@@ -1,7 +1,7 @@
 # Credit Risk Analyst Dashboard (FSAFA · Term V)
 
 Flow: **1 · Sector → 2 · Analysis type (Individual vs Industry average | Peer company review) → 3 · Company / Company 1 + 2**.
-Then tabs: Overview, Liquidity, Solvency & debt service, Earnings quality, Distress & forensic scores, Insights & analysis, Data & method.
+Then tabs: Overview, Liquidity, Solvency & debt service, Earnings quality, Distress & forensic scores, Early warning, Insights & analysis, Data & method.
 
 ## Run
 ```bash
@@ -18,6 +18,7 @@ Data comes live from Yahoo Finance via `yfinance` (needs internet). The first lo
 | `sectors.py` | Sector → NSE tickers. Edit to change the universe (industry average = these peers). |
 | `data.py` | Yahoo pull + mapping of Yahoo row names to standard fields (INR crore). |
 | `metrics.py` | Every formula, thresholds (green/red), Benford test, red-flag rules. Source session noted per metric. |
+| `early_warning.py` | Early-warning tab: quarterly and half-year signals, share-price signals vs sector, Merton distance-to-default. |
 | `insights.py` | Rule-based narrative (no LLM). |
 | `app.py` | Streamlit UI. |
 | `tests/` | Unit tests using the decks' worked examples (Apex liquidity case, accrual A/B, Ohlson 63.7%, Dhenu conversion, Benford, Beneish). |

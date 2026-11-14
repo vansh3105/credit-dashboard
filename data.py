@@ -185,3 +185,68 @@ def mark_failed(ticker, error):
 def clear_cache():
     with _LOCK:
         _CACHE.clear()
+        _QCACHE.clear()
+        _PCACHE.clear()
+
+
+# ------------------------------------------------------------------ early-warning data: quarterly results and prices
+QMAP_IS = {"rev": ["Total Revenue", "Operating Revenue"], "ebitda": ["EBITDA", "Normalized EBITDA"],
+           "ebit": ["EBIT", "Operating Income"], "ni": ["Net Income", "Net Income Common Stockholders"],
+           "interest": ["Interest Expense", "Interest Expense Non Operating"], "da": ["Reconciled Depreciation"]}
+QMAP_BS = {"debt": ["Total Debt"], "cur_debt": ["Current Debt", "Current Debt And Capital Lease Obligation"],
+           "cash": ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"],
+           "ca": ["Current Assets"], "cl": ["Current Liabilities"], "ta": ["Total Assets"]}
+_QCACHE, _PCACHE = {}, {}
+
+
+def _frame(df, mapping):
+    """Yahoo statement (rows = items, columns = period ends) -> DataFrame indexed by period end, Rs crore."""
+    cols = {}
+    for k, names in mapping.items():
+        row = _first_row(df, names)
+        if row is not None:
+            cols[k] = pd.to_numeric(row, errors="coerce") / CR
+    out = pd.DataFrame(cols)
+    if out.empty:
+        return out
+    out.index = pd.to_datetime(out.index)
+    return out.sort_index().dropna(how="all")
+
+
+def get_quarterly(ticker):
+    """{'is': quarterly income statement, 'bs': interim (usually half-yearly) balance sheet}, cached 6 hours.
+    Indian companies publish no quarterly cash-flow statement, so none is returned."""
+    with _LOCK:
+        e = _QCACHE.get(ticker)
+    if e and time.time() - e[0] < CACHE_TTL:
+        return e[1]
+    import yfinance as yf
+    res = {"is": pd.DataFrame(), "bs": pd.DataFrame()}
+    try:
+        t = yf.Ticker(ticker)
+        res = {"is": _frame(t.quarterly_income_stmt, QMAP_IS), "bs": _frame(t.quarterly_balance_sheet, QMAP_BS)}
+    except Exception:
+        pass
+    with _LOCK:
+        _QCACHE[ticker] = (time.time() if len(res["is"]) else time.time() - CACHE_TTL + FAIL_TTL, res)
+    return res
+
+
+def get_prices(tickers):
+    """Daily adjusted close for the last 2 years, one column per ticker (one batch request), cached 6 hours."""
+    key = tuple(sorted(tickers))
+    with _LOCK:
+        e = _PCACHE.get(key)
+    if e and time.time() - e[0] < CACHE_TTL:
+        return e[1]
+    import yfinance as yf
+    try:
+        px = yf.download(list(key), period="2y", auto_adjust=True, progress=False, threads=True)["Close"]
+        if isinstance(px, pd.Series):
+            px = px.to_frame(key[0])
+        px = px.dropna(how="all")
+    except Exception:
+        px = pd.DataFrame()
+    with _LOCK:
+        _PCACHE[key] = (time.time() if len(px) else time.time() - CACHE_TTL + FAIL_TTL, px)
+    return px

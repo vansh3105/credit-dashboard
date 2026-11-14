@@ -11,6 +11,7 @@ import importlib
 import os
 
 import data as dt
+import early_warning as ew
 import insights as ins
 import metrics as mt
 import sectors
@@ -31,6 +32,7 @@ def _fresh(mod):
 dt = _fresh(dt)
 mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
+ew = _fresh(ew)
 SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
@@ -532,7 +534,7 @@ with hc[1]:
             kpis_rel(vB)
 
 tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
-                "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
+                "Early warning", "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
 
 # ------------------------------------------------------------------ Overview
 with tabs[0]:
@@ -918,8 +920,176 @@ with tabs[4]:
 - **Auditor**: Big-4 or not, tenure, non-audit fees vs audit fees, opinion type (unqualified / qualified / adverse / disclaimer).
 - **Board**: CEO duality, independent-director share, CEO tenure/turnover.""")
 
-# ------------------------------------------------------------------ Cash flow & lifecycle
+# ------------------------------------------------------------------ ADVANCED: early warning
 with tabs[5]:
+    st.markdown(f"### Early warning {ADV}", unsafe_allow_html=True)
+    st.caption("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
+               "and the market-implied Merton distance-to-default. These move months before annual ratios do.")
+    if asof_y is not None and asof_y != year_opts[-1]:
+        st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
+                "latest year in View options to see them.")
+    else:
+        e1, e2 = st.columns([3, 1])
+        with e1:
+            ec = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="ew-co")]
+        with e2:
+            rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 6.5, 0.25, key="ew-rf",
+                                 help="Used by the Merton model; roughly the 1-year Indian T-bill yield.") / 100
+        fpd = lambda p_: "n/a" if p_ is None or pd.isna(p_) else ("< 0.01%" if p_ < 1e-4 else f"{p_:.2%}")
+        with st.spinner("Loading quarterly results and share prices…"):
+            px_all = dt.get_prices(list(companies))
+            q_ec = dt.get_quarterly(ec.ticker)
+        mkt_all = {t: (ew.market_stats(px_all[t]) if t in px_all.columns else None) for t in companies}
+        try:
+            ann_end = pd.to_datetime(ec.period_end, format="%b-%Y") + pd.offsets.MonthEnd(0)
+        except Exception:
+            ann_end = None
+
+        def dp_for(comp, q_=None):
+            """Default point; prefers the interim balance sheet when it is newer than the annual report."""
+            bs_ = q_.get("bs") if q_ else None
+            if bs_ is not None and len(bs_) and "debt" in bs_ and not pd.isna(bs_["debt"].iloc[-1]) and (
+                    ann_end is None or bs_.index[-1] > ann_end + pd.Timedelta(days=20)):
+                return ew.default_point(bs_.get("cur_debt", pd.Series([np.nan])).iloc[-1], bs_["debt"].iloc[-1]), f"{bs_.index[-1]:%b-%y} balance sheet"
+            f_ = comp.fin.iloc[-1]
+            return ew.default_point(f_.get("cur_debt", np.nan), f_.get("debt", np.nan)), f"FY{comp.fin.index[-1]} annual report"
+
+        mk_ec = mkt_all.get(ec.ticker)
+        D_ec, D_src = dp_for(ec, q_ec)
+        mert = ew.merton(ec.mcap_cr, mk_ec["vol"] if mk_ec else np.nan, D_ec, rf)
+        hist = ew.dd_history(px_all[ec.ticker], ec.mcap_cr, D_ec, rf) if ec.ticker in px_all.columns else pd.DataFrame()
+        sigs = ew.signals(ec.fin, q_ec, mk_ec, [m for t, m in mkt_all.items() if t != ec.ticker], mert, hist, ann_end)
+        n_, lvl = ew.summary(sigs)
+        st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[lvl]}'><div class='who' style='color:{C1 if ec is A else C2}'>● {esc(ec.name)}</div>"
+                    f"<div class='sig'>{lvl}</div><div>{n_['R']} concern · {n_['A']} watch · {n_['G']} clear, across "
+                    f"{len(sigs)} early-warning signals</div></div>", unsafe_allow_html=True)
+        if not sigs:
+            st.warning("Yahoo returned no quarterly or market data for this company.")
+        else:
+            EW_TXT = {"R": "✕ Concern", "A": "! Watch", "G": "✓ Clear", None: "–"}
+            sdf = pd.DataFrame([{"Area": s_["area"], "Signal": s_["signal"], "Value": s_["value"], "Status": EW_TXT[s_["status"]],
+                                 "Rule": s_["rule"], "Why it matters": s_["why"]} for s_ in sigs])
+            st.dataframe(style_cells(sdf, lambda v: {"✕ Concern": SIG_CSS["✕ Concern"], "! Watch": SIG_CSS["! Watch"],
+                                                     "✓ Clear": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Status"]),
+                         hide_index=True, width="stretch",
+                         column_config={"Rule": st.column_config.TextColumn(width="medium"),
+                                        "Why it matters": st.column_config.TextColumn(width="large")})
+
+        et = st.tabs(["Quarterly results", "Merton distance-to-default", "Share price vs sector", "Sector ranking"])
+        with et[0]:
+            qt = ew.quarterly_table(q_ec.get("is"))
+            if qt.empty:
+                st.info("Yahoo has no quarterly results for this company.")
+            else:
+                xq = [f"{d:%b-%y}" for d in qt.index]
+                qf = go.Figure()
+                qf.add_bar(x=xq, y=qt["Revenue"], name="Revenue (Rs cr)", marker_color=C1 if ec is A else C2,
+                           text=["" if pd.isna(v) else f"{v:+.0%} YoY" for v in qt["Revenue YoY"]], textposition="outside")
+                qf.add_scatter(x=xq, y=qt["EBITDA margin"], name="EBITDA margin", yaxis="y2", mode="lines+markers",
+                               line=dict(color=AMBER, width=2.5))
+                qf.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                 yaxis=dict(title="Revenue (Rs cr)"), legend=dict(orientation="h", y=-0.2),
+                                 yaxis2=dict(title="EBITDA margin", overlaying="y", side="right", tickformat=".0%", showgrid=False))
+                st.plotly_chart(qf, width="stretch", key="ew-q")
+                show_q = qt.copy()
+                show_q.index = xq
+                st.dataframe(show_q.T.style.format(lambda v: "n/a" if pd.isna(v) else f"{v:,.2f}"), width="stretch")
+                st.caption("Year-on-year compares each quarter with the same quarter a year earlier, so seasonality cancels out. "
+                           "Yahoo gives about five to seven quarters; gaps mean Yahoo did not publish that quarter.")
+
+        with et[1]:
+            if mert is None:
+                st.info("Not enough market data (market cap or share-price history) for the Merton model.")
+            elif mert["no_debt"]:
+                st.success(f"{ec.name} has no debt, so there is no default point: distance-to-default is effectively infinite.")
+            else:
+                m1 = st.columns(5)
+                m1[0].metric("Equity value (market cap)", f"Rs {money(mert['E'])} cr")
+                m1[1].metric("Equity volatility", f"{mert['sigma_E']:.0%}", help="Annualised from one year of daily share-price moves.")
+                m1[2].metric("Default point", f"Rs {money(mert['D'])} cr", help=f"Short-term debt + half of long-term debt, from the {D_src}.")
+                m1[3].metric("Distance-to-default", f"{mert['DD']:.2f}", help="Standard deviations of asset value between today and the default point.")
+                m1[4].metric("Probability of default (1y)", fpd(mert["PD"]), help="N(−DD)")
+                st.markdown(f"Solved: asset value **Rs {money(mert['V'])} cr**, asset volatility **{mert['sigma_V']:.1%}**. "
+                            f"DD = [ln(V ÷ D) + (r − ½σ²ᵥ)] ÷ σᵥ = [ln({mert['V']:,.0f} ÷ {mert['D']:,.0f}) + ({rf:.3f} − ½ × {mert['sigma_V']:.3f}²)] "
+                            f"÷ {mert['sigma_V']:.3f} = **{mert['DD']:.2f}**")
+                if len(hist):
+                    hf = go.Figure()
+                    top = max(float(hist["DD"].max()) * 1.1, 4)
+                    hf.add_hrect(y0=0, y1=1.645, fillcolor=RED, opacity=0.10, line_width=0)
+                    hf.add_hrect(y0=1.645, y1=2.326, fillcolor=AMBER, opacity=0.10, line_width=0)
+                    hf.add_scatter(x=hist.index, y=hist["DD"], mode="lines+markers", line=dict(color=C1 if ec is A else C2, width=2.6),
+                                   customdata=[fpd(v) for v in hist["PD"]], hovertemplate="%{x|%b-%y}: DD %{y:.2f}, PD %{customdata}<extra></extra>")
+                    hf.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                     yaxis=dict(title="Distance-to-default", range=[0, top]))
+                    st.plotly_chart(hf, width="stretch", key="ew-dd")
+                    st.caption("Monthly over the last year (debt held at today's level). Red zone: DD below 1.645 = PD above 5%; "
+                               "amber: DD below 2.326 = PD above 1%.")
+                with st.expander("How the Merton model works"):
+                    st.markdown("""
+Equity holders own the firm's assets but must repay debt **D** at the horizon, so equity is a **call option** on the assets
+**V**: E = V·N(d₁) − D·e^(−rT)·N(d₂). Together with σₑ·E = N(d₁)·σᵥ·V, the two observable numbers (market cap E and its volatility σₑ)
+pin down the two unobservable ones (V and σᵥ). **Distance-to-default** is how many standard deviations V sits above the default
+point; the model's probability of default is N(−DD). Following KMV, the default point is short-term debt plus half of long-term
+debt. The model reacts to share-price moves within days, which is why it is an early-warning tool - but it is risk-neutral and
+assumes log-normal assets, so read the level loosely and the **trend** carefully.""")
+
+        with et[2]:
+            if px_all.empty or ec.ticker not in px_all.columns:
+                st.info("No share-price history from Yahoo.")
+            else:
+                rb = px_all.ffill().iloc[-ew.TRADING_DAYS * 2:]
+                rb = rb / rb.bfill().iloc[0]
+                pf = go.Figure()
+                lo_, hi_ = rb.quantile(0.25, axis=1), rb.quantile(0.75, axis=1)
+                pf.add_scatter(x=rb.index, y=hi_, line=dict(width=0), showlegend=False, hoverinfo="skip")
+                pf.add_scatter(x=rb.index, y=lo_, fill="tonexty", fillcolor="rgba(139,148,158,.18)", line=dict(width=0),
+                               name="Sector middle 50%", hoverinfo="skip")
+                pf.add_scatter(x=rb.index, y=rb.median(axis=1), name="Sector median", line=dict(color=CB, dash="dash"))
+                for comp_, col_ in ((A, C1), (B, C2)):
+                    if comp_ is not None and comp_.ticker in rb:
+                        pf.add_scatter(x=rb.index, y=rb[comp_.ticker], name=comp_.name, line=dict(color=col_, width=2.6))
+                pf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                 yaxis=dict(title="Growth of Rs 1 (2 years)", tickformat=".2f"), legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(pf, width="stretch", key="ew-px")
+                if mk_ec:
+                    mm = st.columns(4)
+                    mm[0].metric("1-year return", f"{mk_ec['ret_1y']:+.1%}")
+                    mm[1].metric("From 52-week high", f"{mk_ec['off_high']:+.1%}")
+                    mm[2].metric("Volatility (annual)", f"{mk_ec['vol']:.0%}")
+                    mm[3].metric("Worst fall in the year", f"{mk_ec['max_dd']:.1%}")
+
+        with et[3]:
+            rows_ = []
+            for t, comp_ in companies.items():
+                mk_ = mkt_all.get(t)
+                if not mk_:
+                    continue
+                d_, _ = dp_for(comp_)
+                r_ = ew.merton(comp_.mcap_cr, mk_["vol"], d_, rf)
+                if r_:
+                    rows_.append((comp_.name, r_["DD"], r_["PD"], r_["no_debt"]))
+            if len(rows_) < 3:
+                st.info("Too few companies have market data for a sector comparison.")
+            else:
+                debt_rows = sorted([r for r in rows_ if not r[3]], key=lambda r: r[1])
+                cap = 15.0
+                HLc = {A.name: C1, **({B.name: C2} if B is not None else {})}
+                rf_ = go.Figure(go.Bar(x=[min(r[1], cap) for r in debt_rows], y=[r[0] for r in debt_rows], orientation="h",
+                                       marker_color=[HLc.get(r[0], RED if r[1] < 1.645 else AMBER if r[1] < 2.326 else "rgba(139,148,158,.5)")
+                                                     for r in debt_rows],
+                                       customdata=[[f"{r[1]:.2f}", fpd(r[2])] for r in debt_rows],
+                                       hovertemplate="%{y}: DD %{customdata[0]}, PD %{customdata[1]}<extra></extra>"))
+                rf_.add_vline(x=1.645, line_color=RED, line_dash="dot")
+                rf_.add_vline(x=2.326, line_color=AMBER, line_dash="dot")
+                rf_.update_layout(height=max(320, 22 * len(debt_rows)), template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                  xaxis=dict(title=f"Distance-to-default (capped at {cap:g} for display)"), yaxis=dict(autorange="reversed"))
+                st.plotly_chart(rf_, width="stretch", key="ew-rank")
+                nd_ = [r[0] for r in rows_ if r[3]]
+                st.caption("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
+                           + (f" No debt (not shown): {', '.join(nd_)}." if nd_ else ""))
+
+# ------------------------------------------------------------------ Cash flow & lifecycle
+with tabs[6]:
     st.subheader("Cash flow & lifecycle")
     st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
     yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
@@ -956,7 +1126,7 @@ with tabs[5]:
                      width="stretch", hide_index=True)
 
 # ------------------------------------------------------------------ ADVANCED: credit workbench
-with tabs[6]:
+with tabs[7]:
     st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
     st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
     bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
@@ -1157,7 +1327,7 @@ with tabs[6]:
         st.download_button("Download memo (Markdown)", text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown", key="dl-memo")
 
 # ------------------------------------------------------------------ Insights
-with tabs[7]:
+with tabs[8]:
     st.subheader("Insights & analysis")
 
     def render(secs):
@@ -1292,7 +1462,7 @@ with tabs[7]:
         render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
 
 # ------------------------------------------------------------------ Data & method
-with tabs[8]:
+with tabs[9]:
     st.subheader("Data quality")
     dq = []
     for comp in ([A] + ([B] if B else [])):
@@ -1343,6 +1513,7 @@ with tabs[8]:
   shifts these percentiles). Hard floors stay: DSCR or interest cover below 1x and Ohlson probability above 50% are always a
   concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
   textbook cut-off.
+- {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate editable (default 6.5%); probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
 - **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
   of total assets respectively.
 - **Fiscal-year labels** follow the Indian April-March year: an October-December year end is labelled with the next calendar
