@@ -1,4 +1,6 @@
 import warnings
+from html import escape as esc
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -13,7 +15,11 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", page_icon="📊")
 
 C1, C2, CB = "#1f6feb", "#e8710a", "#8b949e"          # company 1, company 2, benchmark
-RAG_TXT = {"G": "🟢 Green", "A": "🟡 Amber", "R": "🔴 Red", None: "-"}
+GREEN, AMBER, RED = "#2da44e", "#d29922", "#cf222e"
+SIG = {"G": "✓ Healthy", "A": "! Watch", "R": "✕ Concern", None: "–"}
+SIG_CSS = {"✓ Healthy": "background-color: rgba(46,160,67,.30)", "! Watch": "background-color: rgba(210,153,34,.32)",
+           "✕ Concern": "background-color: rgba(248,81,73,.32)"}
+SIGNAL_COL = {"ELEVATED CONCERN": RED, "WATCH": AMBER, "COMFORTABLE": GREEN}
 GROUP_TITLES = {
     "Liquidity": "Can the borrower pay short-term dues from real cash?",
     "Solvency": "Can it carry its debt?",
@@ -22,18 +28,36 @@ GROUP_TITLES = {
     "Scores": "Distress and manipulation scores",
     "Market": "What does the market price imply?",
 }
+ADV = '<span class="adv">ADVANCED</span>'
 
 st.markdown("""<style>
-.block-container{padding-top:1.6rem;max-width:1400px}
-div[data-testid="stMetric"]{background:rgba(128,128,128,.10);padding:10px 14px;border-radius:10px}
-.coname{font-weight:700;font-size:1.05rem;margin:.2rem 0 .3rem 0}
+.block-container{padding-top:3rem;max-width:1450px}
+.adv{display:inline-block;background:#6e40c9;color:#fff;font-size:.66rem;font-weight:700;letter-spacing:.07em;
+     padding:2px 9px;border-radius:999px;vertical-align:middle;margin-left:.5rem}
+.banner{border-radius:12px;padding:14px 18px;border-left:8px solid var(--c);background:rgba(128,128,128,.10);margin-bottom:.6rem}
+.banner .sig{font-size:1.4rem;font-weight:800;color:var(--c);line-height:1.2}
+.banner .who{font-size:.85rem;opacity:.75;font-weight:600}
+.card{border:1px solid rgba(128,128,128,.30);border-radius:12px;padding:12px 14px;height:100%;background:rgba(128,128,128,.05)}
+.card .t{font-weight:700;margin-bottom:2px}
+.bar{height:8px;border-radius:99px;background:rgba(128,128,128,.25);overflow:hidden;margin:3px 0 6px 0}
+.bar>div{height:100%;border-radius:99px}
+.small{font-size:.82rem;opacity:.78}
+div[data-testid="stMetric"]{background:rgba(128,128,128,.09);padding:8px 12px;border-radius:10px}
+.coname{font-weight:700;font-size:1.05rem;margin:.1rem 0 .3rem 0}
 </style>""", unsafe_allow_html=True)
 
 
-# ------------------------------------------------------------------ data
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def get_sector(sector: str):
-    return dt.load_sector(SECTORS[sector])
+# ------------------------------------------------------------------ small helpers
+fmtv = ins.fmt
+
+
+def counts(vals, keys):
+    r = [mt.rag(k, vals.get(k)) for k in keys]
+    return r.count("G"), r.count("A"), r.count("R")
+
+
+def score_color(s):
+    return GREEN if s >= 65 else AMBER if s >= 40 else RED
 
 
 def bench_frame(peer_metrics: dict, how: str):
@@ -46,62 +70,97 @@ def bench_frame(peer_metrics: dict, how: str):
     return pd.DataFrame(res, index=list(mt.M), columns=years)
 
 
-fmtv = ins.fmt
+def style_cells(df, css_fn, subset):
+    sty = df.style
+    return (sty.map if hasattr(sty, "map") else sty.applymap)(css_fn, subset=subset)
 
 
-def counts(vals, keys):
-    r = [mt.rag(k, vals.get(k)) for k in keys]
-    return r.count("G"), r.count("A"), r.count("R")
+def money(v):
+    if v is None or pd.isna(v):
+        return "n/a"
+    return f"{v/1e5:,.2f}L" if abs(v) >= 1e5 else f"{v:,.0f}"
 
 
-# ------------------------------------------------------------------ sidebar: the 3-step flow
+# ------------------------------------------------------------------ sidebar
 st.sidebar.title("📊 Credit Risk Dashboard")
 st.sidebar.caption("For the **Credit Risk Analyst** · live data from Yahoo Finance")
-sector = st.sidebar.selectbox("1 · Sector", list(SECTORS))
-mode = st.sidebar.selectbox("2 · Analysis type", ["Individual stats vs Industry average", "Peer company review"])
-
-with st.spinner(f"Loading {sector} companies from Yahoo Finance (first load can take a minute)…"):
-    companies, errors = get_sector(sector)
-
-names = {t: c.name for t, c in companies.items()}
-if not names:
-    st.error("No company data could be loaded for this sector.")
-    if errors:
-        st.write({SECTORS[sector].get(t, t): e for t, e in errors.items()})
-    st.info("Yahoo Finance may be unreachable or rate-limiting. Click **Reload data** in the sidebar and retry in a few minutes.")
-    if st.sidebar.button("Reload data"):
-        st.cache_data.clear()
-        st.rerun()
-    st.stop()
-
-if mode.startswith("Individual"):
-    t1 = st.sidebar.selectbox("3 · Company", list(names), format_func=lambda t: f"{names[t]} ({t})")
-    t2 = None
-else:
-    t1 = st.sidebar.selectbox("3 · Choose company 1", list(names), format_func=lambda t: f"{names[t]} ({t})")
-    rest = [t for t in names if t != t1]
-    if not rest:
-        st.error("Need at least two loaded companies for a peer review.")
-        st.stop()
-    t2 = st.sidebar.selectbox("   Choose company 2", rest, format_func=lambda t: f"{names[t]} ({t})")
-
-with st.sidebar.expander("Settings"):
+with st.sidebar.expander("Settings", expanded=False):
     how = st.radio("Industry average =", ["Median", "Mean"], horizontal=True)
     gnp = st.number_input("Price index for size term (Ohlson)", 1.0, 1000.0, 100.0,
                           help="Total assets (Rs crore) are divided by this index in the Ohlson size term.")
-if st.sidebar.button("Reload data"):
-    st.cache_data.clear()
+if st.sidebar.button("Reload data", help="Discard saved data and fetch again from Yahoo Finance"):
+    dt.clear_cache()
     st.rerun()
+st.sidebar.markdown("---")
+st.sidebar.markdown("**How to read signals**  \n✓ Healthy · ! Watch · ✕ Concern  \n"
+                    f"{ADV} marks analysis beyond the core ratios.", unsafe_allow_html=True)
+
+# ------------------------------------------------------------------ top selector bar (steps 1-3)
+st.markdown("### Credit Risk Analyst Dashboard")
+top = st.columns([1.1, 1.2, 1.35, 1.35])
+with top[0]:
+    sector = st.selectbox("1 · Sector", list(SECTORS))
+with top[1]:
+    mode = st.selectbox("2 · Analysis type", ["Individual vs industry average", "Peer company review"])
+individual = mode.startswith("Individual")
+
+tickers = SECTORS[sector]
+missing_t = [t for t in tickers if not dt.is_cached(t)]
+if missing_t:
+    bar = st.progress(0.0, text="Connecting to Yahoo Finance…")
+    fails, any_ok = 0, any(dt.is_cached(t) for t in tickers)
+    for i, t in enumerate(missing_t):
+        bar.progress(i / len(missing_t), text=f"Loading {tickers[t]} ({i + 1} of {len(missing_t)})…")
+        c, e = dt.get_company(t, tickers[t])
+        if c is None:
+            fails += 1
+            if fails >= 3 and not any_ok:      # Yahoo unreachable: stop early instead of waiting for every ticker
+                for t2 in missing_t[i + 1:]:
+                    dt.mark_failed(t2, "skipped - Yahoo Finance unreachable (first 3 requests failed)")
+                break
+        else:
+            any_ok, fails = True, 0
+    bar.empty()
+
+companies, errors = {}, {}
+for t, n in tickers.items():
+    c, e = dt.get_company(t, n)            # served from cache
+    if c is not None and not c.fin.empty:
+        companies[t] = c
+    else:
+        errors[t] = e or "no usable data"
+names = {t: c.name for t, c in companies.items()}
 if errors:
-    st.sidebar.warning(f"{len(errors)} ticker(s) failed to load: " + ", ".join(SECTORS[sector].get(t, t) for t in errors))
+    st.sidebar.warning(f"{len(errors)} ticker(s) failed to load: " + ", ".join(tickers[t] for t in errors))
+if not names:
+    st.error("No company data could be loaded for this sector.")
+    st.write({tickers[t]: e for t, e in errors.items()})
+    st.info("Yahoo Finance may be unreachable or rate-limiting. Click **Reload data** in the sidebar and retry in a few minutes.")
+    st.stop()
+
+with top[2]:
+    t1 = st.selectbox("3 · Company" if individual else "3 · Company 1", list(names), format_func=lambda t: names[t])
+t2 = None
+with top[3]:
+    if individual:
+        st.markdown("&nbsp;")
+    else:
+        rest = [t for t in names if t != t1]
+        if not rest:
+            st.error("Need at least two loaded companies for a peer review.")
+            st.stop()
+        t2 = st.selectbox("Company 2", rest, format_func=lambda t: names[t])
 
 # ------------------------------------------------------------------ compute
 all_m = {t: mt.compute(c.fin, c.mcap_cr, gnp) for t, c in companies.items()}
+latest_all = {t: ins.latest(m) for t, m in all_m.items()}
+W = {p: st.session_state.get(f"w_{p}", d) for p, d in mt.DEFAULT_WEIGHTS.items()}
+
 A = companies[t1]; mA = all_m[t1]
 yearA = mA.columns[-1]
-vA = ins.latest(mA)
+vA = latest_all[t1]
 flagsA = mt.red_flags(A.fin, mA)
-if t2 is None:
+if individual:
     peers = {t: m for t, m in all_m.items() if t != t1}
     if not peers:
         st.error("Industry average needs at least one other company in this sector to load.")
@@ -112,10 +171,16 @@ if t2 is None:
     B = None
     vB = cmp_df[yearA] if yearA in cmp_df.columns else ins.latest(cmp_df)
     flagsB = []
+    gov_cmp = np.nanmedian([mt.governance_score(companies[t].gov) for t in peers]) if any(
+        not pd.isna(mt.governance_score(companies[t].gov)) for t in peers) else np.nan
+    pB = mt.pillar_scores(vB); pB["Governance"] = gov_cmp
 else:
     B = companies[t2]; cmp_df = all_m[t2]; cmp_name = B.name; cmp_label = B.name
-    vB = ins.latest(cmp_df)
+    vB = latest_all[t2]
     flagsB = mt.red_flags(B.fin, cmp_df)
+    pB = mt.pillar_scores(vB, B.gov)
+pA = mt.pillar_scores(vA, A.gov)
+scoreA, scoreB = mt.overall_score(pA, W), mt.overall_score(pB, W)
 
 series = {A.name: mA, cmp_name: cmp_df.reindex(list(mt.M))}
 rawA = [x for y in A.raw_values for x in A.raw_values[y]]
@@ -126,20 +191,34 @@ if B is not None:
     bfB = mt.benford(rawB) if rawB else None
 
 
-# ------------------------------------------------------------------ tables
-def latest_table(groups):
+# ------------------------------------------------------------------ tables, charts, sections
+def table_df(groups):
     rows = []
     for k, m in mt.M.items():
         if m["group"] not in groups:
             continue
         a, b = vA.get(k), vB.get(k)
-        row = {"Metric": m["label"], A.name: fmtv(k, a), f"{A.name} signal": RAG_TXT[mt.rag(k, a)],
-               cmp_name: fmtv(k, b), f"{cmp_name} signal": RAG_TXT[mt.rag(k, b)]}
+        tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)]
         bt = ins.better(k, a, b)
-        row[f"{A.name} vs {cmp_name}"] = "-" if bt is None else ("✅ better" if bt else "⚠️ weaker")
-        row["Formula"] = m["formula"]
-        rows.append(row)
+        pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
+        rows.append({"Metric": m["label"], A.name: fmtv(k, a), f"{A.name} signal": SIG[mt.rag(k, a)],
+                     cmp_name: fmtv(k, b), f"{cmp_name} signal": SIG[mt.rag(k, b)],
+                     "Edge": "–" if bt is None else ("Better" if bt else "Weaker"),
+                     "Sector percentile": None if pd.isna(pct) else float(pct),
+                     "Trend": tv if len(tv) >= 2 else None})
     return pd.DataFrame(rows)
+
+
+def show_table(df, key):
+    sig_cols = [c for c in df.columns if c.endswith(" signal")]
+    st.dataframe(
+        style_cells(df, lambda v: SIG_CSS.get(v, ""), sig_cols),
+        column_config={
+            "Metric": st.column_config.TextColumn(width="medium"),
+            "Sector percentile": st.column_config.ProgressColumn("Sector percentile", min_value=0, max_value=100, format="%.0f",
+                                                                 help="Share of companies in this sector that the company beats on this metric. Advanced."),
+            "Trend": st.column_config.LineChartColumn("Trend", width="small"),
+        }, hide_index=True, width="stretch", key=key)
 
 
 def history_table(groups):
@@ -157,21 +236,30 @@ def history_table(groups):
     return pd.DataFrame(rows)
 
 
-def trend(key, ser: dict, h=260):
+def trend(key, ser: dict, h=270):
     m = mt.M[key]
     fig = go.Figure()
+    allv = []
     for i, (nm, s) in enumerate(ser.items()):
         s = s.dropna()
         if s.empty:
             continue
+        allv += list(s.values)
         bench = (i == 1 and B is None)
         fig.add_trace(go.Scatter(x=[f"FY{y}" for y in s.index], y=s.values, name=nm, mode="lines+markers",
-                                 line=dict(color=CB if bench else (C1 if i == 0 else C2), dash="dash" if bench else "solid", width=2.5),
+                                 line=dict(color=CB if bench else (C1 if i == 0 else C2), dash="dash" if bench else "solid", width=2.6),
                                  marker=dict(size=7)))
-    if m["dir"] is not None and key != "fcf":
-        for val, col in ((m["green"], "#2da44e"), (m["red"], "#cf222e")):
-            if val is not None:
-                fig.add_hline(y=val, line=dict(color=col, width=1, dash="dot"))
+    if m["dir"] is not None and allv:
+        g, r = m["green"], m["red"]
+        lo, hi = min(allv + [g, r]), max(allv + [g, r])
+        pad = (hi - lo) * 0.18 or 1.0
+        lo, hi = lo - pad, hi + pad
+        zones = ([(lo, r, RED), (r, g, AMBER), (g, hi, GREEN)] if m["dir"] == "high"
+                 else [(lo, g, GREEN), (g, r, AMBER), (r, hi, RED)])
+        for y0, y1, col in zones:
+            if y1 > y0:
+                fig.add_hrect(y0=y0, y1=y1, fillcolor=col, opacity=0.11, line_width=0, layer="below")
+        fig.update_yaxes(range=[lo, hi])
     fig.update_layout(height=h, margin=dict(l=10, r=10, t=36, b=10), title=dict(text=m["label"], font=dict(size=14)),
                       legend=dict(orientation="h", y=-0.25, font=dict(size=10)),
                       yaxis=dict(tickformat=".0%" if m["unit"] == "%" else None), xaxis=dict(type="category"),
@@ -187,99 +275,208 @@ def charts(groups, tag):
         if any(v.notna().any() for v in s.values()):
             shown.append((k, s))
         else:
-            missing.append(mt.M[k]["label"])
+            need = mt.missing_inputs(k, A.fin)
+            missing.append(f"{mt.M[k]['label']} ({'Yahoo has no ' + ', '.join(need) if need else 'needs more history or market data'})")
     cols = st.columns(2)
     for i, (k, s) in enumerate(shown):
         with cols[i % 2]:
             st.plotly_chart(trend(k, s), width="stretch", key=f"{tag}-{k}")
-            st.caption(f"`{mt.M[k]['formula']}`")
+            st.caption(f"{mt.M[k]['desc']}  \n`{mt.M[k]['formula']}`")
     if missing:
-        st.info("Not available from the data source for this selection: " + ", ".join(missing))
+        st.info("Not available for this selection: " + "; ".join(missing))
+
+
+def na_note(groups):
+    notes = []
+    for k, m in mt.M.items():
+        if m["group"] in groups and pd.isna(vA.get(k)):
+            need = mt.missing_inputs(k, A.fin)
+            notes.append(f"**{m['label']}** - " + ("Yahoo has no " + ", ".join(need) if need else "needs another year of history or market data"))
+    if notes:
+        with st.expander(f"Why some values show n/a for {A.name} ({len(notes)})"):
+            st.markdown("\n".join(f"- {n}" for n in notes))
 
 
 def section(groups, tag, intro=None):
-    """Comparison table + year-by-year history + charts for one or more metric groups."""
     if intro:
         st.caption(intro)
     st.markdown("##### Comparison (latest fiscal year)")
-    st.dataframe(latest_table(groups), width="stretch", hide_index=True)
-    st.caption("🟢 healthy · 🟡 watch · 🔴 concern. Thresholds for every metric are listed in *Data & method*.")
-    with st.expander("Year-by-year values", expanded=False):
+    df = table_df(groups)
+    show_table(df, f"tbl-{tag}")
+    c1, c2 = st.columns([4, 1])
+    c1.caption("✓ Healthy · ! Watch · ✕ Concern. Thresholds for every metric are listed in *Data & method*. "
+               "Sector percentile is an advanced extension.")
+    c2.download_button("Download CSV", df.drop(columns=["Trend"]).to_csv(index=False), file_name=f"{tag}_comparison.csv",
+                       mime="text/csv", key=f"dl-{tag}")
+    na_note(groups)
+    with st.expander("Year-by-year values"):
         st.dataframe(history_table(groups), width="stretch", hide_index=True)
+    with st.expander("Metric guide - what each one tells you"):
+        for k, m in mt.M.items():
+            if m["group"] in groups:
+                st.markdown(f"**{m['label']}** - {m['desc']}  \n`{m['formula']}`")
     st.markdown("##### Trends")
+    st.caption("Shaded bands: green = healthy, amber = watch, red = concern.")
     charts(groups, tag)
 
 
-# ------------------------------------------------------------------ header
+# ------------------------------------------------------------------ headline: verdict banners + KPI strip
+def banner(label, vals, flags, score, color_tag):
+    v = ins.verdict(vals, flags)
+    col = SIGNAL_COL[v["signal"]]
+    st.markdown(
+        f"<div class='banner' style='--c:{col}'><div class='who' style='color:{color_tag}'>● {esc(label)}</div>"
+        f"<div class='sig'>{v['signal']}</div>"
+        f"<div>Indicative score <b>{'n/a' if pd.isna(score) else f'{score:.0f}/100'}</b> · {mt.band(score)} · "
+        f"{v['g']} healthy · {v['a']} watch · {v['r']} concern</div>"
+        f"<div class='small'>Key drivers: {esc(' · '.join(v['reasons']) or 'none flagged')}</div></div>", unsafe_allow_html=True)
+
+
+def kpis(rev, ni, vals):
+    c = st.columns(3)
+    c[0].metric("Revenue (Rs cr)", money(rev), help="L = lakh crore"); c[1].metric("Net profit (Rs cr)", money(ni), help="L = lakh crore"); c[2].metric("Net debt / EBITDA", fmtv("nd_ebitda", vals.get("nd_ebitda")))
+    c = st.columns(3)
+    c[0].metric("Interest cover", fmtv("icr", vals.get("icr"))); c[1].metric("DSCR (proxy)", fmtv("dscr", vals.get("dscr")))
+    c[2].metric("Cash conversion", fmtv("cce", vals.get("cce")))
+
+
+st.title(f"{A.name} vs {cmp_name}")
+asof = f"Annual statements to {A.period_end or 'n/a'}" + (f" ({B.name}: {B.period_end})" if B is not None and B.period_end != A.period_end else "")
+st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · {asof} · "
+           f"fetched {A.fetched_at or 'n/a'} · figures in Rs crore · source: Yahoo Finance (market cap as of fetch)")
 if A.currency and A.currency != "INR":
     st.warning(f"Yahoo reports {A.name}'s financials in {A.currency}; the dashboard assumes INR crore.")
-st.title(f"{A.name} vs {cmp_name}")
-st.caption(f"{sector} · {'Peer company review' if B else 'Individual stats vs industry ' + how.lower()} · "
-           f"latest fiscal year in data: FY{yearA} · figures in Rs crore · source: Yahoo Finance via yfinance")
 
+hc = st.columns(2) if B is not None else st.columns([3, 2])
+with hc[0]:
+    with st.container(border=True):
+        banner(A.name, vA, flagsA, scoreA, C1)
+        kpis(A.fin["rev"].iloc[-1], A.fin["ni"].iloc[-1] if "ni" in A.fin else np.nan, vA)
+with hc[1]:
+    with st.container(border=True):
+        if B is not None:
+            banner(B.name, vB, flagsB, scoreB, C2)
+            kpis(B.fin["rev"].iloc[-1], B.fin["ni"].iloc[-1] if "ni" in B.fin else np.nan, vB)
+        else:
+            banner(f"{cmp_name} ({len(peers)} peers)", vB, [], scoreB, CB)
+            kpis(np.nanmedian([p.fin["rev"].iloc[-1] for t, p in companies.items() if t != t1]),
+                 np.nanmedian([p.fin["ni"].iloc[-1] for t, p in companies.items() if t != t1 and "ni" in p.fin]), vB)
 
-def kpi_row(comp, vals, flags, color, label):
-    g, a, r = counts(vals, mt.M)
-    st.markdown(f"<div class='coname' style='color:{color}'>● {label}</div>", unsafe_allow_html=True)
-    c = st.columns(6)
-    c[0].metric("🟢 Green", g); c[1].metric("🟡 Amber", a); c[2].metric("🔴 Red", r)
-    c[3].metric("Red-flag alerts", len(flags))
-    rv = comp.fin["rev"].iloc[-1]
-    c[4].metric("Revenue (Rs lakh cr)" if rv >= 1e5 else "Revenue (Rs cr)", f"{rv/1e5:,.2f}" if rv >= 1e5 else f"{rv:,.0f}")
-    pat = comp.fin["ni"].iloc[-1] if "ni" in comp.fin else np.nan
-    c[5].metric("Net profit (Rs cr)", "n/a" if pd.isna(pat) else f"{pat:,.0f}")
+tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
+                "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
 
-
-kpi_row(A, vA, flagsA, C1, A.name)
-if B is not None:
-    kpi_row(B, vB, flagsB, C2, B.name)
-else:
-    g, a, r = counts(vB, mt.M)
-    st.markdown(f"<div class='coname' style='color:{CB}'>● {cmp_name} ({len(peers)} peers)</div>", unsafe_allow_html=True)
-    c = st.columns(6)
-    c[0].metric("🟢 Green", g); c[1].metric("🟡 Amber", a); c[2].metric("🔴 Red", r)
-    rv = np.nanmedian([p.fin["rev"].iloc[-1] for t, p in companies.items() if t != t1])
-    c[3].metric("Median revenue (Rs lakh cr)" if rv >= 1e5 else "Median revenue (Rs cr)",
-                f"{rv/1e5:,.2f}" if rv >= 1e5 else f"{rv:,.0f}")
-
-tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic scores",
-                "Insights & analysis", "Data & method"])
-
-# ------------------------------------------------------------------ Overview: one rectangular tab per umbrella factor
+# ------------------------------------------------------------------ Overview
 with tabs[0]:
-    st.caption("Pick a factor to see every metric in it for the selected company and comparator.")
+    st.markdown("##### Scorecard by factor")
+    st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
+               "Weights and the overall score are an advanced extension (see Credit workbench).")
+    PILLAR_NOTE_GROUPS = {"Liquidity": ["Liquidity"], "Solvency & coverage": ["Solvency"], "Earnings quality": ["Earnings quality"],
+                          "Returns": ["Returns"], "Distress & forensic": ["Scores"]}
+
+    def worst_note(p):
+        if p == "Governance":
+            return "Yahoo/ISS risk scores (1 low - 10 high)" if not pd.isna(pA.get("Governance")) else "No governance data from Yahoo"
+        groups = PILLAR_NOTE_GROUPS[p]
+        reds = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "R"]
+        ambers = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "A"]
+        if reds:
+            k = reds[0]; return f"Concern: {mt.M[k]['label']} {fmtv(k, vA[k])}"
+        if ambers:
+            k = ambers[0]; return f"Watch: {mt.M[k]['label']} {fmtv(k, vA[k])}"
+        return "All rated metrics healthy"
+
+    def card(p):
+        sa, sb = pA.get(p), pB.get(p)
+        def row(nm, s, col):
+            if s is None or pd.isna(s):
+                return f"<div class='small'>{esc(nm)}: n/a</div>"
+            return (f"<div class='small'>{esc(nm)} <b>{s:.0f}</b></div>"
+                    f"<div class='bar'><div style='width:{s:.0f}%;background:{score_color(s)}'></div></div>")
+        return (f"<div class='card'><div class='t'>{p}</div>{row(A.name, sa, C1)}{row(cmp_name, sb, CB)}"
+                f"<div class='small'>{esc(worst_note(p))}</div></div>")
+
+    pill = list(mt.PILLARS) + ["Governance"]
+    for r0 in (0, 3):
+        cc = st.columns(3)
+        for i, p in enumerate(pill[r0:r0 + 3]):
+            with cc[i]:
+                st.markdown(card(p), unsafe_allow_html=True)
+    st.markdown("")
+    st.markdown("##### Pick a factor")
     sub = st.tabs(mt.GROUPS)
     for gname, t in zip(mt.GROUPS, sub):
         with t:
-            gA = counts(vA, [k for k, m in mt.M.items() if m["group"] == gname])
-            gB = counts(vB, [k for k, m in mt.M.items() if m["group"] == gname])
+            gA, gB = (counts(v, [k for k, m in mt.M.items() if m["group"] == gname]) for v in (vA, vB))
             st.markdown(f"**{gname}** - {GROUP_TITLES[gname]}")
-            st.write(f"{A.name}: 🟢 {gA[0]} · 🟡 {gA[1]} · 🔴 {gA[2]}   |   {cmp_name}: 🟢 {gB[0]} · 🟡 {gB[1]} · 🔴 {gB[2]}")
-            st.dataframe(latest_table([gname]), width="stretch", hide_index=True)
-            st.caption("🟢 healthy · 🟡 watch · 🔴 concern. ‘-’ means informational (no threshold) or not available.")
+            st.caption(f"{A.name}: {gA[0]} healthy · {gA[1]} watch · {gA[2]} concern   |   "
+                       f"{cmp_name}: {gB[0]} healthy · {gB[1]} watch · {gB[2]} concern")
+            d = table_df([gname])
+            show_table(d, f"ov-{gname}")
 
 with tabs[1]:
     st.subheader("Liquidity")
     section(["Liquidity"], "liq", GROUP_TITLES["Liquidity"])
+
 with tabs[2]:
     st.subheader("Solvency & debt service")
     section(["Solvency", "Returns"], "sol", f"{GROUP_TITLES['Solvency']} {GROUP_TITLES['Returns']}")
-    cr = vA.get("cce", np.nan); dr = vA.get("debt_ratio", np.nan)
-    if not pd.isna(cr) and not pd.isna(dr):
-        cash_rich, asset_rich = cr >= 0.6, dr <= 0.5
+    st.markdown("##### Return drivers (DuPont)")
+    dpA = mt.dupont(A.fin)
+    dpB = mt.dupont(B.fin) if B is not None else None
+    dcols = st.columns(2 if B is not None else 1)
+    for col, comp, dp, color in zip(dcols, (A, B), (dpA, dpB), (C1, C2)):
+        if comp is None:
+            continue
+        with col:
+            st.markdown(f"<div class='coname' style='color:{color}'>● {esc(comp.name)}</div>", unsafe_allow_html=True)
+            r = dp.iloc[-1]
+            f = lambda v, p=False: "n/a" if pd.isna(v) else (f"{v:.1%}" if p else f"{v:.2f}x")
+            m_ = st.columns(4)
+            m_[0].metric("ROE", f(r["ROE"], True)); m_[1].metric("= Net margin", f(r["Net margin"], True))
+            m_[2].metric("× Asset turnover", f(r["Asset turnover"])); m_[3].metric("× Equity multiplier", f(r["Equity multiplier"]))
+            m2 = st.columns(4)
+            m2[0].metric("Net margin", f(r["Net margin"], True)); m2[1].metric("= EBIT margin", f(r["EBIT margin"], True))
+            m2[2].metric("× Interest burden", f(r["Interest burden"])); m2[3].metric("× Tax burden", f(r["Tax burden"]))
+            with st.expander("DuPont by year"):
+                show = dp.copy()
+                show.index = [f"FY{y}" for y in show.index]
+                st.dataframe(show.T.style.format("{:.3f}"), width="stretch")
+    st.caption("Interest burden = pre-tax profit ÷ EBIT (lower means interest eats more of operating profit); tax burden = net profit ÷ pre-tax profit.")
+    cr, dr_ = vA.get("cce", np.nan), vA.get("debt_ratio", np.nan)
+    if not pd.isna(cr) and not pd.isna(dr_):
+        cash_rich, asset_rich = cr >= 0.6, dr_ <= 0.5
         approach = {(True, True): "debt sculpting", (True, False): "debt avalanche", (False, True): "debt sizing (DSCR-based)",
                     (False, False): "debt snowball"}[(cash_rich, asset_rich)]
         st.markdown("##### Debt structuring view")
         st.write(f"{A.name} screens as **{'cash-rich' if cash_rich else 'cash-poor'} + {'asset-rich' if asset_rich else 'asset-poor'}** "
                  f"(proxy: CFO/EBITDA ≥ 60% and Debt/Assets ≤ 50%) → suggested approach: **{approach}**.")
+
 with tabs[3]:
     st.subheader("Earnings quality")
     section(["Earnings quality", "Market"], "eq", f"{GROUP_TITLES['Earnings quality']} P/OCF above P/E means profits are not converting to cash.")
     st.markdown("**Reading the accrual ratios:** low balance-sheet accrual + low cash-flow accrual = excellent quality; both high = serious concern; "
                 "if only one is high, investigate that side.")
+
 with tabs[4]:
     st.subheader("Distress & forensic scores")
     section(["Scores"], "sc", GROUP_TITLES["Scores"])
+    st.markdown("##### What drives the Altman Z″ score")
+    st.caption("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
+    fig = go.Figure()
+    for comp, color in ((A, C1), (B, C2)):
+        if comp is None:
+            continue
+        try:
+            comps = mt.altman_components(comp.fin)
+            fig.add_bar(x=[c[0] for c in comps], y=[c[1] for c in comps], name=comp.name, marker_color=color)
+        except Exception:
+            pass
+    if fig.data:
+        fig.update_layout(barmode="group", height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                          legend=dict(orientation="h", y=-0.3), yaxis_title="Contribution to Z″")
+        st.plotly_chart(fig, width="stretch", key="altman-comp")
+    else:
+        st.info("Altman components are not available (Yahoo is missing inputs).")
     st.markdown("##### Benford's-law screen")
     cols = st.columns(2 if B is not None else 1)
     for col, comp, r, colr in zip(cols, (A, B), (bfA, bfB), (C1, C2)):
@@ -299,7 +496,7 @@ with tabs[4]:
                               legend=dict(orientation="h", y=-0.3))
             st.plotly_chart(fig, width="stretch", key=f"bf-{comp.ticker}")
             st.write(f"KS = **{r['ks']:.3f}** vs cut-off 1.36/√N = **{r['cutoff']:.3f}** (N = {r['n']}) → "
-                     + ("🔴 above cut-off: unusual pattern, investigate" if r["flag"] else "🟢 within cut-off"))
+                     + ("**above cut-off: unusual pattern, investigate**" if r["flag"] else "within cut-off"))
     st.caption("Benford's law is an anomaly detector, not a fraud detector: it shows where to look.")
     st.markdown("##### Governance (Yahoo/ISS risk scores, 1 = low risk, 10 = high risk)")
     gv = {c.name: c.gov for c in (A, B) if c is not None}
@@ -316,8 +513,246 @@ with tabs[4]:
 - **Auditor**: Big-4 or not, tenure, non-audit fees vs audit fees, opinion type (unqualified / qualified / adverse / disclaimer).
 - **Board**: CEO duality, independent-director share, CEO tenure/turnover.""")
 
-# ------------------------------------------------------------------ Insights
+# ------------------------------------------------------------------ Cash flow & lifecycle
 with tabs[5]:
+    st.subheader("Cash flow & lifecycle")
+    st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
+    yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
+    yr = st.select_slider("Fiscal year", options=yrs, value=yrs[-1], format_func=lambda y: f"FY{y}")
+    wcols = st.columns(2 if B is not None else 1)
+    for col, comp, color in zip(wcols, (A, B), (C1, C2)):
+        if comp is None:
+            continue
+        with col:
+            y_ = yr if yr in comp.fin.index else comp.fin.index[-1]
+            steps, net, approx = mt.waterfall_steps(comp.fin.loc[y_])
+            fig = go.Figure(go.Waterfall(
+                x=[s[0] for s in steps] + ["Net change in cash"], y=[s[1] for s in steps] + [0],
+                measure=["relative"] * len(steps) + ["total"], connector=dict(line=dict(color=CB, width=1)),
+                increasing=dict(marker=dict(color=GREEN)), decreasing=dict(marker=dict(color=RED)),
+                totals=dict(marker=dict(color=color)), text=[f"{s[1]:,.0f}" for s in steps] + [f"{net:,.0f}"], textposition="outside"))
+            fig.update_layout(title=dict(text=f"{comp.name} - FY{y_} (Rs cr)", font=dict(size=14)), height=380,
+                              template="plotly_white", margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+            st.plotly_chart(fig, width="stretch", key=f"wf-{comp.ticker}")
+            if approx:
+                st.caption("Yahoo does not split every cash-flow line for this company, so 'other' items are approximate.")
+    st.markdown("##### Lifecycle stage by year")
+    st.caption("Stage from the signs of operating (CFO), investing (CFI) and financing (CFF) cash flow.")
+    for comp in (A, B):
+        if comp is None:
+            continue
+        rows = []
+        for y_, r in comp.fin.iterrows():
+            stage, why = mt.lifecycle(r.get("cfo", np.nan), r.get("cfi", np.nan), r.get("cff", np.nan))
+            rows.append({"Year": f"FY{y_}", "CFO": r.get("cfo", np.nan), "CFI": r.get("cfi", np.nan), "CFF": r.get("cff", np.nan),
+                         "Stage": stage or "n/a", "Credit reading": why or "Yahoo is missing a cash-flow total"})
+        st.markdown(f"**{comp.name}**")
+        st.dataframe(pd.DataFrame(rows).style.format({"CFO": "{:,.0f}", "CFI": "{:,.0f}", "CFF": "{:,.0f}"}, na_rep="n/a"),
+                     width="stretch", hide_index=True)
+
+# ------------------------------------------------------------------ ADVANCED: credit workbench
+with tabs[6]:
+    st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
+    st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
+    bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
+    BC = A if bor_name == A.name else B
+    bm = all_m[BC.ticker]; bvals = latest_all[BC.ticker]
+    bflags = flagsA if BC is A else flagsB
+    brow = BC.fin.iloc[-1]
+    g_ = lambda k: brow[k] if k in brow.index else np.nan
+    base = dict(rev=g_("rev"), ebitda=g_("ebitda"), ebit=g_("ebit"), da=g_("da"), interest=g_("interest"), debt=g_("debt"),
+                cur_debt=g_("cur_debt"), cash=g_("cash"), recv=g_("recv"), inv=g_("inv"), pay=g_("pay"), cfo=g_("cfo"),
+                eq=g_("equity"), ni=g_("ni"))
+    taxr = float(np.clip(g_("tax") / g_("pbt"), 0, 0.4)) if (not pd.isna(g_("tax")) and not pd.isna(g_("pbt")) and g_("pbt") > 0) else 0.25
+    wb = st.tabs(["Facility & stress", "Covenants", "Rating scorecard", "Sector watchlist", "Credit memo"])
+    fac = {}
+
+    # ---- facility & stress
+    with wb[0]:
+        st.markdown(f"##### Facility request and stress test {ADV}", unsafe_allow_html=True)
+        implied = base["interest"] / base["debt"] if base["debt"] and base["debt"] > 0 and not pd.isna(base["interest"]) else 0.095
+        k_ = BC.ticker
+        c = st.columns(5)
+        ftype = c[0].selectbox("Facility type", ["Term loan (amortising)", "Working-capital limit (revolving)"], key=f"ft_{k_}")
+        revolving = ftype.startswith("Working")
+        default_amt = float(max(round(0.25 * (base["ebitda"] if not pd.isna(base["ebitda"]) else 100), -1), 10.0))
+        amount = c[1].number_input("Amount (Rs cr)", 0.0, 1e7, default_amt, 10.0, key=f"fa_{k_}")
+        rate = c[2].number_input("Interest rate (%)", 0.0, 30.0, float(round(min(max(implied * 100, 7.0), 14.0), 2)), 0.25, key=f"fr_{k_}") / 100
+        tenor = c[3].number_input("Tenor (years)", 1.0, 30.0, 5.0, 1.0, key=f"fn_{k_}", disabled=revolving)
+        target = c[4].number_input("Target DSCR (x)", 0.5, 3.0, 1.25, 0.05, key=f"fd_{k_}")
+        st.markdown("**Stress scenario**")
+        s_ = st.columns(4)
+        sg = s_[0].slider("Revenue change (%)", -40, 30, -10, key=f"sg_{k_}") / 100
+        sdm = s_[1].slider("EBITDA margin change (pp)", -10.0, 5.0, -2.0, 0.5, key=f"sdm_{k_}") / 100
+        sdr = s_[2].slider("Interest-rate change (pp)", -2.0, 5.0, 1.0, 0.25, key=f"sdr_{k_}") / 100
+        sdd = s_[3].slider("Receivable days change", -20, 90, 10, key=f"sdd_{k_}")
+        kw = dict(new_rate=rate, tenor=tenor, revolving=revolving, tax_rate=taxr)
+        r_base = mt.stress(base, tax_rate=taxr)
+        r_pro = mt.stress(base, new_debt=amount, **kw)
+        r_str = mt.stress(base, g=sg, dm=sdm, dr=sdr, d_recv_days=sdd, new_debt=amount, **kw)
+        capacity = mt.debt_capacity(base, target, rate, tenor, revolving)
+        covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
+        rows = [("Revenue (Rs cr)", "rev", "{:,.0f}"), ("EBITDA (Rs cr)", "ebitda", "{:,.0f}"), ("Interest (Rs cr)", "interest", "{:,.1f}"),
+                ("Operating cash flow (Rs cr)", "cfo", "{:,.0f}"), ("Interest cover", "icr", "{:.2f}x"), ("DSCR", "dscr", "{:.2f}x"),
+                ("Debt / Equity", "de", "{:.2f}x"), ("Net debt / EBITDA", "nd_ebitda", "{:.2f}x"),
+                ("Cash conversion (CFO/EBITDA)", "cce", "{:.0%}"), ("Cash runway (months)", "runway_m", "{:.0f}")]
+        tbl, css = [], []
+        for label, k, f in rows:
+            vals_ = [r_base[k], r_pro[k], r_str[k]]
+            tbl.append([label] + [("–" if pd.isna(v) else f.format(v)) for v in vals_])
+            cs = [""]
+            for v in vals_:
+                st_ = ""
+                if k in mt.COVENANT_SPECS and not pd.isna(v):
+                    status, _ = mt.covenant_status(v, covs[k], mt.COVENANT_SPECS[k][1])
+                    st_ = {"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)"}.get(status, "")
+                cs.append(st_)
+            css.append(cs)
+        tdf = pd.DataFrame(tbl, columns=["", "Current", "With facility", "Stressed (facility + shocks)"])
+        cdf = pd.DataFrame(css, columns=tdf.columns)
+        st.dataframe(tdf.style.apply(lambda _: cdf, axis=None), width="stretch", hide_index=True)
+        st.caption("Amber = within 15% of a covenant limit, red = breach (limits are set on the Covenants tab).")
+        m3 = st.columns(3)
+        m3[0].metric("Largest facility at target DSCR", money(capacity))
+        m3[1].metric("Requested vs capacity", "No room" if capacity == 0 and amount > 0 else ("Within capacity" if amount <= capacity else "Exceeds capacity"))
+        m3[2].metric("Pro-forma DSCR → stressed", f"{r_pro['dscr']:.2f}x → {r_str['dscr']:.2f}x" if not (pd.isna(r_pro['dscr']) or pd.isna(r_str['dscr'])) else "n/a")
+        st.markdown("**DSCR sensitivity: EBITDA margin vs interest rate** (with the facility and the revenue / receivable shocks above)")
+        dm_list, dr_list = [-0.06, -0.04, -0.02, 0.0, 0.02], [0.0, 0.01, 0.02, 0.03, 0.04]
+        grid = mt.sens_grid(base, dm_list, dr_list, "dscr", g=sg, d_recv_days=sdd, new_debt=amount, **kw)
+        z = grid.values.astype(float)
+        cls = np.where(np.isnan(z), np.nan, np.where(z < 1.0, 0, np.where(z < target, 1, 2)))
+        hm = go.Figure(go.Heatmap(z=cls, x=[f"{d*100:+.0f}pp" for d in dm_list], y=[f"+{d*100:.0f}pp" for d in dr_list],
+                                  colorscale=[[0, RED], [0.5, AMBER], [1, GREEN]], zmin=0, zmax=2, showscale=False,
+                                  text=[[("n/a" if pd.isna(v) else f"{v:.2f}x") for v in row] for row in z], texttemplate="%{text}",
+                                  hovertemplate="margin %{x}, rates %{y}: %{text}<extra></extra>"))
+        hm.update_layout(height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                         xaxis_title="Change in EBITDA margin", yaxis_title="Change in interest rate")
+        st.plotly_chart(hm, width="stretch", key="sens-heat")
+        st.caption(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
+        fac.update(dict(req=dict(type=ftype, amount=amount, rate=rate, tenor=tenor, target=target, capacity=capacity),
+                        scen=dict(base=r_base, pro=r_pro, stress=r_str,
+                                  desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}")))
+
+    # ---- covenants
+    with wb[1]:
+        st.markdown(f"##### Covenant monitor {ADV}", unsafe_allow_html=True)
+        st.caption("Set the limits a lender might impose; the table shows actual value and status for each year.")
+        cc = st.columns(len(mt.COVENANT_SPECS))
+        for col, (k, (label, kind, dflt)) in zip(cc, mt.COVENANT_SPECS.items()):
+            col.number_input(label, 0.0, 50.0, float(dflt), 0.05, key=f"cov_{k}")
+        covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
+        yrs_c = list(bm.columns)[-4:]
+        rows, css = [], []
+        latest_rows = []
+        for k, (label, kind, _) in mt.COVENANT_SPECS.items():
+            r_, c_ = [f"{label.split(' (')[0]} ({'≥' if kind == 'min' else '≤'} {covs[k]:g})"], [""]
+            for y in yrs_c:
+                v = bm.loc[k, y] if k in bm.index else np.nan
+                status, head = mt.covenant_status(v, covs[k], kind)
+                r_.append("n/a" if pd.isna(v) else f"{fmtv(k, v)} · {status}")
+                c_.append({"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)",
+                           "OK": "background-color: rgba(46,160,67,.25)"}.get(status, ""))
+            v_last = bvals.get(k)
+            latest_rows.append((label.split(" (")[0], fmtv(k, v_last), f"{'≥' if kind == 'min' else '≤'} {covs[k]:g}",
+                                mt.covenant_status(v_last, covs[k], kind)[0]))
+            rows.append(r_); css.append(c_)
+        cdf = pd.DataFrame(rows, columns=["Covenant"] + [f"FY{y}" for y in yrs_c])
+        cdf_css = pd.DataFrame(css, columns=cdf.columns)
+        st.dataframe(cdf.style.apply(lambda _: cdf_css, axis=None), width="stretch", hide_index=True)
+        n_b = sum(1 for r in latest_rows if r[3] == "Breach"); n_t = sum(1 for r in latest_rows if r[3] == "Tight")
+        k3 = st.columns(3)
+        k3[0].metric("Breaches (latest year)", n_b); k3[1].metric("Tight (<15% headroom)", n_t)
+        k3[2].metric("Passing", sum(1 for r in latest_rows if r[3] == "OK"))
+        e_, i_ = base["ebit"], base["interest"]
+        if not pd.isna(e_) and not pd.isna(i_) and e_ > 0 and i_ > 0:
+            cushion = 1 - covs["icr"] * i_ / e_
+            st.write(f"**EBIT cushion:** operating profit could fall by **{max(cushion, 0):.0%}** before the interest-cover covenant "
+                     f"({covs['icr']:g}x) is breached.")
+        fac["cov_rows"] = latest_rows
+
+    # ---- rating scorecard
+    with wb[2]:
+        st.markdown(f"##### Indicative risk scorecard {ADV}", unsafe_allow_html=True)
+        st.caption("Weighted blend of the factor scores. It is an internal-style indication, not an agency rating. "
+                   "Change the weights to reflect your view; the banner and Overview update.")
+        with st.expander("Adjust weights", expanded=False):
+            wc = st.columns(6)
+            for col, (p, d) in zip(wc, mt.DEFAULT_WEIGHTS.items()):
+                col.slider(p, 0, 50, d, key=f"w_{p}")
+        W = {p: st.session_state.get(f"w_{p}", d) for p, d in mt.DEFAULT_WEIGHTS.items()}
+        pb = mt.pillar_scores(bvals, BC.gov)
+        pcmp = pB if BC is A else pA
+        cmp_nm = cmp_name if BC is A else A.name
+        sc_b, sc_c = mt.overall_score(pb, W), mt.overall_score(pcmp, W)
+        k2 = st.columns(3)
+        k2[0].metric(f"{BC.name} overall", "n/a" if pd.isna(sc_b) else f"{sc_b:.0f} / 100")
+        k2[1].metric("Indicative band", mt.band(sc_b))
+        k2[2].metric(f"{cmp_nm}", "n/a" if pd.isna(sc_c) else f"{sc_c:.0f} / 100 · {mt.band(sc_c)}")
+        fig = go.Figure()
+        fig.add_bar(y=list(pb), x=[0 if pd.isna(v) else v for v in pb.values()], orientation="h", name=BC.name,
+                    marker_color=C1 if BC is A else C2)
+        fig.add_bar(y=list(pcmp), x=[0 if pd.isna(v) else v for v in pcmp.values()], orientation="h", name=cmp_nm, marker_color=CB)
+        fig.update_layout(barmode="group", height=380, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                          xaxis=dict(range=[0, 100], title="Factor score (0-100)"), yaxis=dict(autorange="reversed"),
+                          legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig, width="stretch", key="pillar-bars")
+        st.caption("Bands: 80+ low risk · 65-80 moderate · 50-65 elevated · 35-50 high · below 35 very high. "
+                   "Governance uses Yahoo/ISS risk scores and is left out (weights re-normalised) when unavailable.")
+        fac["score"] = (sc_b, mt.band(sc_b), pb)
+
+    # ---- sector watchlist
+    with wb[3]:
+        st.markdown(f"##### Sector watchlist - {sector} {ADV}", unsafe_allow_html=True)
+        st.caption("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
+        rows = []
+        for t, c in companies.items():
+            m_ = all_m[t]
+            ys = mt.score_by_year(m_, W)
+            now, prev = ys.iloc[-1], (ys.iloc[-2] if len(ys) > 1 else np.nan)
+            v_ = latest_all[t]
+            vd = ins.verdict(v_, mt.red_flags(c.fin, m_))
+            d_ = now - prev if not pd.isna(now) and not pd.isna(prev) else np.nan
+            rows.append({"": "◀" if t in (t1, t2) else "", "Company": c.name, "Score": now, "Band": mt.band(now),
+                         "Δ vs prior yr": ("n/a" if pd.isna(d_) else f"{'▲' if d_ > 0 else '▼' if d_ < 0 else '■'} {abs(d_):.0f}"),
+                         "Signal": vd["signal"].title(), "Concerns": vd["r"],
+                         "Interest cover": fmtv("icr", v_.get("icr")), "DSCR": fmtv("dscr", v_.get("dscr")),
+                         "Net debt/EBITDA": fmtv("nd_ebitda", v_.get("nd_ebitda")), "Cash conv.": fmtv("cce", v_.get("cce")),
+                         "Altman Z″": fmtv("altman_z2", v_.get("altman_z2")), "Ohlson P(distress)": fmtv("ohlson_p", v_.get("ohlson_p"))})
+        wdf = pd.DataFrame(rows).sort_values("Score", na_position="first")
+        st.dataframe(wdf, column_config={"Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f")},
+                     width="stretch", hide_index=True)
+        st.download_button("Download watchlist (CSV)", wdf.to_csv(index=False), file_name=f"watchlist_{sector}.csv", mime="text/csv", key="dl-watch")
+
+    # ---- credit memo
+    with wb[4]:
+        st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
+        st.caption("Assembled from the numbers on the other tabs (facility inputs, stress case, covenants, scorecard). "
+                   "A draft for analyst review, not a credit decision.")
+        ycols = list(bm.columns)[-3:]
+        snap_items = [("Revenue (Rs cr)", None, "rev"), ("EBITDA (Rs cr)", None, "ebitda"), ("Net profit (Rs cr)", None, "ni"),
+                      ("Operating cash flow (Rs cr)", None, "cfo"), ("Current ratio", "current_ratio", None), ("Interest cover", "icr", None),
+                      ("DSCR (proxy)", "dscr", None), ("Debt / Equity", "de", None), ("Net debt / EBITDA", "nd_ebitda", None),
+                      ("Cash conversion", "cce", None)]
+        srows = []
+        for label, mk, fk in snap_items:
+            vals_ = []
+            for y in ycols:
+                if mk:
+                    vals_.append(fmtv(mk, bm.loc[mk, y]))
+                else:
+                    v = BC.fin.loc[y, fk] if (fk in BC.fin.columns and y in BC.fin.index) else np.nan
+                    vals_.append("n/a" if pd.isna(v) else f"{v:,.0f}")
+            srows.append((label, vals_))
+        sc_b, band_b, pb_ = fac.get("score", (np.nan, "n/a", {}))
+        text = ins.memo(BC.name, sector, f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}", bvals, bflags, pb_,
+                        sc_b if not pd.isna(sc_b) else 0.0, band_b, dict(cols=[f"FY{y}" for y in ycols], rows=srows),
+                        fac.get("req"), fac.get("scen"), fac.get("cov_rows"), bfA if BC is A else bfB, cmp_name)
+        with st.container(border=True):
+            st.markdown(text)
+        st.download_button("Download memo (Markdown)", text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown", key="dl-memo")
+
+# ------------------------------------------------------------------ Insights
+with tabs[7]:
     st.subheader("Insights & analysis")
 
     def render(secs):
@@ -331,35 +766,50 @@ with tabs[5]:
     else:
         l, r = st.columns(2)
         with l:
-            st.markdown(f"<div class='coname' style='color:{C1}'>● {A.name}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='coname' style='color:{C1}'>● {esc(A.name)}</div>", unsafe_allow_html=True)
             render(ins.build(A.name, vA, flagsA, B.name, vB, B.name, bfA))
         with r:
-            st.markdown(f"<div class='coname' style='color:{C2}'>● {B.name}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='coname' style='color:{C2}'>● {esc(B.name)}</div>", unsafe_allow_html=True)
             render(ins.build(B.name, vB, flagsB, A.name, vA, A.name, bfB))
 
 # ------------------------------------------------------------------ Data & method
-with tabs[6]:
+with tabs[8]:
+    st.subheader("Data quality")
+    dq = []
+    for comp in ([A] + ([B] if B else [])):
+        fin = comp.fin
+        ok = int(all_m[comp.ticker].iloc[:, -1].notna().sum())
+        gap = np.nan
+        if {"ta", "tl", "equity"} <= set(fin.columns):
+            r = fin.iloc[-1]
+            gap = abs(r["ta"] - (r["tl"] + r["equity"])) / r["ta"] if r["ta"] else np.nan
+        dq.append({"Company": comp.name, "Latest period": comp.period_end or "n/a", "Fetched": comp.fetched_at or "n/a",
+                   "Years of data": len(fin), "Metrics computable": f"{ok} of {len(mt.M)}",
+                   "Balance check": "n/a" if pd.isna(gap) else (f"OK ({gap:.1%} gap)" if gap < 0.05 else f"Check ({gap:.1%} gap - minority interest or Yahoo mapping)"),
+                   "Fields Yahoo did not supply": ", ".join(comp.missing) or "none"})
+    st.dataframe(pd.DataFrame(dq), width="stretch", hide_index=True)
     st.subheader("Data used")
     for comp in ([A] + ([B] if B else [])):
         st.write(f"Standardised annual statements for **{comp.name}** (Rs crore):")
-        st.dataframe(comp.fin.T.style.format("{:,.1f}"), width="stretch")
-        if comp.missing:
-            st.warning(f"Fields Yahoo did not supply for {comp.name} (related metrics show n/a or use fallbacks): " + ", ".join(comp.missing))
+        st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
     st.subheader("Metric dictionary and thresholds")
-    st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"],
+    st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
                                 "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
-                                "Green at": m["green"], "Red at": m["red"]} for m in mt.M.values()]),
+                                "Healthy at": m["green"], "Concern at": m["red"]} for m in mt.M.values()]),
                  width="stretch", hide_index=True)
     st.subheader("Assumptions & limitations")
-    st.markdown("""
-- **Yahoo Finance gives about 4 annual periods**, so averages, Piotroski, Beneish and the Ohlson change term need the prior year and start in year 2.
+    st.markdown(f"""
+- **Yahoo Finance gives about 4 annual periods**, so averages, Piotroski, Beneish and the Ohlson change term need the prior year and start in year 2. Data is cached for 6 hours; annual statements change only when a company files new results, while market cap moves daily.
 - **Fiscal-year label** = calendar year in which the period ends (FY2025 = year ending Mar-2025 for most Indian firms).
 - **DSCR is a proxy**: (CFO + interest) ÷ (interest + current portion of debt). True DSCR needs the repayment schedule.
 - **Defensive interval** uses cash opex = Revenue − EBITDA; liquid assets = cash & short-term investments + receivables.
 - **Cash-flow accrual** = (NI − CFO) ÷ average net operating assets; NOA = (Assets − cash) − (Liabilities − debt).
 - **Altman Z (original)** uses *current* market cap, so only the latest year is shown. Z′ and Z″ use book values.
-- **Beneish**: if SG&A or another index is missing, that index is set to neutral (1.0); results are then indicative. It is not valid for banks/insurers (none are in the sector list).
+- **Beneish**: if SG&A or another index is missing, that index is set to neutral (1.0); results are then indicative. Not valid for banks/insurers (none are in the sector list).
 - **Ohlson** size term depends on units: total assets in Rs crore ÷ price index (default 100).
+- **Lifecycle stage** follows the sign pattern of operating / investing / financing cash flow.
+- {ADV} **Facility & stress** is a one-year simplified pro-forma: revenue and margin shocks flow to EBITDA; interest scales with the rate change; working-capital change comes from receivable days and revenue-scaled stock and payables; tax at the company's recent rate. New debt proceeds are assumed spent in the business. Debt capacity ignores the tax shield on new interest, so it is conservative.
+- {ADV} **Covenants, scorecard, watchlist, percentile ranks and the credit memo** are analyst aids built on the same metrics. The scorecard blends factor scores with adjustable weights and is not an agency rating.
 - **Not included**: Montier C-score, Kaplan-Zingales, Fulmer H, abnormal-accrual regressions, LLCR and time-adjusted current ratio (these need repayment schedules or receivable ageing).
 - Industry average = the companies listed for that sector in `sectors.py`, not the whole market.
-- Insights are rule-based text, not a credit rating.""")
+- Insights and the memo are rule-based text, not a credit rating or a lending decision.""", unsafe_allow_html=True)

@@ -33,6 +33,7 @@ _r("debt_ratio", "Debt ratio (Debt / Assets)", "Solvency", "x", "low", 0.4, 0.7,
 _r("equity_ratio", "Equity ratio", "Solvency", "x", "high", 0.4, 0.2, "Equity / Total assets", "S3-4")
 _r("icr", "Interest coverage", "Solvency", "x", "high", 3.0, 1.5, "EBIT / Interest", "S3-4 (1.5x = highly leveraged)")
 _r("dscr", "DSCR (proxy)", "Solvency", "x", "high", 1.5, 1.0, "(CFO + Interest) / (Interest + current debt)", "S7-8 (<1 = cash insufficient)")
+_r("nd_ebitda", "Net debt / EBITDA", "Solvency", "x", "low", 2.0, 4.0, "(Total debt - Cash) / EBITDA", "extension")
 _r("fin_lev", "Financial leverage (Assets/Equity)", "Solvency", "x", None, None, None, "Avg assets / Avg equity", "S1-2 DuPont")
 _r("roe", "ROE", "Solvency", "%", None, None, None, "NI / Avg equity", "S1-2 DuPont")
 _r("roa", "ROA", "Solvency", "%", None, None, None, "NI / Avg assets", "S1-2")
@@ -62,6 +63,84 @@ _r("pe", "P/E", "Market", "x", None, None, None, "Market cap / NI", "S15-16")
 _r("p_ocf", "P/OCF", "Market", "x", None, None, None, "Market cap / CFO", "S15-16 (P/OCF > P/E = profits not cash)")
 
 GROUPS = ["Liquidity", "Solvency", "Earnings quality", "Returns", "Scores", "Market"]
+
+# Plain-English meaning of each metric (shown as tooltips / guide in the app)
+DESC = {
+    "current_ratio": "Short-term assets for every rupee due within a year. Above 1.5 looks comfortable, but stuck receivables or slow stock can hide weakness.",
+    "quick_ratio": "Like the current ratio but ignores inventory, so it tests near-cash assets against short-term dues.",
+    "cash_ratio": "Cash alone against short-term dues - the most conservative liquidity test.",
+    "wc_days": "Days of sales tied up in working capital. Fewer is better; a rising number means cash is getting stuck.",
+    "ccc": "Days from paying suppliers to collecting from customers. Shorter is better; negative means customers and suppliers fund the business.",
+    "ocf_ratio": "Operating cash generated per rupee of short-term dues.",
+    "cce": "Share of EBITDA that actually turns into operating cash. Under 40% is a major concern.",
+    "dir_days": "Days the firm can pay its cash costs from cash and receivables if sales stopped.",
+    "runway_m": "If operations are burning cash, the months until the cash balance runs out.",
+    "de": "Debt for every rupee of equity: how much lenders fund versus owners.",
+    "debt_ratio": "Share of total assets funded by debt.",
+    "equity_ratio": "Share of total assets funded by owners - the loss cushion for lenders.",
+    "icr": "How many times operating profit (EBIT) covers interest. Below 1.5x is thin.",
+    "dscr": "Cash available for debt service divided by interest plus principal due. Below 1.0 means cash does not cover repayments. Proxy built from public data.",
+    "nd_ebitda": "Years of EBITDA needed to repay net debt. Above about 4x is usually stretched. (Advanced metric)",
+    "fin_lev": "Rupees of assets supported by each rupee of equity; higher means more gearing.",
+    "roe": "Profit earned on owners' money.",
+    "roa": "Profit earned on all assets.",
+    "sloan": "Share of profit that is non-cash accruals, relative to assets. High values mean lower earnings quality.",
+    "bs_accrual": "Growth in net operating assets (receivables, stock) relative to their size - where did the profits go?",
+    "cf_accrual": "Profit not backed by operating cash, relative to net operating assets - why didn't profit become cash?",
+    "cfo_ni": "Operating cash per rupee of profit; below 1 means profits are not fully cash-backed.",
+    "ffo_tl": "Funds from operations per rupee of total liabilities.",
+    "fcf": "Operating cash left after capital spending.",
+    "roce": "Operating profit relative to capital employed.",
+    "roic": "After-tax operating profit relative to capital provided by lenders and owners.",
+    "roic_spread": "ROIC minus the interest rate paid. Negative means growth is not covering the cost of debt.",
+    "roiic": "Return on the additional capital invested this year.",
+    "altman_z": "Bankruptcy-risk score using market value of equity. Below 1.81 is distress, above 2.99 is safe.",
+    "altman_zp": "Altman score for private manufacturers (book value of equity).",
+    "altman_z2": "Altman score for non-manufacturers and emerging-market firms. Below 1.10 is distress, above 2.60 is safe.",
+    "ohlson_p": "Estimated probability of distress from nine ratios. Above 50% signals likely default within two years.",
+    "zmijewski": "Bankruptcy-risk score from profitability, leverage and liquidity. Higher means riskier.",
+    "springate": "Financial-stress score. Below 0.862 signals stress.",
+    "piotroski": "Count of nine financial-strength tests passed. 7 or more is strong, 3 or less is weak.",
+    "beneish": "Earnings-manipulation score. Above -2.22 suggests a likely manipulator.",
+    "pe": "Price paid for each rupee of profit.",
+    "p_ocf": "Price paid for each rupee of operating cash flow. Higher than P/E means profits are not converting to cash.",
+}
+for _k, _v in M.items():
+    _v["desc"] = DESC.get(_k, "")
+
+# Standard input fields each metric needs (used to explain why a metric is n/a)
+NEEDS = {
+    "current_ratio": ["ca", "cl"], "quick_ratio": ["ca", "inv", "cl"], "cash_ratio": ["cash", "cl"],
+    "wc_days": ["ca", "cl", "rev"], "ccc": ["recv", "inv", "pay", "rev", "cogs"], "ocf_ratio": ["cfo", "cl"],
+    "cce": ["cfo", "ebitda"], "dir_days": ["cash", "recv", "rev", "ebitda"], "runway_m": ["cash", "cfo"],
+    "de": ["debt", "equity"], "debt_ratio": ["debt", "ta"], "equity_ratio": ["equity", "ta"], "icr": ["ebit", "interest"],
+    "dscr": ["cfo", "interest", "cur_debt"], "nd_ebitda": ["debt", "cash", "ebitda"], "fin_lev": ["ta", "equity"],
+    "roe": ["ni", "equity"], "roa": ["ni", "ta"], "sloan": ["ni", "cfo", "ta"], "bs_accrual": ["ta", "cash", "tl", "debt"],
+    "cf_accrual": ["ni", "cfo", "ta", "cash", "tl", "debt"], "cfo_ni": ["cfo", "ni"], "ffo_tl": ["ni", "da", "tl"],
+    "fcf": ["cfo", "capex"], "roce": ["ebit", "ta", "cl"], "roic": ["ebit", "equity", "debt", "cash"],
+    "roic_spread": ["ebit", "equity", "debt", "interest"], "roiic": ["ebit", "equity", "debt", "cash"],
+    "altman_z": ["ca", "cl", "ta", "retained", "ebit", "tl", "rev"], "altman_zp": ["ca", "cl", "ta", "retained", "ebit", "equity", "tl", "rev"],
+    "altman_z2": ["ca", "cl", "ta", "retained", "ebit", "equity", "tl"], "ohlson_p": ["ta", "tl", "ca", "cl", "ni", "da"],
+    "zmijewski": ["ni", "ta", "tl", "ca", "cl"], "springate": ["ca", "cl", "ta", "ebit", "pbt", "rev"],
+    "piotroski": ["ni", "cfo", "ta", "ca", "cl", "rev", "cogs"],
+    "beneish": ["recv", "rev", "cogs", "ca", "ppe", "ta", "da", "sga", "cl", "ltd", "ni", "cfo"],
+    "pe": ["ni"], "p_ocf": ["cfo"],
+}
+FIELD_NAME = {"ca": "current assets", "cl": "current liabilities", "inv": "inventory", "recv": "receivables", "pay": "payables",
+              "cogs": "cost of revenue", "sga": "SG&A", "da": "depreciation", "ppe": "net PP&E", "ltd": "long-term debt",
+              "cur_debt": "current debt", "retained": "retained earnings", "capex": "capex", "ebitda": "EBITDA", "ebit": "EBIT",
+              "interest": "interest expense", "cash": "cash", "debt": "total debt", "equity": "equity", "tl": "total liabilities",
+              "ta": "total assets", "rev": "revenue", "ni": "net income", "pbt": "pre-tax income", "cfo": "operating cash flow"}
+
+
+def missing_inputs(key, fin):
+    """Names of the input fields a metric needs that Yahoo did not supply for this company."""
+    out = []
+    for n in NEEDS.get(key, []):
+        if n not in fin.columns or fin[n].isna().all():
+            out.append(FIELD_NAME.get(n, n))
+    return out
+
 
 
 # ------------------------------------------------------------------ helpers
@@ -143,6 +222,7 @@ def compute(d: pd.DataFrame, mcap_cr: float = np.nan, gnp: float = 100.0) -> pd.
     out["equity_ratio"] = div(eq, ta)
     out["icr"] = div(ebit, intr)
     out["dscr"] = div(cfo + intr, intr + cur_debt.fillna(0))
+    out["nd_ebitda"] = div(debt - cash, ebitda)
     out["fin_lev"] = div(ta_avg, eq_avg)
     out["roe"] = div(ni, eq_avg)
     out["roa"] = div(ni, ta_avg)
@@ -265,7 +345,207 @@ def red_flags(d: pd.DataFrame, m: pd.DataFrame):
     cce = m.loc["cce", y] if "cce" in m.index else np.nan
     if not pd.isna(cce) and cce < 0.4:
         flags.append(("R", f"Only {cce:.0%} of EBITDA converts into operating cash (<40% is a major concern)."))
+    ndx = m.loc["nd_ebitda", y] if "nd_ebitda" in m.index else np.nan
+    if not pd.isna(ndx) and ndx > 4:
+        flags.append(("A", f"Net debt is {ndx:.1f}x EBITDA - stretched leverage (above about 4x)."))
     icr = m.loc["icr", y]
     if not pd.isna(icr) and icr < 1.5:
         flags.append(("R", f"Interest coverage is {icr:.1f}x - EBIT barely covers interest."))
     return flags
+
+
+# ====================================================================== ADVANCED EXTENSIONS
+# ---- percentile rank within sector ------------------------------------------------------
+def percentile(key, value, peer_values):
+    """Share (0-100) of sector values that `value` beats; higher is always better. NaN if < 3 values."""
+    d = M[key]["dir"]
+    vals = [v for v in peer_values if v is not None and not pd.isna(v)]
+    if d is None or pd.isna(value) or len(vals) < 3:
+        return np.nan
+    beat = sum(1.0 for v in vals if (value > v if d == "high" else value < v)) + 0.5 * sum(1.0 for v in vals if v == value)
+    return 100.0 * beat / len(vals)
+
+
+# ---- indicative scorecard ---------------------------------------------------------------
+PILLARS = {"Liquidity": ["Liquidity"], "Solvency & coverage": ["Solvency"], "Earnings quality": ["Earnings quality"],
+           "Returns": ["Returns"], "Distress & forensic": ["Scores"]}
+RAG_PTS = {"G": 100.0, "A": 50.0, "R": 0.0}
+DEFAULT_WEIGHTS = {"Liquidity": 20, "Solvency & coverage": 25, "Earnings quality": 20, "Returns": 10,
+                   "Distress & forensic": 20, "Governance": 5}
+BANDS = [(80, "Low risk"), (65, "Moderate"), (50, "Elevated"), (35, "High"), (0, "Very high")]
+
+
+def governance_score(gov):
+    """Yahoo/ISS risk scores run 1 (low risk) to 10 (high risk); map to 100..0."""
+    vals = [v for v in (gov or {}).values() if v is not None and not pd.isna(v)]
+    return float(100 * (10 - np.mean(vals)) / 9) if vals else np.nan
+
+
+def pillar_scores(vals, gov=None):
+    """vals: Series metric->value. Each pillar = average of 100/50/0 for green/amber/red metrics in it."""
+    out = {}
+    for p, groups in PILLARS.items():
+        pts = [RAG_PTS[r] for k, m in M.items() if m["group"] in groups for r in [rag(k, vals.get(k))] if r]
+        out[p] = float(np.mean(pts)) if pts else np.nan
+    out["Governance"] = governance_score(gov)
+    return out
+
+
+def overall_score(pillars, weights=None):
+    w = weights or DEFAULT_WEIGHTS
+    num = den = 0.0
+    for p, wt in w.items():
+        s_ = pillars.get(p)
+        if s_ is not None and not pd.isna(s_) and wt > 0:
+            num += s_ * wt; den += wt
+    return num / den if den else np.nan
+
+
+def band(score):
+    if pd.isna(score):
+        return "n/a"
+    for lo, name in BANDS:
+        if score >= lo:
+            return name
+    return "Very high"
+
+
+def score_by_year(m_df, weights=None):
+    """Overall indicative score for every year column (governance excluded - it has no history)."""
+    w = {k: v for k, v in (weights or DEFAULT_WEIGHTS).items() if k != "Governance"}
+    return pd.Series({y: overall_score(pillar_scores(m_df[y]), w) for y in m_df.columns})
+
+
+# ---- stress test and facility request ---------------------------------------------------
+def stress(b, g=0.0, dm=0.0, dr=0.0, d_recv_days=0.0, new_debt=0.0, new_rate=0.0, tenor=5.0,
+           revolving=False, tax_rate=0.25):
+    """Simplified one-year pro-forma. b: dict with rev ebitda ebit da interest debt cur_debt cash recv inv pay cfo eq ni.
+    g = revenue growth shock, dm = EBITDA-margin change (absolute, 0.02 = 2pp), dr = interest-rate change (0.01 = 1pp),
+    d_recv_days = change in receivable days, new_debt/new_rate/tenor = proposed facility."""
+    n = lambda k: 0.0 if (b.get(k) is None or pd.isna(b.get(k))) else float(b[k])
+    rev, ebitda, ebit, da = n("rev"), n("ebitda"), n("ebit"), n("da")
+    interest, debt, cur_debt, cash = n("interest"), n("debt"), n("cur_debt"), n("cash")
+    recv, inv, pay, cfo, eq, ni = n("recv"), n("inv"), n("pay"), n("cfo"), n("eq"), n("ni")
+    margin = ebitda / rev if rev else 0.0
+    rev2 = rev * (1 + g)
+    ebitda2 = rev2 * (margin + dm)
+    ebit2 = ebitda2 - da
+    r = interest / debt if debt > 0 else 0.0
+    scale = max(r + dr, 0.0) / r if r > 0 else 1.0
+    interest2 = interest * scale + new_debt * max(new_rate + dr, 0.0)
+    rdays = recv / rev * 365 if rev else 0.0
+    recv2 = (rdays + d_recv_days) * rev2 / 365
+    k = rev2 / rev if rev else 1.0
+    d_wc = (recv2 - recv) + (inv * k - inv) - (pay * k - pay)
+    d_int = interest2 - interest
+    d_tax = tax_rate * ((ebit2 - ebit) - d_int)
+    cfo2 = cfo + (ebitda2 - ebitda) - d_int - d_wc - d_tax
+    cfads2 = cfo2 + interest2
+    ds2 = interest2 + cur_debt + (0.0 if revolving else new_debt / tenor if tenor else 0.0)
+    ni2 = (ebit2 - interest2) * (1 - tax_rate)
+    eq2 = eq + (ni2 - ni)
+    debt2 = debt + new_debt
+    res = dict(
+        rev=rev2, ebitda=ebitda2, ebit=ebit2, interest=interest2, cfo=cfo2, cfads=cfads2, debt_service=ds2,
+        icr=ebit2 / interest2 if interest2 > 0 else np.nan,
+        dscr=cfads2 / ds2 if ds2 > 0 else np.nan,
+        de=debt2 / eq2 if eq2 > 0 else np.nan,
+        nd_ebitda=(debt2 - cash) / ebitda2 if ebitda2 > 0 else np.nan,
+        cce=cfo2 / ebitda2 if ebitda2 > 0 else np.nan,
+        runway_m=cash / (-cfo2 / 12) if cfo2 < 0 else np.nan,
+        debt=debt2, equity=eq2)
+    return res
+
+
+def debt_capacity(b, target_dscr, rate, tenor, revolving=False):
+    """Largest new facility (Rs cr) that keeps DSCR >= target. Conservative: ignores the tax shield on new interest."""
+    n = lambda k: 0.0 if (b.get(k) is None or pd.isna(b.get(k))) else float(b[k])
+    cfads = n("cfo") + n("interest")
+    room = cfads / target_dscr - n("interest") - n("cur_debt")
+    per = rate + (0.0 if revolving else 1.0 / tenor)
+    return max(room / per, 0.0) if per > 0 else np.nan
+
+
+def sens_grid(b, dm_list, dr_list, metric="dscr", **kw):
+    """Grid of `metric` for EBITDA-margin changes (columns) and interest-rate changes (rows)."""
+    return pd.DataFrame([[stress(b, dm=dm, dr=dr, **kw)[metric] for dm in dm_list] for dr in dr_list],
+                        index=dr_list, columns=dm_list)
+
+
+# ---- covenants --------------------------------------------------------------------------
+COVENANT_SPECS = {   # metric key -> (label, kind, default)
+    "icr": ("Interest cover (min)", "min", 2.0),
+    "dscr": ("DSCR (min)", "min", 1.25),
+    "de": ("Debt / Equity (max)", "max", 1.5),
+    "nd_ebitda": ("Net debt / EBITDA (max)", "max", 3.5),
+    "current_ratio": ("Current ratio (min)", "min", 1.2),
+}
+
+
+def covenant_status(actual, limit, kind, tight=0.15):
+    """Return (status, headroom). Headroom is relative distance to the limit (negative = breached)."""
+    if actual is None or pd.isna(actual) or not limit:
+        return "n/a", np.nan
+    head = (actual - limit) / abs(limit) if kind == "min" else (limit - actual) / abs(limit)
+    return ("Breach" if head < 0 else "Tight" if head < tight else "OK"), head
+
+
+# ---- cash flow: lifecycle and waterfall -------------------------------------------------
+LIFECYCLE = {
+    (False, False, True): ("Introduction", "Operations burn cash and are funded by new capital - high risk; check runway."),
+    (True, False, True): ("Growth", "Operations fund part of the expansion but capital is still being raised - watch leverage."),
+    (True, False, False): ("Mature", "Self-funding and repaying capital - usually the lowest credit risk."),
+    (False, False, False): ("Shake-out", "Mixed signals: cash is draining from every activity - investigate."),
+    (True, True, True): ("Shake-out", "Mixed signals: asset sales plus new funding - investigate."),
+    (True, True, False): ("Shake-out", "Asset sales fund repayments - check whether it is sustainable."),
+    (False, True, True): ("Decline", "Operations burn cash and assets are being sold - high risk."),
+    (False, True, False): ("Decline", "Operations burn cash while capital is being returned - high risk."),
+}
+
+
+def lifecycle(cfo, cfi, cff):
+    """Stage from the signs of operating / investing / financing cash flow. Returns (stage, reading) or (None, None)."""
+    if any(v is None or pd.isna(v) for v in (cfo, cfi, cff)):
+        return None, None
+    return LIFECYCLE[(cfo > 0, cfi > 0, cff > 0)]
+
+
+def waterfall_steps(row):
+    """Where a year's cash came from and went. row: Series with cfo capex cfi cff divs netdebt. Returns (steps, net, approx)."""
+    g = lambda k: (np.nan if k not in row.index else row[k])
+    cfo, capex, cfi, cff, divs, nd = g("cfo"), g("capex"), g("cfi"), g("cff"), g("divs"), g("netdebt")
+    z = lambda v: 0.0 if pd.isna(v) else float(v)
+    approx = any(pd.isna(v) for v in (capex, divs, nd))
+    other_inv = z(cfi) - z(capex) if not pd.isna(cfi) else 0.0
+    other_fin = z(cff) - z(divs) - z(nd) if not pd.isna(cff) else 0.0
+    steps = [("Operating cash flow", z(cfo)), ("Capex", z(capex)), ("Other investing", other_inv),
+             ("Dividends", z(divs)), ("Net borrowing", z(nd)), ("Other financing", other_fin)]
+    return steps, sum(v for _, v in steps), approx
+
+
+# ---- return drivers and score breakdown -------------------------------------------------
+def dupont(d):
+    """DuPont and modified DuPont by year: ROE = NPM x asset turnover x equity multiplier;
+    NPM = EBIT margin x interest burden x tax burden."""
+    c = lambda k: d[k] if k in d else pd.Series(np.nan, index=d.index)
+    ta_avg, eq_avg = avg(c("ta")), avg(c("equity"))
+    out = pd.DataFrame(index=d.index)
+    out["Net margin"] = div(c("ni"), c("rev"))
+    out["Asset turnover"] = div(c("rev"), ta_avg)
+    out["Equity multiplier"] = div(ta_avg, eq_avg)
+    out["ROE"] = out["Net margin"] * out["Asset turnover"] * out["Equity multiplier"]
+    out["EBIT margin"] = div(c("ebit"), c("rev"))
+    out["Interest burden"] = div(c("pbt"), c("ebit"))
+    out["Tax burden"] = div(c("ni"), c("pbt"))
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def altman_components(d, year=None):
+    """Weighted contribution of each term of Altman Z'' for one year: list of (label, contribution)."""
+    year = year if year is not None else d.index[-1]
+    r = d.loc[year]
+    g = lambda k: r[k] if k in r.index else np.nan
+    ta, tl = g("ta"), g("tl")
+    x1, x2, x3, x4 = (g("ca") - g("cl")) / ta, g("retained") / ta, g("ebit") / ta, g("equity") / tl
+    return [("Working capital / assets (x6.56)", 6.56 * x1), ("Retained earnings / assets (x3.26)", 3.26 * x2),
+            ("EBIT / assets (x6.72)", 6.72 * x3), ("Equity / liabilities (x1.05)", 1.05 * x4)]
