@@ -190,6 +190,166 @@ def beneish_m(idx):
             + 0.115 * g("DEPI") - 0.172 * g("SGAI") + 4.679 * idx["TATA"] - 0.327 * g("LVGI"))
 
 
+# ------------------------------------------------------------------ score breakdowns ("how is it calculated")
+# Beneish (1999) sample means: non-manipulators vs manipulators. Coefficient sign shows the direction that raises M.
+BENEISH = [
+    # key, name, coef, non-manipulator mean, manipulator mean, formula, what a high value suggests
+    ("DSRI", "Days sales in receivables index", 0.920, 1.031, 1.465, "(Receivables / Sales)ₜ ÷ (Receivables / Sales)ₜ₋₁",
+     "Receivables growing faster than sales: possible revenue inflation or looser credit terms."),
+    ("GMI", "Gross margin index", 0.528, 1.014, 1.193, "Gross marginₜ₋₁ ÷ Gross marginₜ",
+     "Margins are shrinking, which raises the pressure to manage earnings."),
+    ("AQI", "Asset quality index", 0.404, 1.039, 1.254, "[1 − (CA + PPE) / TA]ₜ ÷ [1 − (CA + PPE) / TA]ₜ₋₁",
+     "More of the balance sheet is soft assets: costs may be capitalised instead of expensed."),
+    ("SGI", "Sales growth index", 0.892, 1.134, 1.607, "Salesₜ ÷ Salesₜ₋₁",
+     "Fast growth is not fraud, but it creates pressure to keep reporting it."),
+    ("DEPI", "Depreciation index", 0.115, 1.001, 1.077, "Dep. rateₜ₋₁ ÷ Dep. rateₜ, rate = D&A / (PPE + D&A)",
+     "Depreciating assets more slowly than last year, which flatters profit."),
+    ("SGAI", "SG&A index", -0.172, 1.054, 1.041, "(SG&A / Sales)ₜ ÷ (SG&A / Sales)ₜ₋₁",
+     "Overheads rising relative to sales (negative weight in the model)."),
+    ("LVGI", "Leverage index", -0.327, 1.037, 1.111, "[(CL + LTD) / TA]ₜ ÷ [(CL + LTD) / TA]ₜ₋₁",
+     "Leverage rising, which raises debt-covenant pressure (negative weight in the model)."),
+    ("TATA", "Total accruals to total assets", 4.679, 0.018, 0.031, "(Net income − CFO) ÷ Total assetsₜ",
+     "Profit not backed by operating cash: the strongest single driver of the M-score."),
+]
+BENEISH_CONST, BENEISH_CUTOFF = -4.84, -2.22
+
+
+def _q(a, b):
+    return a / b if not (pd.isna(a) or pd.isna(b) or abs(b) < 1e-12) else np.nan
+
+
+def beneish_parts(d, yr, p):
+    """Each Beneish index for year `yr` vs prior year `p`, with the ratio it compares.
+    Returns {key: dict(cur, prev, index)}; `cur`/`prev` are the underlying ratios (prev is None for TATA)."""
+    g = lambda k, y: d.at[y, k] if k in d.columns else np.nan
+    rv = lambda y: _q(g("recv", y), g("rev", y))
+    gm = lambda y: _q(g("rev", y) - g("cogs", y), g("rev", y))
+    soft = lambda y: 1 - _q(g("ca", y) + g("ppe", y), g("ta", y))
+    dep = lambda y: _q(g("da", y), g("ppe", y) + g("da", y))
+    sga = lambda y: _q(g("sga", y), g("rev", y))
+    lev = lambda y: _q(g("cl", y) + (0.0 if pd.isna(g("ltd", y)) else g("ltd", y)), g("ta", y))
+    ratio = {"DSRI": (rv(yr), rv(p), False), "GMI": (gm(yr), gm(p), True), "AQI": (soft(yr), soft(p), False),
+             "SGI": (g("rev", yr), g("rev", p), False), "DEPI": (dep(yr), dep(p), True), "SGAI": (sga(yr), sga(p), False),
+             "LVGI": (lev(yr), lev(p), False)}
+    out = {k: dict(cur=c, prev=pv, index=_q(pv, c) if inv else _q(c, pv)) for k, (c, pv, inv) in ratio.items()}
+    tata = _q(g("ni", yr) - g("cfo", yr), g("ta", yr))
+    out["TATA"] = dict(cur=tata, prev=None, index=tata)
+    return out
+
+
+def beneish_detail(d, year=None):
+    """Rows explaining the Beneish M-score for one year (default latest). None if no prior year."""
+    if len(d) < 2:
+        return None
+    year = d.index[-1] if year is None else year
+    i = list(d.index).index(year)
+    if i == 0:
+        return None
+    parts = beneish_parts(d, year, d.index[i - 1])
+    rows = []
+    for k, name, coef, ok_mean, bad_mean, formula, meaning in BENEISH:
+        v = parts[k]["index"]
+        used = v if not pd.isna(v) else (np.nan if k == "TATA" else 1.0)
+        rows.append(dict(key=k, name=name, formula=formula, meaning=meaning, cur=parts[k]["cur"], prev=parts[k]["prev"],
+                         index=v, used=used, imputed=pd.isna(v) and k != "TATA", coef=coef, contribution=coef * used,
+                         ok_mean=ok_mean, bad_mean=bad_mean,
+                         # "suspicious" = closer to the manipulator mean than the non-manipulator mean, in the direction that raises M
+                         suspicious=(not pd.isna(v)) and (v >= (ok_mean + bad_mean) / 2 if coef > 0 else False)))
+    m = beneish_m({r["key"]: r["index"] for r in rows})
+    return dict(year=year, prev_year=d.index[i - 1], rows=rows, const=BENEISH_CONST, m=m, cutoff=BENEISH_CUTOFF)
+
+
+def piotroski_detail(d, year=None):
+    """The nine Piotroski tests for one year with the numbers each one used. passed is None when data is missing."""
+    if len(d) < 2:
+        return None
+    year = d.index[-1] if year is None else year
+    i = list(d.index).index(year)
+    if i == 0:
+        return None
+    p = d.index[i - 1]
+    g = lambda k, y: d.at[y, k] if k in d.columns else np.nan
+    ta_avg = lambda y: g("ta", y) if list(d.index).index(y) == 0 else (g("ta", y) + g("ta", d.index[list(d.index).index(y) - 1])) / 2
+    roa_c = _q(g("ni", year), ta_avg(year))
+    cr_c, cr_p = _q(g("ca", year), g("cl", year)), _q(g("ca", p), g("cl", p))
+    gm_c, gm_p = _q(g("rev", year) - g("cogs", year), g("rev", year)), _q(g("rev", p) - g("cogs", p), g("rev", p))
+    at_c, at_p = _q(g("rev", year), ta_avg(year)), _q(g("rev", p), ta_avg(p))
+    cr = lambda v: "n/a" if pd.isna(v) else f"Rs {v:,.0f} cr"
+    pc = lambda v: "n/a" if pd.isna(v) else f"{v:.1%}"
+    xx = lambda v: "n/a" if pd.isna(v) else f"{v:.2f}x"
+    sh = lambda v: "n/a" if pd.isna(v) else f"{v / 1e7:,.2f} cr shares"
+
+    def t(a, b, op):
+        if pd.isna(a) or pd.isna(b):
+            return None
+        return bool(op(a, b))
+    gt, lt, le = (lambda a, b: a > b), (lambda a, b: a < b), (lambda a, b: a <= b)
+    rows = [
+        ("Profitability", "Net income > 0", t(g("ni", year), 0, gt), f"Net income {cr(g('ni', year))}"),
+        ("Profitability", "ROA > 0", t(roa_c, 0, gt), f"ROA {pc(roa_c)}"),
+        ("Profitability", "Operating cash flow > 0", t(g("cfo", year), 0, gt), f"CFO {cr(g('cfo', year))}"),
+        ("Profitability", "CFO > Net income (accrual test)", t(g("cfo", year), g("ni", year), gt),
+         f"CFO {cr(g('cfo', year))} vs NI {cr(g('ni', year))}"),
+        ("Leverage & liquidity", "Long-term debt fell", t(g("ltd", year), g("ltd", p), lt),
+         f"{cr(g('ltd', year))} vs {cr(g('ltd', p))} last year"),
+        ("Leverage & liquidity", "Current ratio rose", t(cr_c, cr_p, gt), f"{xx(cr_c)} vs {xx(cr_p)}"),
+        ("Leverage & liquidity", "No new shares issued", t(g("shares", year), g("shares", p), le),
+         f"{sh(g('shares', year))} vs {sh(g('shares', p))}"),
+        ("Operating efficiency", "Gross margin rose", t(gm_c, gm_p, gt), f"{pc(gm_c)} vs {pc(gm_p)}"),
+        ("Operating efficiency", "Asset turnover rose", t(at_c, at_p, gt), f"{xx(at_c)} vs {xx(at_p)}"),
+    ]
+    rows = [dict(area=a, test=tt, passed=ok, evidence=ev) for a, tt, ok, ev in rows]
+    tested = [r for r in rows if r["passed"] is not None]
+    return dict(year=year, prev_year=p, rows=rows, score=sum(r["passed"] for r in tested) if tested else np.nan,
+                tested=len(tested))
+
+
+def ohlson_detail(d, year=None, gnp=100.0):
+    """Each term of the Ohlson O-score for one year: label, input value, coefficient, contribution."""
+    if not len(d):
+        return None
+    year = d.index[-1] if year is None else year
+    i = list(d.index).index(year)
+    g = lambda k, y: d.at[y, k] if k in d.columns else np.nan
+    ta, tl, ca, cl, ni = (g(k, year) for k in ("ta", "tl", "ca", "cl", "ni"))
+    ffo = ni + g("da", year)
+    ni_p = g("ni", d.index[i - 1]) if i > 0 else ni
+    if any(pd.isna(v) for v in (ta, tl, ca, cl, ni, ffo, ni_p)) or ta <= 0:
+        return None
+    chg = (ni - ni_p) / (abs(ni) + abs(ni_p)) if (abs(ni) + abs(ni_p)) else 0.0
+    terms = [("Size: log(TA / price index)", np.log(ta / gnp), -0.407),
+             ("TL / TA (leverage)", tl / ta, 6.03),
+             ("Working capital / TA", (ca - cl) / ta, -1.43),
+             ("CL / CA", cl / ca, 0.0757),
+             ("Liabilities exceed assets (1 = yes)", 1.0 if tl > ta else 0.0, -1.72),
+             ("NI / TA (profitability)", ni / ta, -2.37),
+             ("FFO / TL (cash cover of liabilities)", ffo / tl, -1.83),
+             ("Losses in both last two years (1 = yes)", 1.0 if (ni < 0 and ni_p < 0) else 0.0, 0.285),
+             ("Change in net income", chg, -0.521)]
+    rows = [dict(term=t, value=v, coef=c, contribution=c * v) for t, v, c in terms]
+    T = -1.32 + sum(r["contribution"] for r in rows)
+    return dict(year=year, rows=rows, const=-1.32, T=T, p=logistic(T), first_year=(i == 0))
+
+
+def forensic_summary(vals, benford_res=None):
+    """One line per earnings-quality / manipulation test: (test, value text, flagged True/False/None, rule)."""
+    def row(key, label, rule):
+        v = vals.get(key)
+        r = rag(key, v)
+        return dict(test=label, key=key, value=v, flagged=None if r is None else (r == "R"), watch=(r == "A"), rule=rule)
+    out = [row("beneish", "Beneish M-score", "Above −2.22 = likely manipulator"),
+           row("sloan", "Sloan accrual ratio", "Above 10% = high accruals"),
+           row("cf_accrual", "Cash-flow accrual ratio", "Above 15% = profit not turning into cash"),
+           row("bs_accrual", "Balance-sheet accrual ratio", "Above 15% = operating assets ballooning"),
+           row("cfo_ni", "CFO / Net income", "Below 0.5x = profit not cash-backed")]
+    bf = benford_res or {}
+    out.append(dict(test="Benford's law (leading digits)", key="benford", value=bf.get("ks"),
+                    flagged=bf.get("flag"), watch=False, rule="KS above 1.36/√N = unusual digit pattern"))
+    tested = [r for r in out if r["flagged"] is not None]
+    return dict(rows=out, flagged=sum(1 for r in tested if r["flagged"]), watch=sum(1 for r in tested if r["watch"]),
+                tested=len(tested))
+
+
 # ------------------------------------------------------------------ main engine
 def compute(d: pd.DataFrame, mcap_cr: float = np.nan, gnp: float = 100.0) -> pd.DataFrame:
     d = d.sort_index().copy()
@@ -284,16 +444,7 @@ def compute(d: pd.DataFrame, mcap_cr: float = np.nan, gnp: float = 100.0) -> pd.
     for i, yr in enumerate(d.index):
         if i == 0:
             continue
-        p = d.index[i - 1]
-        idx = dict(
-            DSRI=div(recv, rev)[yr] / div(recv, rev)[p],
-            GMI=gm[p] / gm[yr],
-            AQI=(1 - (ca[yr] + ppe[yr]) / ta[yr]) / (1 - (ca[p] + ppe[p]) / ta[p]),
-            SGI=rev[yr] / rev[p],
-            DEPI=(da[p] / (ppe[p] + da[p])) / (da[yr] / (ppe[yr] + da[yr])),
-            SGAI=(sga[yr] / rev[yr]) / (sga[p] / rev[p]),
-            LVGI=((cl[yr] + ltd.fillna(0)[yr]) / ta[yr]) / ((cl[p] + ltd.fillna(0)[p]) / ta[p]),
-            TATA=(ni[yr] - cfo[yr]) / ta[yr])
+        idx = {k: v["index"] for k, v in beneish_parts(d, yr, d.index[i - 1]).items()}
         bm[yr] = beneish_m(idx)
     out["beneish"] = bm
     # Market

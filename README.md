@@ -21,6 +21,7 @@ Data comes live from Yahoo Finance via `yfinance` (needs internet). The first lo
 | `insights.py` | Rule-based narrative (no LLM). |
 | `app.py` | Streamlit UI. |
 | `tests/` | Unit tests using the decks' worked examples (Apex liquidity case, accrual A/B, Ohlson 63.7%, Dhenu conversion, Benford, Beneish). |
+| `tests/test_breakdowns.py` | Checks the score breakdowns reproduce the scores exactly, and the insight rules find the right cause on a deteriorating test firm. |
 
 ## First live run - check these
 1. Sidebar warning lists tickers that failed to load (tickers were written from memory; fix in `sectors.py`).

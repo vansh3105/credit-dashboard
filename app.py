@@ -460,6 +460,133 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("Distress & forensic scores")
     section(["Scores"], "sc", GROUP_TITLES["Scores"])
+
+    # ---------- how the forensic scores are calculated
+    st.markdown(f"##### How the forensic scores are calculated {ADV}", unsafe_allow_html=True)
+    st.caption("Every number below is traced back to the statement lines it comes from, so each score can be checked by hand.")
+    fc1, fc2 = st.columns([2, 3])
+    with fc1:
+        fcomp = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="fx-co")]
+    f_years = list(fcomp.fin.index[1:])
+    with fc2:
+        if len(f_years) > 1:
+            fy = st.select_slider("Fiscal year", options=f_years, value=f_years[-1], format_func=lambda y: f"FY{y}", key="fx-yr")
+        else:
+            fy = f_years[0] if f_years else None
+    fm = all_m[fcomp.ticker]
+    fbf = bfA if fcomp is A else bfB
+    if fy is None:
+        st.info("These breakdowns need at least two years of statements.")
+    else:
+        ft = st.tabs(["Forensic summary", "Beneish M-score", "Piotroski F-score", "Ohlson O-score"])
+        RES_TXT = {True: "✕ Flagged", False: "✓ Clear"}
+
+        with ft[0]:
+            fs = mt.forensic_summary(fm[fy], fbf)
+            n, tot = fs["flagged"], fs["tested"]
+            col = RED if n >= 2 else (AMBER if n == 1 or fs["watch"] else GREEN)
+            head = (f"{n} of {tot} forensic tests point to aggressive accounting" if tot else "No forensic test could be run")
+            meaning = ("Several independent tests agree: treat reported earnings with caution and verify them before relying on them."
+                       if n >= 2 else "One isolated signal: look into that test specifically; on its own it is not conclusive."
+                       if n == 1 else "No test raises a concern on the available data.")
+            st.markdown(f"<div class='banner' style='--c:{col}'><div class='sig' style='font-size:1.15rem'>{esc(head)}</div>"
+                        f"<div class='small'>{esc(fcomp.name)} · FY{fy} · {esc(meaning)}</div></div>", unsafe_allow_html=True)
+            rows = []
+            for r in fs["rows"]:
+                if r["key"] == "benford":
+                    val = "n/a" if r["value"] is None or pd.isna(r["value"]) else f"KS {r['value']:.3f} (cut-off {fbf['cutoff']:.3f})"
+                else:
+                    val = fmtv(r["key"], r["value"])
+                res = "– n/a" if r["flagged"] is None else ("! Watch" if r["watch"] else RES_TXT[r["flagged"]])
+                rows.append({"Test": r["test"], "Value": val, "Rule": r["rule"], "Result": res})
+            fdf = pd.DataFrame(rows)
+            st.dataframe(style_cells(fdf, lambda v: {"✕ Flagged": SIG_CSS["✕ Concern"], "✓ Clear": SIG_CSS["✓ Healthy"],
+                                                     "! Watch": SIG_CSS["! Watch"]}.get(v, ""), ["Result"]),
+                         hide_index=True, width="stretch")
+            st.caption("Beneish, Sloan and the accrual ratios all lean on the gap between profit and operating cash, so they are not fully "
+                       "independent. Benford uses every reported figure across all years. None of these proves fraud; they show where to dig.")
+
+        with ft[1]:
+            bd = mt.beneish_detail(fcomp.fin, fy)
+            k1, k2, k3 = st.columns(3)
+            k1.metric("M-score", "n/a" if pd.isna(bd["m"]) else f"{bd['m']:.2f}")
+            k2.metric("Cut-off", f"{bd['cutoff']:.2f}", help="Above −2.22 the model classes the company as a likely manipulator.")
+            k3.metric("Verdict", "n/a" if pd.isna(bd["m"]) else ("Likely manipulator" if bd["m"] > bd["cutoff"] else "Unlikely manipulator"))
+            st.caption(f"M = −4.84 + Σ (weight × index). Each index compares FY{fy} with FY{bd['prev_year']}; 1.0 means no change.")
+            fr = lambda k, v: "n/a" if v is None or pd.isna(v) else (f"Rs {v:,.0f} cr" if k == "SGI" else f"{v:.3f}")
+            brows = [{"Index": f"{r['key']} · {r['name']}", f"FY{fy}": fr(r["key"], r["cur"]),
+                      f"FY{bd['prev_year']}": "–" if r["prev"] is None else fr(r["key"], r["prev"]),
+                      "Index value": "n/a" if pd.isna(r["index"]) else f"{r['index']:.3f}" + (" (neutral 1.0 used)" if r["imputed"] else ""),
+                      "Typical: honest": r["ok_mean"], "Typical: manipulator": r["bad_mean"], "Weight": r["coef"],
+                      "Adds to M": r["contribution"],
+                      "Signal": "⚠ Like manipulators" if r["suspicious"] else "–"} for r in bd["rows"]]
+            bdf = pd.DataFrame(brows)
+            st.dataframe(bdf.style.format({"Typical: honest": "{:.3f}", "Typical: manipulator": "{:.3f}", "Weight": "{:+.3f}",
+                                           "Adds to M": "{:+.3f}"}, na_rep="n/a")
+                         .map(lambda v: SIG_CSS["✕ Concern"] if v == "⚠ Like manipulators" else "", subset=["Signal"]),
+                         hide_index=True, width="stretch")
+            if not pd.isna(bd["m"]):
+                wf = go.Figure(go.Waterfall(
+                    x=["Constant"] + [r["key"] for r in bd["rows"]] + ["M-score"],
+                    measure=["absolute"] + ["relative"] * len(bd["rows"]) + ["total"],
+                    y=[bd["const"]] + [r["contribution"] for r in bd["rows"]] + [0],
+                    text=[f"{bd['const']:.2f}"] + [f"{r['contribution']:+.2f}" for r in bd["rows"]] + [f"{bd['m']:.2f}"],
+                    textposition="outside", increasing=dict(marker_color=RED), decreasing=dict(marker_color=GREEN),
+                    totals=dict(marker_color=RED if bd["m"] > bd["cutoff"] else GREEN), connector=dict(line=dict(color=CB))))
+                wf.add_hline(y=bd["cutoff"], line_dash="dash", line_color=AMBER, annotation_text="−2.22 cut-off",
+                             annotation_position="top left")
+                wf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                 yaxis_title="Running M-score", showlegend=False)
+                st.plotly_chart(wf, width="stretch", key="beneish-wf")
+                st.caption("Red bars push the score towards 'manipulator', green bars pull it back. The final bar is the M-score.")
+            with st.expander("What each index is looking for"):
+                for r in bd["rows"]:
+                    st.markdown(f"**{r['key']} - {r['name']}** `{r['formula']}`  \n{r['meaning']}"
+                                + (" **This company looks like the manipulator sample on this index.**" if r["suspicious"] else ""))
+                st.caption("Typical values are the sample means in Beneish (1999). An index is marked when it is closer to the manipulator "
+                           "mean than to the honest mean, for indices whose weight is positive.")
+
+        with ft[2]:
+            pdt = mt.piotroski_detail(fcomp.fin, fy)
+            k1, k2 = st.columns(2)
+            k1.metric("F-score", "n/a" if pd.isna(pdt["score"]) else f"{pdt['score']:.0f} / 9",
+                      help="7 or more is strong, 3 or less is weak.")
+            k2.metric("Tests with data", f"{pdt['tested']} of 9")
+            if pdt["tested"] < 9:
+                st.caption("Tests without data are left out, so the score is out of fewer than 9 points.")
+            prow = [{"Area": r["area"], "Test": r["test"],
+                     "Result": "– no data" if r["passed"] is None else ("✓ Pass (+1)" if r["passed"] else "✕ Fail (0)"),
+                     "Numbers used": r["evidence"]} for r in pdt["rows"]]
+            pdf_ = pd.DataFrame(prow)
+            st.dataframe(style_cells(pdf_, lambda v: SIG_CSS["✓ Healthy"] if str(v).startswith("✓") else
+                                     (SIG_CSS["✕ Concern"] if str(v).startswith("✕") else ""), ["Result"]),
+                         hide_index=True, width="stretch")
+            st.caption(f"Comparisons are FY{fy} vs FY{pdt['prev_year']}. ROA and asset turnover use average total assets.")
+
+        with ft[3]:
+            od = mt.ohlson_detail(fcomp.fin, fy, gnp)
+            if od is None:
+                st.info("Ohlson inputs are missing for this year.")
+            else:
+                k1, k2, k3 = st.columns(3)
+                k1.metric("T (log-odds)", f"{od['T']:.2f}")
+                k2.metric("Probability of distress", f"{od['p']:.1%}", help="e^T / (1 + e^T). Above 50% signals default within two years.")
+                k3.metric("Zone", {"G": "Low", "A": "Moderate", "R": "High"}.get(mt.rag("ohlson_p", od["p"]), "n/a"))
+                orows = [{"Term": r["term"], "Input value": r["value"], "Weight": r["coef"], "Adds to T": r["contribution"]}
+                         for r in od["rows"]]
+                st.dataframe(pd.DataFrame(orows).style.format({"Input value": "{:.3f}", "Weight": "{:+.3f}", "Adds to T": "{:+.3f}"}),
+                             hide_index=True, width="stretch")
+                srt = sorted(od["rows"], key=lambda r: r["contribution"])
+                of = go.Figure(go.Bar(x=[r["contribution"] for r in srt], y=[r["term"] for r in srt], orientation="h",
+                                      marker_color=[RED if r["contribution"] > 0 else GREEN for r in srt]))
+                of.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                 xaxis_title="Contribution to T (right = more risk)")
+                st.plotly_chart(of, width="stretch", key="ohlson-bars")
+                st.markdown(f"T = −1.32 + Σ contributions = **{od['T']:.2f}** → P = e^T ÷ (1 + e^T) = **{od['p']:.1%}**")
+                st.caption(f"The size term divides total assets (Rs crore) by the price index set in the sidebar ({gnp:g}), so large Indian "
+                           "companies get a large negative size term."
+                           + (" This is the first year of data, so the change-in-income term uses the same year (0)." if od["first_year"] else ""))
+
     st.markdown("##### What drives the Altman Z″ score")
     st.caption("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
     fig = go.Figure()
@@ -761,16 +888,130 @@ with tabs[7]:
             for b in bullets:
                 st.markdown(f"- {b}")
 
-    if B is None:
-        render(ins.build(A.name, vA, flagsA, cmp_label, vB, None, bfA))
-    else:
+    ic = A if B is None else {A.name: A, B.name: B}[st.radio("Analyse", [A.name, B.name], horizontal=True, key="ins-co")]
+    is_A = ic is A
+    i_vals, i_m, i_flags, i_bf, i_col = (vA, mA, flagsA, bfA, C1) if is_A else (vB, cmp_df, flagsB, bfB, C2)
+    i_bench, i_bench_lbl, i_bench_m = (vB, cmp_name, cmp_df) if is_A else (vA, A.name, mA)
+    i_tr = ins.trends(i_m, {t: m for t, m in all_m.items() if t != ic.ticker})
+    i_rc = ins.root_causes(ic.fin, i_m)
+    i_fix, i_cush = ins.fix_targets(ic.fin)
+    i_cards = ins.cards(ic.name, i_vals, i_m, ic.fin, i_flags, i_tr, i_rc, i_bench, i_bench_lbl, latest_all)
+    n_sev = {s: sum(1 for c in i_cards if c["severity"] == s) for s in ins.SEV_ORDER}
+    v_ = ins.verdict(i_vals, i_flags)
+    st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[v_['signal']]}'><div class='who' style='color:{i_col}'>● {esc(ic.name)}</div>"
+                f"<div class='sig'>{v_['signal']}</div><div>{n_sev['High']} high-priority issues · {n_sev['Medium']} medium · "
+                f"{n_sev['Strength']} strengths · compared with {esc(i_bench_lbl)}</div></div>", unsafe_allow_html=True)
+
+    it = st.tabs(["Key insights", "Trends", "Root causes", "Peer position", "What it would take", "Summary"])
+    SEV_COL = {"High": RED, "Medium": AMBER, "Low": CB, "Strength": GREEN}
+
+    with it[0]:
+        st.caption("Ranked by priority. Each card shows the evidence, why a lender should care, what to ask, and where to look in the dashboard.")
+        show = st.segmented_control("Show", ["Risks", "Strengths", "All"], default="Risks", key="ins-filter") or "Risks"
+        sel = [c for c in i_cards if show == "All" or (show == "Strengths") == (c["severity"] == "Strength")]
+        if not sel:
+            st.info("Nothing to show for this filter.")
+        for c in sel:
+            with st.container(border=True):
+                st.markdown(f"<span style='background:{SEV_COL[c['severity']]};color:#fff;font-size:.7rem;font-weight:700;"
+                            f"padding:2px 8px;border-radius:999px'>{c['severity'].upper()}</span> "
+                            f"<b style='font-size:1.02rem'>{esc(c['title'])}</b>", unsafe_allow_html=True)
+                st.markdown(c["body"])
+                if c["evidence"]:
+                    st.caption(" · ".join(c["evidence"]))
+                extra = []
+                if c["why"] and c["why"] not in c["body"]:
+                    extra.append(f"**Why it matters:** {c['why']}")
+                if c["ask"]:
+                    extra.append(f"**What to ask:** {c['ask']}")
+                extra.append(f"*See the {c['tab']} tab.*")
+                st.markdown("  \n".join(extra))
+
+    with it[1]:
+        worse = [t for t in i_tr if not t["improving"]]
+        better_ = [t for t in i_tr if t["improving"]]
+        st.caption(f"Change over the full history available ({len(i_m.columns)} fiscal years). Moves that change zone come first, "
+                   "then moves that are the largest in the sector.")
         l, r = st.columns(2)
         with l:
-            st.markdown(f"<div class='coname' style='color:{C1}'>● {esc(A.name)}</div>", unsafe_allow_html=True)
-            render(ins.build(A.name, vA, flagsA, B.name, vB, B.name, bfA))
+            st.markdown("**Getting worse**")
+            for t in worse[:8]:
+                st.markdown(f"- {t['text']}")
+            if not worse:
+                st.write("No rated metric has deteriorated.")
         with r:
-            st.markdown(f"<div class='coname' style='color:{C2}'>● {esc(B.name)}</div>", unsafe_allow_html=True)
-            render(ins.build(B.name, vB, flagsB, A.name, vA, A.name, bfB))
+            st.markdown("**Getting better**")
+            for t in better_[:8]:
+                st.markdown(f"- {t['text']}")
+            if not better_:
+                st.write("No rated metric has improved.")
+        movers = [t for t in i_tr if t["zone"] != 0][:4] or i_tr[:4]
+        if movers:
+            st.markdown("##### Biggest moves")
+            mc = st.columns(2)
+            for j, t in enumerate(movers):
+                with mc[j % 2]:
+                    sers = {ic.name: i_m.loc[t["key"]]}
+                    if t["key"] in i_bench_m.index:
+                        sers[i_bench_lbl] = i_bench_m.loc[t["key"]]
+                    st.plotly_chart(trend(t["key"], sers, h=250), width="stretch", key=f"ins-tr-{t['key']}")
+
+    with it[2]:
+        st.caption("Why the key numbers moved, traced back to the statement lines (latest year vs the year before).")
+        if not i_rc:
+            st.success("No major deterioration that needs explaining in the latest year.")
+        for c in sorted(i_rc, key=lambda c: ins.SEV_ORDER[c["severity"]]):
+            with st.container(border=True):
+                st.markdown(f"<span style='color:{SEV_COL[c['severity']]};font-weight:700'>●</span> <b>{esc(c['title'])}</b>",
+                            unsafe_allow_html=True)
+                st.markdown(c["text"])
+                if c["evidence"]:
+                    st.caption(" · ".join(c["evidence"]))
+
+    with it[3]:
+        top, bottom = ins.peer_position(i_vals, latest_all)
+        st.caption(f"Percentile = share of the {len(latest_all)} companies loaded in {sector} that {ic.name} beats on each metric "
+                   "(higher is always better).")
+
+        def pp_table(rows):
+            return pd.DataFrame([{"Metric": mt.M[k]["label"], "Value": fmtv(k, i_vals.get(k)), "Percentile": p} for k, p in rows])
+        cfg = {"Percentile": st.column_config.ProgressColumn("Percentile", min_value=0, max_value=100, format="%.0f")}
+        l, r = st.columns(2)
+        for col_, rows_, head_ in ((l, top, "Top quartile (sector leader)"), (r, bottom, "Bottom quartile (sector laggard)")):
+            with col_:
+                st.markdown(f"**{head_}**")
+                if rows_:
+                    st.dataframe(pp_table(rows_), column_config=cfg, hide_index=True, width="stretch")
+                else:
+                    st.write("None.")
+        if len(latest_all) < 5:
+            st.caption("Few companies are loaded for this sector, so percentiles are coarse.")
+
+    with it[4]:
+        st.caption(f"Based on FY{ic.fin.index[-1]} statements. Targets are the healthy thresholds used across the dashboard; "
+                   "each fix assumes everything else stays the same.")
+        l, r = st.columns(2)
+        with l:
+            st.markdown("**To reach the healthy zone**")
+            if not i_fix:
+                st.success("All the tested metrics are already in the healthy zone.")
+            for f_ in i_fix:
+                with st.container(border=True):
+                    st.markdown(f"**{mt.M[f_['key']]['label']}**: {fmtv(f_['key'], f_['now'])} → target {fmtv(f_['key'], f_['target'])}")
+                    st.markdown(f_["text"])
+        with r:
+            st.markdown("**Cushion before the concern zone**")
+            if not i_cush:
+                st.write("No healthy metric to stress.")
+            for c in i_cush:
+                with st.container(border=True):
+                    st.markdown(f"**{mt.M[c['key']]['label']}**: {fmtv(c['key'], i_vals.get(c['key']))}")
+                    st.markdown(c["text"])
+        st.caption("Use the Credit workbench tab to test combined shocks and a new facility.")
+
+    with it[5]:
+        st.caption("The original rule-based summary.")
+        render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
 
 # ------------------------------------------------------------------ Data & method
 with tabs[8]:
