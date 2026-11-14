@@ -6,10 +6,19 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import importlib
+
 import data as dt
 import insights as ins
 import metrics as mt
-from sectors import SECTORS
+import sectors
+
+# Streamlit re-runs app.py after a code update (e.g. a git push to Streamlit Cloud) but keeps already-imported
+# modules in memory, so a new app.py could run against an old metrics.py. Reload the pure-logic modules every run
+# (metrics first: insights depends on it). data.py is NOT reloaded because it holds the 6-hour download cache.
+mt = importlib.reload(mt)
+ins = importlib.reload(ins)
+SECTORS = importlib.reload(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", page_icon="📊")
