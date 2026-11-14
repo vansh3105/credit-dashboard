@@ -151,6 +151,23 @@ def stance(signal, pro_dscr=None, breaches=0, target=1.25):
     return "Supportable", "Metrics are comfortable; keep standard monitoring."
 
 
+def conditions(vals, stance_txt):
+    """Conditions that match the stance: a 'Supportable' case gets actions only for concern-zone metrics and a light
+    monitoring line for watch-zone ones; weaker stances also get the watch-zone actions."""
+    reds = [k for k in mt.M if mt.rag(k, vals.get(k)) == "R"]
+    ambers = [k for k in mt.M if mt.rag(k, vals.get(k)) == "A"]
+    pool = reds if stance_txt == "Supportable" else reds + ambers
+    acts = []
+    for k in pool:
+        a = ACTION.get(k)
+        if a and a not in acts:
+            acts.append(a)
+    acts = acts[:6]
+    if stance_txt == "Supportable" and ambers:
+        acts.append("Monitor at the next review: " + ", ".join(mt.M[k]["label"] for k in ambers[:5]) + ".")
+    return acts or ["Standard monitoring; refresh after the next results."]
+
+
 def memo(name, sector, as_of, vals, flags, pillars, score, band_txt, snap_rows, req=None, scen=None, cov_rows=None,
          bf=None, cmp_name=None):
     """Return the credit-appraisal note as markdown. All inputs are pre-computed by the app."""
@@ -194,13 +211,9 @@ def memo(name, sector, as_of, vals, flags, pillars, score, band_txt, snap_rows, 
         lines.append("")
     breaches = sum(1 for r in (cov_rows or []) if r[3] == "Breach")
     st_, why = stance(v["signal"], scen["pro"]["dscr"] if scen else None, breaches, req["target"] if req else 1.25)
-    acts = []
-    for k in [k for k in mt.M if mt.rag(k, vals.get(k)) in ("R", "A")]:
-        a = ACTION.get(k)
-        if a and a not in acts:
-            acts.append(a)
+    acts = conditions(vals, st_)
     lines += ["## 8. Indicative stance", f"**{st_}.** {why}", "", "### Conditions / next steps",
-              *([f"- {a}" for a in acts[:6]] or ["- Standard monitoring; refresh after next results."]), "",
+              *[f"- {a}" for a in acts], "",
               "---", "*Limitations: annual public statements only; DSCR is a proxy; no collateral, management or "
               "industry assessment is included. Figures in Rs crore.*"]
     return "\n".join(lines)

@@ -19,7 +19,8 @@ import sectors
 def _fresh(mod):
     """Streamlit re-runs app.py after a code update (e.g. a git push to Streamlit Cloud) but keeps imported modules in
     memory, so a new app.py could run against an old metrics.py. Reload a module only when its file has changed, so
-    concurrent sessions are not disturbed. data.py is never reloaded: it holds the 6-hour download cache."""
+    concurrent sessions are not disturbed. Reloading data.py also empties its download cache, so after a deploy that
+    changes data.py the next visitor re-downloads the sector once."""
     stamp = os.path.getmtime(mod.__file__)
     if getattr(mod, "_loaded_mtime", None) != stamp:
         mod = importlib.reload(mod)
@@ -27,7 +28,8 @@ def _fresh(mod):
     return mod
 
 
-mt = _fresh(mt)          # metrics first: insights depends on it
+dt = _fresh(dt)
+mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
 SECTORS = _fresh(sectors).SECTORS
 
@@ -113,10 +115,16 @@ st.sidebar.title("📊 Credit Risk Dashboard")
 st.sidebar.caption("For the **Credit Risk Analyst** · live data from Yahoo Finance")
 view_box = st.sidebar.expander("View options", expanded=True)
 with view_box:
+    basis_sel = st.segmented_control(
+        "Scoring basis", ["Textbook", "Sector-relative"], default="Textbook", key="basis",
+        help="Textbook: the course cut-offs, the same for every industry. Sector-relative: each metric is judged against the "
+             "companies in the selected sector - healthy = at least the sector median, concern = the sector's worst 25%. "
+             "Hard floors still apply (DSCR or interest cover below 1x, Ohlson default probability above 50%), and the "
+             "Beneish and free-cash-flow rules never become 'sector-normal'.") or "Textbook"
     strict = st.segmented_control("Threshold strictness", ["Lenient", "Standard", "Conservative"], default="Standard",
-                                  key="strict", help="Conservative moves every healthy / concern cut-off 20% towards 'better', so more "
-                                  "metrics are flagged; Lenient moves them 20% the other way. Model cut-offs (Beneish −2.22, "
-                                  "Springate 0.862) never move.") or "Standard"
+                                  key="strict", help="Textbook basis: Conservative moves every healthy / concern cut-off 20% towards "
+                                  "'better', Lenient 20% the other way. Sector-relative basis: Conservative uses the 60th / 35th sector "
+                                  "percentiles, Standard the 50th / 25th, Lenient the 40th / 15th. Model cut-offs (Beneish −2.22) never move.") or "Standard"
     show_calc = st.toggle("Show calculations", key="show_calc",
                           help="Adds the formula with the company's own numbers to every comparison table.")
 mt.set_strictness(strict)
@@ -205,6 +213,12 @@ with top[3]:
 # ------------------------------------------------------------------ compute
 all_m = {t: mt.compute(c.fin, c.mcap_cr, gnp) for t, c in companies.items()}
 latest_all = {t: ins.latest(m) for t, m in all_m.items()}
+mt.set_basis(basis_sel, {k: [lv.get(k) for lv in latest_all.values()] for k in mt.M})
+SECTOR_MODE = basis_sel == "Sector-relative"
+if SECTOR_MODE:
+    n_band = sum(mt.is_sector_band(k) for k in mt.M)
+    st.sidebar.info(f"**Sector-relative scoring:** {n_band} metrics are judged against the {len(latest_all)} {sector} companies. "
+                    "Tables add a *textbook* column so you can see what is weak on paper but normal for the sector.")
 W = {p: st.session_state.get(f"w_{p}", d) for p, d in mt.DEFAULT_WEIGHTS.items()}
 
 A = companies[t1]; mA = all_m[t1]
@@ -268,6 +282,8 @@ def table_df(groups):
             pv = [lv.get(k) for t, lv in latest_all.items() if t != t1 and not pd.isna(lv.get(k))]
             row["Sector middle 50%"] = ("–" if size_k or len(pv) < 4 else
                                         f"{fmtv(k, np.percentile(pv, 25))} to {fmtv(k, np.percentile(pv, 75))}")
+        if SECTOR_MODE:
+            row[f"{A.name} textbook signal"] = SIG[mt.rag(k, a, "Textbook")]
         if show_calc:
             for comp in (A, B):
                 if comp is not None:
@@ -488,7 +504,8 @@ def size_line(t):
 
 st.title(f"{A.name} vs {cmp_name}")
 asof = f"Annual statements to {A.period_end or 'n/a'}" + (f" ({B.name}: {B.period_end})" if B is not None and B.period_end != A.period_end else "")
-st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · {asof} · "
+st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · "
+           f"scoring: **{basis_sel.lower()}**{'' if strict == 'Standard' else ', ' + strict.lower()} · {asof} · "
            f"fetched {A.fetched_at or 'n/a'} · figures in Rs crore · source: Yahoo Finance (market cap as of fetch)")
 if A.currency and A.currency != "INR":
     st.warning(f"Yahoo reports {A.name}'s financials in {A.currency}; the dashboard assumes INR crore.")
@@ -552,7 +569,7 @@ with tabs[0]:
         v = g if which == "G" else r
         if v is None or mt.M[k]["dir"] is None:
             return "–"
-        if k in ("beneish", "springate", "fcf"):
+        if k in ("beneish", "fcf") or (k == "springate" and not mt.is_sector_band(k)):
             return {"beneish": {"G": "< −2.22", "R": "> −2.22"}, "springate": {"G": "> 0.862", "R": "< 0.862"},
                     "fcf": {"G": "> 0", "R": "< 0"}}[k][which]
         hi = mt.M[k]["dir"] == "high"
@@ -582,16 +599,19 @@ with tabs[0]:
             pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
             tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)] if k in mA.index else []
             rows.append({"Metric": mt.M[k]["label"], A.name: fmtv(k, a), "Signal": SIG[mt.rag(k, a)],
+                         **({"Textbook signal": SIG[mt.rag(k, a, "Textbook")]} if SECTOR_MODE else {}),
                          cmp_name: NOT_COMPARABLE if size_k else fmtv(k, b),
                          "Healthy": cutoff(k, "G"), "Concern": cutoff(k, "R"),
                          "Sector pct": None if pd.isna(pct) else float(pct), "Trend": tv if len(tv) >= 2 else None,
                          f"How {A.name}'s value is calculated": calc_text(k, A)})
         ddf = pd.DataFrame(rows)
-        st.dataframe(style_cells(ddf, lambda v: SIG_CSS.get(v, ""), ["Signal"]), hide_index=True, width="stretch",
+        st.dataframe(style_cells(ddf, lambda v: SIG_CSS.get(v, ""), [c for c in ddf.columns if c.endswith("Signal")]),
+                     hide_index=True, width="stretch",
                      column_config={"Sector pct": st.column_config.ProgressColumn("Sector pct", min_value=0, max_value=100, format="%.0f"),
                                     "Trend": st.column_config.LineChartColumn("Trend", width="small"),
                                     f"How {A.name}'s value is calculated": st.column_config.TextColumn(width="large")})
-        st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score.")
+        st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score."
+                   + (f" Cut-offs are {sector}'s own percentiles (sector-relative basis)." if SECTOR_MODE else ""))
 
     pill = list(mt.PILLARS) + ["Governance"]
     st.caption("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
@@ -1292,16 +1312,20 @@ with tabs[8]:
         st.write(f"Standardised annual statements for **{comp.name}** (Rs crore):")
         st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
     st.subheader("Metric dictionary and thresholds")
-    if strict != "Standard":
+    if SECTOR_MODE:
+        st.caption(f"Cut-offs below are **sector-relative** for {sector} ({strict} strictness): taken from this sector's own "
+                   "distribution where at least 6 companies have the metric, otherwise the textbook cut-off.")
+    elif strict != "Standard":
         st.caption(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
     st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
                                 "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
-                                "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1]} for k, m in mt.M.items()]),
+                                "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1],
+                                "Cut-off source": "sector" if mt.is_sector_band(k) else ("textbook" if m["dir"] and m["green"] is not None else "-"),
+                                "Textbook healthy": m["green"], "Textbook concern": m["red"]} for k, m in mt.M.items()]),
                  width="stretch", hide_index=True)
     st.subheader("Assumptions & limitations")
     st.markdown(f"""
 - **Yahoo Finance gives about 4 annual periods**, so averages, Piotroski, Beneish and the Ohlson change term need the prior year and start in year 2. Data is cached for 6 hours; annual statements change only when a company files new results, while market cap moves daily.
-- **Fiscal-year label** = calendar year in which the period ends (FY2025 = year ending Mar-2025 for most Indian firms).
 - **DSCR is a proxy**: (CFO + interest) ÷ (interest + current portion of debt). True DSCR needs the repayment schedule.
 - **Defensive interval** uses cash opex = Revenue − EBITDA; liquid assets = cash & short-term investments + receivables.
 - **Cash-flow accrual** = (NI − CFO) ÷ average net operating assets; NOA = (Assets − cash) − (Liabilities − debt).
@@ -1313,5 +1337,15 @@ with tabs[8]:
 - {ADV} **Covenants, scorecard, watchlist, percentile ranks and the credit memo** are analyst aids built on the same metrics. The scorecard blends factor scores with adjustable weights and is not an agency rating.
 - **Not included**: Montier C-score, Kaplan-Zingales, Fulmer H, abnormal-accrual regressions, LLCR and time-adjusted current ratio (these need repayment schedules or receivable ageing).
 - Industry average = the companies listed for that sector in `sectors.py` (excluding the selected company), not the whole market. Only size-neutral numbers (ratios, margins, growth, days, scores) are averaged; rupee amounts such as revenue, profit and free cash flow are shown as a rank within the sector instead, because a median of very different-sized companies is not a benchmark.
+- **Scoring basis.** *Textbook* applies the course cut-offs to every industry, which marks whole sectors as weak (e.g. most
+  utilities fail Springate and Altman; most IT and pharma firms carry 'too many' working-capital days). *Sector-relative*
+  judges each metric against the selected sector: healthy = at least the sector median, concern = its worst 25% (strictness
+  shifts these percentiles). Hard floors stay: DSCR or interest cover below 1x and Ohlson probability above 50% are always a
+  concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
+  textbook cut-off.
+- **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
+  of total assets respectively.
+- **Fiscal-year labels** follow the Indian April-March year: an October-December year end is labelled with the next calendar
+  year (Dec-2025 → FY2026), since it overlaps that fiscal year for 9 of 12 months.
 - **Growth & margins** (revenue growth, EBITDA, net and free-cash-flow margins) are compared with peers but not rated green/red, because normal margins differ widely between sectors.
 - Insights and the memo are rule-based text, not a credit rating or a lending decision.""", unsafe_allow_html=True)

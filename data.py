@@ -78,6 +78,14 @@ def _first_row(df, names):
     return None
 
 
+def fiscal_label(period_end):
+    """Indian fiscal-year label for a period end. FY2026 = Apr-2025 to Mar-2026, so a March year end keeps its calendar
+    year, while an October-December year end (e.g. Dec-2025) overlaps FY2026 for 9 of 12 months and is labelled FY2026.
+    Without this, December year-end companies sat a year behind their March year-end peers."""
+    ts = pd.Timestamp(period_end)
+    return ts.year + 1 if ts.month >= 10 else ts.year
+
+
 def _standardise(ticker, name, bs, is_, cf, info):
     stm = {"bs": bs, "is": is_, "cf": cf}
     cols, missing = {}, []
@@ -87,7 +95,7 @@ def _standardise(ticker, name, bs, is_, cf, info):
             missing.append(k)
             continue
         row = pd.to_numeric(row, errors="coerce")
-        row.index = pd.to_datetime(row.index).year          # fiscal-year label = calendar year of period end
+        row.index = [fiscal_label(x) for x in row.index]
         row = row[~row.index.duplicated()]
         cols[k] = row if k in NON_MONEY else row / CR
     fin = pd.DataFrame(cols).sort_index().dropna(how="all")
@@ -100,7 +108,7 @@ def _standardise(ticker, name, bs, is_, cf, info):
     # period end date of the latest year, for the "data as of" stamp
     period_end = ""
     try:
-        periods = {pd.Timestamp(c).year: pd.Timestamp(c) for c in is_.columns}
+        periods = {fiscal_label(c): pd.Timestamp(c) for c in is_.columns}
         if len(fin):
             period_end = periods[fin.index[-1]].strftime("%b-%Y")
     except Exception:
@@ -110,7 +118,7 @@ def _standardise(ticker, name, bs, is_, cf, info):
         if df is None or df.empty:
             continue
         for col in df.columns:
-            yr = pd.Timestamp(col).year
+            yr = fiscal_label(col)
             raw.setdefault(yr, []).extend([float(v) for v in df[col].dropna().values if v])
     gov = {k: info.get(k) for k in ("auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk")
            if info.get(k) is not None}

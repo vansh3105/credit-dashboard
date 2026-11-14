@@ -96,3 +96,42 @@ def test_explain_shows_the_numbers_used(stressed):
     assert mt.explain("icr", stressed) == "EBIT 60 ÷ interest 70"
     assert mt.explain("rev_growth", stressed) == "Revenue FY2025 1,150 ÷ revenue FY2024 1,100 − 1"
     assert mt.explain("beneish", stressed) is None                     # multi-part scores have their own breakdown
+
+
+def test_sector_relative_cutoffs_and_floors():
+    sector = {"wc_days": [60, 80, 100, 110, 120, 130, 140, 150],          # IT-like: everyone above the textbook 90-day 'concern'
+              "dscr": [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.2, 1.4],          # whole sector below 1x
+              "beneish": [-1.5] * 8}
+    try:
+        assert mt.rag("wc_days", 110) == "R"                              # textbook
+        mt.set_strictness("Standard"); mt.set_basis("Sector-relative", sector)
+        # sector median 115 = healthy line, 75th percentile 132.5 = concern line (lower is better)
+        assert (mt.rag("wc_days", 110), mt.rag("wc_days", 120), mt.rag("wc_days", 140)) == ("G", "A", "R")
+        assert mt.rag("wc_days", 110, "Textbook") == "R"                  # textbook view still available
+        assert mt.rag("dscr", 0.9) == "R"                                 # hard floor: below 1x is never sector-normal
+        assert mt.rag("beneish", -1.5) == "R"                             # manipulation rule never relative
+        assert mt.thresholds("current_ratio") == (1.5, 1.0)               # no sector data -> textbook
+    finally:
+        mt.set_basis("Textbook"); mt.set_strictness("Standard")
+
+
+def test_red_flags_ignore_immaterial_balances(stressed):
+    d = stressed.astype(float)
+    d.loc[2025, "inv"] = 1.0; d.loc[2024, "inv"] = 0.5                    # stock doubles, but is ~0% of assets
+    texts = [t for _, t in mt.red_flags(d, mt.compute(d))]
+    assert not any(t.startswith("Inventory grew") for t in texts)
+    assert any(t.startswith("Receivables grew") for t in texts)          # 420 of 1,900 assets: material
+
+
+def test_memo_conditions_match_stance():
+    vals = pd.Series({"cce": 0.6})                                        # amber only
+    assert ins.conditions(vals, "Supportable")[-1].startswith("Monitor at the next review")
+    assert not any("watch-list" in a for a in ins.conditions(pd.Series({"altman_z2": 2.0}), "Supportable"))
+    assert any("CFO-vs-EBITDA" in a for a in ins.conditions(vals, "Supportable with conditions"))
+
+
+def test_fiscal_year_labels():
+    import data as dt
+    assert dt.fiscal_label("2026-03-31") == 2026
+    assert dt.fiscal_label("2025-12-31") == 2026                          # Dec-2025 sits in FY2026 (Apr-25 to Mar-26)
+    assert dt.fiscal_label("2025-06-30") == 2025

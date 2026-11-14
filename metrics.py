@@ -172,12 +172,58 @@ FIXED_RULES = ("springate", "beneish", "fcf")       # model cut-offs, not judgem
 
 def set_strictness(level):
     _LOCAL.shift = STRICTNESS.get(level, 0.0)
+    _LOCAL.level = level if level in STRICTNESS else "Standard"
 
 
-def thresholds(key):
-    """(healthy, concern) cut-offs in force. Conservative moves both 20% towards 'better', so it is harder to look
-    healthy and easier to be flagged; Lenient does the opposite."""
+# ---- scoring basis: textbook cut-offs, or cut-offs taken from the sector's own distribution
+SECTOR_PCT = {"Lenient": (40, 15), "Standard": (50, 25), "Conservative": (60, 35)}   # (healthy, concern) percentile of goodness
+SECTOR_FLOORS = {"dscr": 1.0, "icr": 1.0, "ohlson_p": 0.50}    # always a concern beyond these, however the sector looks
+SECTOR_FIXED = ("beneish", "fcf")                              # manipulation and negative FCF are never 'normal for the sector'
+MIN_SECTOR_N = 6
+
+
+def set_basis(basis, sector_values=None):
+    """basis 'Textbook' or 'Sector-relative'. sector_values: {metric: [latest value of every sector company]}.
+    Builds the sector cut-offs for this session's run."""
+    _LOCAL.basis = basis
+    _LOCAL.bands = {}
+    if basis != "Sector-relative" or not sector_values:
+        return
+    pg, pr = SECTOR_PCT.get(getattr(_LOCAL, "level", "Standard"), (50, 25))
+    for k, vals in sector_values.items():
+        m = M.get(k)
+        if not m or m["dir"] is None or m["green"] is None or m["red"] is None or k in SECTOR_FIXED:
+            continue
+        v = np.asarray([x for x in vals if x is not None and not pd.isna(x)], dtype=float)
+        if len(v) < MIN_SECTOR_N:
+            continue                                     # too few peers: textbook cut-offs stay
+        if m["dir"] == "high":
+            g, r = np.percentile(v, pg), np.percentile(v, pr)
+            if k in SECTOR_FLOORS:
+                r = max(r, SECTOR_FLOORS[k]); g = max(g, r)
+        else:
+            g, r = np.percentile(v, 100 - pg), np.percentile(v, 100 - pr)
+            if k in SECTOR_FLOORS:
+                r = min(r, SECTOR_FLOORS[k]); g = min(g, r)
+        _LOCAL.bands[k] = (float(g), float(r))
+
+
+def basis():
+    return getattr(_LOCAL, "basis", "Textbook")
+
+
+def is_sector_band(key):
+    return key in getattr(_LOCAL, "bands", {})
+
+
+def thresholds(key, mode=None):
+    """(healthy, concern) cut-offs in force. Textbook: the course cut-offs, moved 20% by the strictness setting.
+    Sector-relative: the sector's own percentiles (strictness picks which ones), with hard floors.
+    mode='Textbook' forces the textbook view whatever the session setting."""
     m = M[key]
+    bands = getattr(_LOCAL, "bands", {})
+    if mode != "Textbook" and basis() == "Sector-relative" and key in bands:
+        return bands[key]
     g, r = m["green"], m["red"]
     s = getattr(_LOCAL, "shift", 0.0)
     if g is None or r is None or not s or key in FIXED_RULES or m["dir"] is None:
@@ -186,15 +232,16 @@ def thresholds(key):
     return g + sign * s * abs(g), r + sign * s * abs(r)
 
 
-def rag(key, v):
-    """Return 'G','A','R' or None for a metric value."""
+def rag(key, v, mode=None):
+    """Return 'G','A','R' or None for a metric value (mode='Textbook' to ignore sector-relative cut-offs)."""
     m = M[key]
     if v is None or pd.isna(v) or m["dir"] is None:
         return None
-    g, r = thresholds(key)
+    g, r = thresholds(key, mode)
+    sector = mode != "Textbook" and basis() == "Sector-relative" and is_sector_band(key)
     if key not in ("springate", "beneish", "fcf") and (g is None or r is None):
         return None                  # comparable but not rated (e.g. margins differ by sector)
-    if key == "springate":
+    if key == "springate" and not sector:
         return "G" if v > 0.862 else "R"
     if key == "beneish":
         return "G" if v < -2.22 else "R"
@@ -516,6 +563,9 @@ def benford(values):
 
 
 # ------------------------------------------------------------------ red flags (Sessions 1-2, 5-8)
+MATERIALITY = {"recv": 0.02, "inv": 0.02, "debt": 0.05}     # share of total assets below which a growth flag is skipped
+
+
 def red_flags(d: pd.DataFrame, m: pd.DataFrame):
     """List of (severity, text) for the latest year, using standard red-flag rules."""
     flags = []
@@ -524,6 +574,9 @@ def red_flags(d: pd.DataFrame, m: pd.DataFrame):
     y, p = d.index[-1], d.index[-2]
     g = lambda k: (d[k][y] / d[k][p] - 1) if (k in d and d[k][p] not in (0, np.nan) and not pd.isna(d[k][p]) and not pd.isna(d[k][y])) else np.nan
     rg, rec, inv, dbt, nig, cfg = g("rev"), g("recv"), g("inv"), g("debt"), g("ni"), g("cfo")
+    # growth-mismatch flags only count when the balance is big enough to matter (an IT firm's Rs 200 cr of stock is noise)
+    big = lambda k: k in d and "ta" in d and not pd.isna(d[k][y]) and d["ta"][y] > 0 and d[k][y] >= MATERIALITY[k] * d["ta"][y]
+    rec, inv, dbt = (rec if big("recv") else np.nan), (inv if big("inv") else np.nan), (dbt if big("debt") else np.nan)
     if d["cfo"][y] < 0:
         flags.append(("R", f"Operating cash flow is negative (Rs {d['cfo'][y]:,.0f} cr) - cash pays debt, not EBITDA."))
     if d["ni"][y] > 0 and not pd.isna(cfg) and cfg < 0 and not pd.isna(nig) and nig > 0:
