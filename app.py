@@ -6,19 +6,30 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import dataclasses
 import importlib
+import os
 
 import data as dt
 import insights as ins
 import metrics as mt
 import sectors
 
-# Streamlit re-runs app.py after a code update (e.g. a git push to Streamlit Cloud) but keeps already-imported
-# modules in memory, so a new app.py could run against an old metrics.py. Reload the pure-logic modules every run
-# (metrics first: insights depends on it). data.py is NOT reloaded because it holds the 6-hour download cache.
-mt = importlib.reload(mt)
-ins = importlib.reload(ins)
-SECTORS = importlib.reload(sectors).SECTORS
+
+def _fresh(mod):
+    """Streamlit re-runs app.py after a code update (e.g. a git push to Streamlit Cloud) but keeps imported modules in
+    memory, so a new app.py could run against an old metrics.py. Reload a module only when its file has changed, so
+    concurrent sessions are not disturbed. data.py is never reloaded: it holds the 6-hour download cache."""
+    stamp = os.path.getmtime(mod.__file__)
+    if getattr(mod, "_loaded_mtime", None) != stamp:
+        mod = importlib.reload(mod)
+        mod._loaded_mtime = stamp
+    return mod
+
+
+mt = _fresh(mt)          # metrics first: insights depends on it
+ins = _fresh(ins)
+SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", page_icon="📊")
@@ -100,6 +111,15 @@ def money(v):
 # ------------------------------------------------------------------ sidebar
 st.sidebar.title("📊 Credit Risk Dashboard")
 st.sidebar.caption("For the **Credit Risk Analyst** · live data from Yahoo Finance")
+view_box = st.sidebar.expander("View options", expanded=True)
+with view_box:
+    strict = st.segmented_control("Threshold strictness", ["Lenient", "Standard", "Conservative"], default="Standard",
+                                  key="strict", help="Conservative moves every healthy / concern cut-off 20% towards 'better', so more "
+                                  "metrics are flagged; Lenient moves them 20% the other way. Model cut-offs (Beneish −2.22, "
+                                  "Springate 0.862) never move.") or "Standard"
+    show_calc = st.toggle("Show calculations", key="show_calc",
+                          help="Adds the formula with the company's own numbers to every comparison table.")
+mt.set_strictness(strict)
 with st.sidebar.expander("Settings", expanded=False):
     how = st.radio("Industry average =", ["Median", "Mean"], horizontal=True)
     gnp = st.number_input("Price index for size term (Ohlson)", 1.0, 1000.0, 100.0,
@@ -144,6 +164,22 @@ for t, n in tickers.items():
         companies[t] = c
     else:
         errors[t] = e or "no usable data"
+# ---- as-of year: cut every company's statements at the chosen fiscal year
+all_years = sorted(set().union(*[set(c.fin.index) for c in companies.values()])) if companies else []
+year_opts = [y for y in all_years if sum(y in c.fin.index for c in companies.values()) >= max(3, len(companies) // 2)]
+with view_box:
+    asof_y = st.selectbox("As-of fiscal year", year_opts[::-1], format_func=lambda y: f"FY{y}" + (" (latest)" if y == year_opts[-1] else ""),
+                          key="asof", help="View the whole dashboard as it looked at an earlier year end. Market cap is only "
+                          "available today, so market-based measures (Altman Z, P/E, P/OCF) are blank for past years.") if year_opts else None
+if asof_y is not None and asof_y != year_opts[-1]:
+    cut = {}
+    for t, c in companies.items():
+        f_ = c.fin.loc[c.fin.index <= asof_y]
+        if len(f_):
+            cut[t] = dataclasses.replace(c, fin=f_, mcap_cr=np.nan, period_end=f"FY{asof_y}",
+                                         raw_values={y: v for y, v in c.raw_values.items() if y <= asof_y})
+    companies = cut
+    st.sidebar.info(f"Showing the dashboard as of **FY{asof_y}**. Switch back to the latest year in *View options*.")
 names = {t: c.name for t, c in companies.items()}
 if errors:
     st.sidebar.warning(f"{len(errors)} ticker(s) failed to load: " + ", ".join(tickers[t] for t in errors))
@@ -207,6 +243,15 @@ if B is not None:
 
 
 # ------------------------------------------------------------------ tables, charts, sections
+def calc_text(k, comp, year=None):
+    """'inputs = result' for a metric, or the bare formula when it cannot be filled in."""
+    ex = mt.explain(k, comp.fin, year)
+    m_ = all_m[comp.ticker]
+    y = year if year is not None else m_.columns[-1]
+    v = m_.at[k, y] if (k in m_.index and y in m_.columns) else np.nan
+    return f"{ex} = {fmtv(k, v)}" if ex else mt.M[k]["formula"]
+
+
 def table_df(groups):
     rows = []
     for k, m in mt.M.items():
@@ -223,6 +268,12 @@ def table_df(groups):
             pv = [lv.get(k) for t, lv in latest_all.items() if t != t1 and not pd.isna(lv.get(k))]
             row["Sector middle 50%"] = ("–" if size_k or len(pv) < 4 else
                                         f"{fmtv(k, np.percentile(pv, 25))} to {fmtv(k, np.percentile(pv, 75))}")
+        if show_calc:
+            for comp in (A, B):
+                if comp is not None:
+                    row[f"{comp.name} calculation"] = calc_text(k, comp)
+            if B is None:
+                row["Formula"] = m["formula"]
         rows.append({**row,
                      "Edge": "–" if bt is None else ("Better" if bt else "Weaker"),
                      "Sector percentile": None if pd.isna(pct) else float(pct),
@@ -272,8 +323,8 @@ def trend(key, ser: dict, h=270):
         fig.add_trace(go.Scatter(x=[f"FY{y}" for y in s.index], y=s.values, name=nm, mode="lines+markers",
                                  line=dict(color=CB if bench else (C1 if i == 0 else C2), dash="dash" if bench else "solid", width=2.6),
                                  marker=dict(size=7)))
-    if m["dir"] is not None and allv and m["green"] is not None and m["red"] is not None:
-        g, r = m["green"], m["red"]
+    g, r = mt.thresholds(key)
+    if m["dir"] is not None and allv and g is not None and r is not None:
         lo, hi = min(allv + [g, r]), max(allv + [g, r])
         pad = (hi - lo) * 0.18 or 1.0
         lo, hi = lo - pad, hi + pad
@@ -355,12 +406,42 @@ def banner(label, vals, flags, score, color_tag):
         f"<div class='small'>Key drivers: {esc(' · '.join(v['reasons']) or 'none flagged')}</div></div>", unsafe_allow_html=True)
 
 
-def kpis(rev, ni, vals):
+def yoy(comp, k):
+    """Change in metric k versus the prior year, as delta text for st.metric."""
+    m_ = all_m[comp.ticker]
+    if k not in m_.index or len(m_.columns) < 2:
+        return None
+    a, b = m_.at[k, m_.columns[-1]], m_.at[k, m_.columns[-2]]
+    if pd.isna(a) or pd.isna(b):
+        return None
+    return (f"{(a - b) * 100:+.1f} pp vs FY{m_.columns[-2]}" if mt.M[k]["unit"] == "%"
+            else f"{a - b:+.2f}x vs FY{m_.columns[-2]}")
+
+
+def kpi_help(k, comp=None):
+    h = mt.M[k]["desc"]
+    if comp is not None:
+        h += f"\n\n**Calculation (Rs cr):** {calc_text(k, comp)}"
+        prev = yoy(comp, k)
+        if prev and B is None:
+            h += f"\n\n**Change:** {prev}"
+    return h
+
+
+def kpis(comp, vals):
+    """Peer-review headline numbers with the change from the prior year."""
+    f_ = comp.fin
+    rev, ni = f_["rev"].iloc[-1], (f_["ni"].iloc[-1] if "ni" in f_ else np.nan)
+    pct = lambda col: (None if len(f_) < 2 or col not in f_ or pd.isna(f_[col].iloc[-2]) or f_[col].iloc[-2] == 0 or pd.isna(f_[col].iloc[-1])
+                       else f"{(f_[col].iloc[-1] / f_[col].iloc[-2] - 1):+.1%} vs FY{f_.index[-2]}")
     c = st.columns(3)
-    c[0].metric("Revenue (Rs cr)", money(rev), help="L = lakh crore"); c[1].metric("Net profit (Rs cr)", money(ni), help="L = lakh crore"); c[2].metric("Net debt / EBITDA", fmtv("nd_ebitda", vals.get("nd_ebitda")))
+    c[0].metric("Revenue (Rs cr)", money(rev), delta=pct("rev"), help=f"L = lakh crore. FY{f_.index[-1]} vs the prior year.")
+    c[1].metric("Net profit (Rs cr)", money(ni), delta=pct("ni"), help="L = lakh crore.")
+    c[2].metric("Net debt / EBITDA", fmtv("nd_ebitda", vals.get("nd_ebitda")), delta=yoy(comp, "nd_ebitda"), delta_color="inverse",
+                help=kpi_help("nd_ebitda", comp))
     c = st.columns(3)
-    c[0].metric("Interest cover", fmtv("icr", vals.get("icr"))); c[1].metric("DSCR (proxy)", fmtv("dscr", vals.get("dscr")))
-    c[2].metric("Cash conversion", fmtv("cce", vals.get("cce")))
+    for col, k, lbl in zip(c, ("icr", "dscr", "cce"), ("Interest cover", "DSCR (proxy)", "Cash conversion")):
+        col.metric(lbl, fmtv(k, vals.get(k)), delta=yoy(comp, k), help=kpi_help(k, comp))
 
 
 REL_KPIS = [[("rev_growth", "Revenue growth"), ("ebitda_margin", "EBITDA margin"), ("net_margin", "Net margin")],
@@ -374,13 +455,13 @@ def gap_txt(k, a, b):
     return f"{d * 100:+.1f} pp vs {how.lower()}" if mt.M[k]["unit"] == "%" else f"{d:+.2f}x vs {how.lower()}"
 
 
-def kpis_rel(vals, bench=None):
+def kpis_rel(vals, bench=None, comp=None):
     """Size-neutral headline numbers; with `bench`, each shows the gap to the industry benchmark."""
     for row in REL_KPIS:
         c = st.columns(len(row))
         for col, (k, lbl) in zip(c, row):
             dl = gap_txt(k, vals.get(k), bench.get(k)) if bench is not None else None
-            col.metric(lbl, fmtv(k, vals.get(k)), delta=dl, help=mt.M[k]["desc"],
+            col.metric(lbl, fmtv(k, vals.get(k)), delta=dl, help=kpi_help(k, comp),
                        delta_color="off" if dl is None else ("normal" if mt.M[k]["dir"] == "high" else "inverse"))
 
 
@@ -417,15 +498,15 @@ with hc[0]:
     with st.container(border=True):
         banner(A.name, vA, flagsA, scoreA, C1)
         if B is not None:
-            kpis(A.fin["rev"].iloc[-1], A.fin["ni"].iloc[-1] if "ni" in A.fin else np.nan, vA)
+            kpis(A, vA)
         else:
             st.caption(size_line(t1))
-            kpis_rel(vA, vB)
+            kpis_rel(vA, vB, A)
 with hc[1]:
     with st.container(border=True):
         if B is not None:
             banner(B.name, vB, flagsB, scoreB, C2)
-            kpis(B.fin["rev"].iloc[-1], B.fin["ni"].iloc[-1] if "ni" in B.fin else np.nan, vB)
+            kpis(B, vB)
         else:
             banner(f"{cmp_name} ({len(peers)} peers)", vB, [], scoreB, CB)
             st.markdown(f"<div class='small'>{how} of the {len(peers)} other {esc(sector)} companies. Rupee amounts (revenue, profit, "
@@ -466,12 +547,61 @@ with tabs[0]:
         return (f"<div class='card'><div class='t'>{p}</div>{row(A.name, sa, C1)}{row(cmp_name, sb, CB)}"
                 f"<div class='small'>{esc(worst_note(p))}</div></div>")
 
+    def cutoff(k, which):
+        g, r = mt.thresholds(k)
+        v = g if which == "G" else r
+        if v is None or mt.M[k]["dir"] is None:
+            return "–"
+        if k in ("beneish", "springate", "fcf"):
+            return {"beneish": {"G": "< −2.22", "R": "> −2.22"}, "springate": {"G": "> 0.862", "R": "< 0.862"},
+                    "fcf": {"G": "> 0", "R": "< 0"}}[k][which]
+        hi = mt.M[k]["dir"] == "high"
+        return (("≥ " if hi else "≤ ") if which == "G" else ("< " if hi else "> ")) + fmtv(k, v)
+
+    def factor_detail(p):
+        """Contents of a scorecard box's popover: how the factor score is built, metric by metric."""
+        if p == "Governance":
+            gv = {c.name: c.gov for c in (A, B) if c is not None}
+            gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
+            gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
+            st.markdown("**Governance: Yahoo / ISS risk scores** (1 = low risk, 10 = high risk)")
+            st.dataframe(gdf, width="stretch")
+            st.caption("Factor score = 100 × (10 − average risk score) ÷ 9. Not available for every company.")
+            return
+        keys = [k for k, m in mt.M.items() if m["group"] in PILLAR_NOTE_GROUPS[p]]
+        rg = [mt.rag(k, vA.get(k)) for k in keys]
+        nG, nA, nR = rg.count("G"), rg.count("A"), rg.count("R")
+        sc = pA.get(p)
+        st.markdown(f"**{p}: how the score is built**")
+        st.markdown(f"{A.name}: ({nG} healthy × 100 + {nA} watch × 50 + {nR} concern × 0) ÷ {nG + nA + nR} rated metrics = "
+                    f"**{'n/a' if sc is None or pd.isna(sc) else f'{sc:.0f}'}**" + (f" · threshold strictness: *{strict}*" if strict != "Standard" else ""))
+        rows = []
+        for k in keys:
+            a, b = vA.get(k), vB.get(k)
+            size_k = B is None and k in SIZE_KEYS
+            pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
+            tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)] if k in mA.index else []
+            rows.append({"Metric": mt.M[k]["label"], A.name: fmtv(k, a), "Signal": SIG[mt.rag(k, a)],
+                         cmp_name: NOT_COMPARABLE if size_k else fmtv(k, b),
+                         "Healthy": cutoff(k, "G"), "Concern": cutoff(k, "R"),
+                         "Sector pct": None if pd.isna(pct) else float(pct), "Trend": tv if len(tv) >= 2 else None,
+                         f"How {A.name}'s value is calculated": calc_text(k, A)})
+        ddf = pd.DataFrame(rows)
+        st.dataframe(style_cells(ddf, lambda v: SIG_CSS.get(v, ""), ["Signal"]), hide_index=True, width="stretch",
+                     column_config={"Sector pct": st.column_config.ProgressColumn("Sector pct", min_value=0, max_value=100, format="%.0f"),
+                                    "Trend": st.column_config.LineChartColumn("Trend", width="small"),
+                                    f"How {A.name}'s value is calculated": st.column_config.TextColumn(width="large")})
+        st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score.")
+
     pill = list(mt.PILLARS) + ["Governance"]
+    st.caption("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
     for r0 in (0, 3):
         cc = st.columns(3)
         for i, p in enumerate(pill[r0:r0 + 3]):
             with cc[i]:
                 st.markdown(card(p), unsafe_allow_html=True)
+                with st.popover("See inside", icon=":material/search:", width="stretch", key=f"pop-{p}"):
+                    factor_detail(p)
     st.markdown("")
     # ---------- sector position: size is ranked, ratios are shown against the whole spread of peers
     st.markdown("##### Where it sits in the sector")
@@ -515,7 +645,7 @@ with tabs[0]:
             q1, med, q3 = np.percentile(vs, [25, 50, 75])
             dfig.add_vrect(x0=q1, x1=q3, fillcolor=CB, opacity=0.12, line_width=0)
             dfig.add_vline(x=med, line_dash="dash", line_color=CB, annotation_text="median", annotation_position="top")
-            for thr, colr in ((mt.M[mk]["green"], GREEN), (mt.M[mk]["red"], RED)):
+            for thr, colr in zip(mt.thresholds(mk), (GREEN, RED)):
                 if thr is not None and lo < thr < hi:
                     dfig.add_vline(x=thr, line_color=colr, line_width=1, opacity=0.6)
             dfig.add_scatter(x=xs, y=[n for n, _ in pts], mode="markers",
@@ -1162,9 +1292,11 @@ with tabs[8]:
         st.write(f"Standardised annual statements for **{comp.name}** (Rs crore):")
         st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
     st.subheader("Metric dictionary and thresholds")
+    if strict != "Standard":
+        st.caption(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
     st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
                                 "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
-                                "Healthy at": m["green"], "Concern at": m["red"]} for m in mt.M.values()]),
+                                "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1]} for k, m in mt.M.items()]),
                  width="stretch", hide_index=True)
     st.subheader("Assumptions & limitations")
     st.markdown(f"""

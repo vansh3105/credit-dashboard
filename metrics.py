@@ -6,6 +6,8 @@ Input: DataFrame `d`, index = fiscal year (ascending), columns (standard names):
  cur_debt equity retained tl ppe cfo cfi capex shares
 Output: DataFrame, index = metric key, columns = fiscal years.
 """
+import threading
+
 import numpy as np
 import pandas as pd
 
@@ -162,12 +164,34 @@ def avg(s):
     """Two-point average (current + prior year); first year falls back to year-end value."""
     return ((s + s.shift(1)) / 2).fillna(s)
 
+# ---- threshold strictness (a per-session view setting; thread-local because Streamlit serves each session in its own thread)
+STRICTNESS = {"Conservative": 0.20, "Standard": 0.0, "Lenient": -0.20}
+_LOCAL = threading.local()
+FIXED_RULES = ("springate", "beneish", "fcf")       # model cut-offs, not judgement calls: never shifted
+
+
+def set_strictness(level):
+    _LOCAL.shift = STRICTNESS.get(level, 0.0)
+
+
+def thresholds(key):
+    """(healthy, concern) cut-offs in force. Conservative moves both 20% towards 'better', so it is harder to look
+    healthy and easier to be flagged; Lenient does the opposite."""
+    m = M[key]
+    g, r = m["green"], m["red"]
+    s = getattr(_LOCAL, "shift", 0.0)
+    if g is None or r is None or not s or key in FIXED_RULES or m["dir"] is None:
+        return g, r
+    sign = 1 if m["dir"] == "high" else -1
+    return g + sign * s * abs(g), r + sign * s * abs(r)
+
+
 def rag(key, v):
     """Return 'G','A','R' or None for a metric value."""
     m = M[key]
     if v is None or pd.isna(v) or m["dir"] is None:
         return None
-    g, r = m["green"], m["red"]
+    g, r = thresholds(key)
     if key not in ("springate", "beneish", "fcf") and (g is None or r is None):
         return None                  # comparable but not rated (e.g. margins differ by sector)
     if key == "springate":
@@ -717,3 +741,52 @@ def altman_components(d, year=None):
     x1, x2, x3, x4 = (g("ca") - g("cl")) / ta, g("retained") / ta, g("ebit") / ta, g("equity") / tl
     return [("Working capital / assets (x6.56)", 6.56 * x1), ("Retained earnings / assets (x3.26)", 3.26 * x2),
             ("EBIT / assets (x6.72)", 6.72 * x3), ("Equity / liabilities (x1.05)", 1.05 * x4)]
+
+
+# ====================================================================== the calculation, with the company's own numbers
+def explain(key, d, year=None):
+    """The formula of `key` filled in with this company's figures for `year` (default latest), e.g.
+    'EBIT 66,714 ÷ interest 1,227'. Rupee figures are Rs crore. None if not available for this metric."""
+    if d is None or not len(d):
+        return None
+    y = d.index[-1] if year is None else year
+    if y not in d.index:
+        return None
+    i = list(d.index).index(y)
+    p = d.index[i - 1] if i > 0 else None
+    g = lambda k, yy=y: d.at[yy, k] if (yy is not None and k in d.columns) else np.nan
+    n = lambda v: "n/a" if pd.isna(v) else f"{v:,.0f}"
+    av = lambda k: g(k) if p is None or pd.isna(g(k, p)) else (g(k) + g(k, p)) / 2
+    q = lambda a, b: a / b if not (pd.isna(a) or pd.isna(b) or b == 0) else np.nan
+    days = lambda a, b: f"{q(g(a), g(b)) * 365:,.0f}" if not pd.isna(q(g(a), g(b))) else "n/a"
+    E = {
+        "current_ratio": lambda: f"Current assets {n(g('ca'))} ÷ current liabilities {n(g('cl'))}",
+        "quick_ratio": lambda: f"(Current assets {n(g('ca'))} − inventory {n(g('inv'))}) ÷ current liabilities {n(g('cl'))}",
+        "cash_ratio": lambda: f"Cash {n(g('cash'))} ÷ current liabilities {n(g('cl'))}",
+        "wc_days": lambda: f"(Current assets {n(g('ca'))} − current liabilities {n(g('cl'))}) ÷ revenue {n(g('rev'))} × 365",
+        "ccc": lambda: f"Receivable days {days('recv', 'rev')} + inventory days {days('inv', 'cogs')} − payable days {days('pay', 'cogs')}",
+        "ocf_ratio": lambda: f"Operating cash flow {n(g('cfo'))} ÷ current liabilities {n(g('cl'))}",
+        "cce": lambda: f"Operating cash flow {n(g('cfo'))} ÷ EBITDA {n(g('ebitda'))}",
+        "dir_days": lambda: f"(Cash {n(g('cash'))} + receivables {n(g('recv'))}) ÷ (cash costs {n(g('rev') - g('ebitda'))} ÷ 365)",
+        "de": lambda: f"Total debt {n(g('debt'))} ÷ equity {n(g('equity'))}",
+        "debt_ratio": lambda: f"Total debt {n(g('debt'))} ÷ total assets {n(g('ta'))}",
+        "equity_ratio": lambda: f"Equity {n(g('equity'))} ÷ total assets {n(g('ta'))}",
+        "icr": lambda: f"EBIT {n(g('ebit'))} ÷ interest {n(g('interest'))}",
+        "dscr": lambda: (f"(Operating cash flow {n(g('cfo'))} + interest {n(g('interest'))}) ÷ "
+                         f"(interest {n(g('interest'))} + current debt {n(0 if pd.isna(g('cur_debt')) else g('cur_debt'))})"),
+        "nd_ebitda": lambda: f"(Total debt {n(g('debt'))} − cash {n(g('cash'))}) ÷ EBITDA {n(g('ebitda'))}",
+        "fin_lev": lambda: f"Average assets {n(av('ta'))} ÷ average equity {n(av('equity'))}",
+        "roe": lambda: f"Net income {n(g('ni'))} ÷ average equity {n(av('equity'))}",
+        "roa": lambda: f"Net income {n(g('ni'))} ÷ average assets {n(av('ta'))}",
+        "sloan": lambda: f"(Net income {n(g('ni'))} − operating cash flow {n(g('cfo'))}) ÷ average assets {n(av('ta'))}",
+        "cfo_ni": lambda: f"Operating cash flow {n(g('cfo'))} ÷ net income {n(g('ni'))}",
+        "ffo_tl": lambda: f"(Net income {n(g('ni'))} + D&A {n(g('da'))}) ÷ total liabilities {n(g('tl'))}",
+        "fcf": lambda: f"Operating cash flow {n(g('cfo'))} − capex {n(abs(g('capex')))}",
+        "roce": lambda: f"EBIT {n(g('ebit'))} ÷ (total assets {n(g('ta'))} − current liabilities {n(g('cl'))})",
+        "rev_growth": lambda: None if p is None else f"Revenue FY{y} {n(g('rev'))} ÷ revenue FY{p} {n(g('rev', p))} − 1",
+        "ebitda_margin": lambda: f"EBITDA {n(g('ebitda'))} ÷ revenue {n(g('rev'))}",
+        "net_margin": lambda: f"Net income {n(g('ni'))} ÷ revenue {n(g('rev'))}",
+        "fcf_margin": lambda: f"(Operating cash flow {n(g('cfo'))} − capex {n(abs(g('capex')))}) ÷ revenue {n(g('rev'))}",
+    }
+    f = E.get(key)
+    return f() if f else None

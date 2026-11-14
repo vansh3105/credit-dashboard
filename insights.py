@@ -292,7 +292,7 @@ def root_causes(fin, m_df):
 
     # 1. Cash conversion: which working-capital line absorbed the cash?
     cce_y, cce_p = mv("cce", y), mv("cce", p)
-    if not pd.isna(cce_y) and (cce_y < mt.M["cce"]["green"] - 0.03 or (not pd.isna(cce_p) and cce_y < cce_p - 0.10)):
+    if not pd.isna(cce_y) and (cce_y < mt.thresholds("cce")[0] - 0.03 or (not pd.isna(cce_p) and cce_y < cce_p - 0.10)):
         days = lambda num, den, yy: _q(g(num, yy), g(den, yy)) * 365
         drivers = []
         for lbl, num, den, sign in (("Receivable days", "recv", "rev", 1), ("Inventory days", "inv", "cogs", 1),
@@ -318,7 +318,7 @@ def root_causes(fin, m_df):
 
     # 2. Interest cover: profit problem or borrowing problem?
     icr_y, icr_p = mv("icr", y), mv("icr", p)
-    if not (pd.isna(icr_y) or pd.isna(icr_p)) and icr_y < icr_p * 0.85 and icr_y < 2 * mt.M["icr"]["green"]:
+    if not (pd.isna(icr_y) or pd.isna(icr_p)) and icr_y < icr_p * 0.85 and icr_y < 2 * mt.thresholds("icr")[0]:
         e_ch = _q(g("ebit") - g("ebit", p), abs(g("ebit", p)))
         i_ch = _q(g("interest") - g("interest", p), abs(g("interest", p)))
         cause = ("mainly higher borrowing costs" if (not pd.isna(i_ch) and (pd.isna(e_ch) or i_ch > max(-e_ch, 0)))
@@ -430,7 +430,7 @@ def fix_targets(fin):
 
     nd = debt - cash
     if not (pd.isna(nd) or pd.isna(ebitda)) and ebitda > 0:
-        v, tg, rd = nd / ebitda, M_["nd_ebitda"]["green"], M_["nd_ebitda"]["red"]
+        v, tg, rd = nd / ebitda, *mt.thresholds("nd_ebitda")
         if v > tg:
             fixes.append(dict(key="nd_ebitda", now=v, target=tg,
                               text=f"Repay about **{_cr(nd - tg * ebitda)}** of net debt, or grow EBITDA by **{nd / tg / ebitda - 1:.0%}** "
@@ -440,7 +440,7 @@ def fix_targets(fin):
         else:
             cush.append(dict(key="nd_ebitda", text="Net cash position: cash exceeds total debt."))
     if not (pd.isna(ebit) or pd.isna(intr)) and intr > 0:
-        v, tg, rd = ebit / intr, M_["icr"]["green"], M_["icr"]["red"]
+        v, tg, rd = ebit / intr, *mt.thresholds("icr")
         rate = _q(intr, debt)
         if v < tg:
             cut = 1 - ebit / tg / intr
@@ -453,7 +453,7 @@ def fix_targets(fin):
     if not (pd.isna(cfo) or pd.isna(intr)):
         ds = intr + cur
         if ds > 0:
-            v, tg, rd = (cfo + intr) / ds, M_["dscr"]["green"], M_["dscr"]["red"]
+            v, tg, rd = (cfo + intr) / ds, *mt.thresholds("dscr")
             if v < tg:
                 refi = (cfo + intr) / tg - intr
                 fixes.append(dict(key="dscr", now=v, target=tg,
@@ -463,18 +463,18 @@ def fix_targets(fin):
             elif cfo > 0:
                 cush.append(dict(key="dscr", text=f"Operating cash flow can fall **{1 - (rd * ds - intr) / cfo:.0%}** before DSCR drops below {rd:.1f}x."))
     if not (pd.isna(ca) or pd.isna(cl)) and cl > 0:
-        v, tg = ca / cl, M_["current_ratio"]["green"]
+        v, tg = ca / cl, mt.thresholds("current_ratio")[0]
         if v < tg:
             fixes.append(dict(key="current_ratio", now=v, target=tg,
                               text=f"Add **{_cr(tg * cl - ca)}** of current assets (e.g. fresh long-term funds held as cash), or cut current "
                                    f"liabilities by **{_cr(cl - ca / tg)}** (e.g. term out short-term borrowing)."))
     if not (pd.isna(debt) or pd.isna(eq)) and eq > 0:
-        v, tg = debt / eq, M_["de"]["green"]
+        v, tg = debt / eq, mt.thresholds("de")[0]
         if v > tg:
             fixes.append(dict(key="de", now=v, target=tg,
                               text=f"Repay **{_cr(debt - tg * eq)}** of debt, or add **{_cr(debt / tg - eq)}** of equity."))
     if not (pd.isna(cfo) or pd.isna(ebitda)) and ebitda > 0:
-        v, tg = cfo / ebitda, M_["cce"]["green"]
+        v, tg = cfo / ebitda, mt.thresholds("cce")[0]
         if v < tg and (tg * ebitda - cfo) > 0.02 * ebitda:
             fixes.append(dict(key="cce", now=v, target=tg,
                               text=f"Release about **{_cr(tg * ebitda - cfo)}** of cash from working capital (faster collections, leaner stock) "

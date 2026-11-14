@@ -76,3 +76,23 @@ def test_growth_and_margins(stressed):
 def test_rupee_amounts_get_no_sector_percentile():
     assert np.isnan(mt.percentile("fcf", 500, [100, 200, 300, 400]))   # would only rank company size
     assert mt.percentile("net_margin", 0.25, [0.1, 0.2, 0.3, 0.4]) == 50.0
+
+
+def test_strictness_moves_cutoffs_but_not_model_rules():
+    try:
+        assert mt.rag("current_ratio", 1.6) == "G"                    # standard: healthy at 1.5
+        mt.set_strictness("Conservative")
+        assert mt.thresholds("current_ratio") == pytest.approx((1.8, 1.2))
+        assert mt.rag("current_ratio", 1.6) == "A"                    # no longer healthy
+        assert mt.thresholds("de") == pytest.approx((0.8, 1.6))         # lower-is-better metrics tighten downwards
+        assert mt.thresholds("beneish") == (-2.22, -2.22)               # model cut-off never moves
+        mt.set_strictness("Lenient")
+        assert mt.rag("current_ratio", 1.3) == "G"                    # healthy from 1.2
+    finally:
+        mt.set_strictness("Standard")
+
+
+def test_explain_shows_the_numbers_used(stressed):
+    assert mt.explain("icr", stressed) == "EBIT 60 ÷ interest 70"
+    assert mt.explain("rev_growth", stressed) == "Revenue FY2025 1,150 ÷ revenue FY2024 1,100 − 1"
+    assert mt.explain("beneish", stressed) is None                     # multi-part scores have their own breakdown
