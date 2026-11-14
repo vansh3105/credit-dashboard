@@ -25,6 +25,7 @@ GROUP_TITLES = {
     "Solvency": "Can it carry its debt?",
     "Earnings quality": "Is profit backed by cash?",
     "Returns": "Are returns above the cost of capital?",
+    "Growth & margins": "How fast is it growing and how much of each rupee of sales does it keep? (size-neutral)",
     "Scores": "Distress and manipulation scores",
     "Market": "What does the market price imply?",
 }
@@ -67,7 +68,13 @@ def bench_frame(peer_metrics: dict, how: str):
     fn = np.nanmedian if how == "Median" else np.nanmean
     with np.errstate(all="ignore"):
         res = fn(arr, axis=0)
-    return pd.DataFrame(res, index=list(mt.M), columns=years)
+    out = pd.DataFrame(res, index=list(mt.M), columns=years)
+    out.loc[SIZE_KEYS] = np.nan            # a median of rupee amounts mixes big and small firms: not a benchmark
+    return out
+
+
+SIZE_KEYS = [k for k, m in mt.M.items() if m["unit"] == "Rs cr"]
+NOT_COMPARABLE = "not comparable (size)"
 
 
 def style_cells(df, css_fn, subset):
@@ -107,19 +114,18 @@ individual = mode.startswith("Individual")
 tickers = SECTORS[sector]
 missing_t = [t for t in tickers if not dt.is_cached(t)]
 if missing_t:
-    bar = st.progress(0.0, text="Connecting to Yahoo Finance…")
-    fails, any_ok = 0, any(dt.is_cached(t) for t in tickers)
-    for i, t in enumerate(missing_t):
-        bar.progress(i / len(missing_t), text=f"Loading {tickers[t]} ({i + 1} of {len(missing_t)})…")
-        c, e = dt.get_company(t, tickers[t])
-        if c is None:
-            fails += 1
-            if fails >= 3 and not any_ok:      # Yahoo unreachable: stop early instead of waiting for every ticker
-                for t2 in missing_t[i + 1:]:
-                    dt.mark_failed(t2, "skipped - Yahoo Finance unreachable (first 3 requests failed)")
-                break
-        else:
-            any_ok, fails = True, 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    bar = st.progress(0.0, text=f"Loading {len(missing_t)} companies from Yahoo Finance…")
+    probe = missing_t[:3]
+    if not any(dt.is_cached(t) for t in tickers) and all(dt.get_company(t, tickers[t])[0] is None for t in probe):
+        for t2 in missing_t[3:]:            # Yahoo unreachable: stop early instead of waiting for every ticker
+            dt.mark_failed(t2, "skipped - Yahoo Finance unreachable (first 3 requests failed)")
+    else:
+        todo = [t for t in missing_t if not dt.is_cached(t)]
+        with ThreadPoolExecutor(max_workers=6) as pool:      # a few parallel requests; more risks Yahoo rate limits
+            futs = {pool.submit(dt.get_company, t, tickers[t]): t for t in todo}
+            for i, f in enumerate(as_completed(futs), 1):
+                bar.progress(i / len(todo), text=f"Loaded {tickers[futs[f]]} ({i} of {len(todo)})…")
     bar.empty()
 
 companies, errors = {}, {}
@@ -201,8 +207,14 @@ def table_df(groups):
         tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)]
         bt = ins.better(k, a, b)
         pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
-        rows.append({"Metric": m["label"], A.name: fmtv(k, a), f"{A.name} signal": SIG[mt.rag(k, a)],
-                     cmp_name: fmtv(k, b), f"{cmp_name} signal": SIG[mt.rag(k, b)],
+        size_k = B is None and k in SIZE_KEYS
+        row = {"Metric": m["label"], A.name: fmtv(k, a), f"{A.name} signal": SIG[mt.rag(k, a)],
+               cmp_name: NOT_COMPARABLE if size_k else fmtv(k, b), f"{cmp_name} signal": SIG[mt.rag(k, b)]}
+        if B is None:
+            pv = [lv.get(k) for t, lv in latest_all.items() if t != t1 and not pd.isna(lv.get(k))]
+            row["Sector middle 50%"] = ("–" if size_k or len(pv) < 4 else
+                                        f"{fmtv(k, np.percentile(pv, 25))} to {fmtv(k, np.percentile(pv, 75))}")
+        rows.append({**row,
                      "Edge": "–" if bt is None else ("Better" if bt else "Weaker"),
                      "Sector percentile": None if pd.isna(pct) else float(pct),
                      "Trend": tv if len(tv) >= 2 else None})
@@ -218,6 +230,8 @@ def show_table(df, key):
             "Sector percentile": st.column_config.ProgressColumn("Sector percentile", min_value=0, max_value=100, format="%.0f",
                                                                  help="Share of companies in this sector that the company beats on this metric. Advanced."),
             "Trend": st.column_config.LineChartColumn("Trend", width="small"),
+            "Sector middle 50%": st.column_config.TextColumn(help="Range covering the middle half of the other companies in this sector "
+                                                                  "(25th to 75th percentile) - the typical spread around the average."),
         }, hide_index=True, width="stretch", key=key)
 
 
@@ -249,7 +263,7 @@ def trend(key, ser: dict, h=270):
         fig.add_trace(go.Scatter(x=[f"FY{y}" for y in s.index], y=s.values, name=nm, mode="lines+markers",
                                  line=dict(color=CB if bench else (C1 if i == 0 else C2), dash="dash" if bench else "solid", width=2.6),
                                  marker=dict(size=7)))
-    if m["dir"] is not None and allv:
+    if m["dir"] is not None and allv and m["green"] is not None and m["red"] is not None:
         g, r = m["green"], m["red"]
         lo, hi = min(allv + [g, r]), max(allv + [g, r])
         pad = (hi - lo) * 0.18 or 1.0
@@ -340,6 +354,48 @@ def kpis(rev, ni, vals):
     c[2].metric("Cash conversion", fmtv("cce", vals.get("cce")))
 
 
+REL_KPIS = [[("rev_growth", "Revenue growth"), ("ebitda_margin", "EBITDA margin"), ("net_margin", "Net margin")],
+            [("nd_ebitda", "Net debt / EBITDA"), ("icr", "Interest cover"), ("dscr", "DSCR (proxy)"), ("cce", "Cash conversion")]]
+
+
+def gap_txt(k, a, b):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None
+    d = a - b
+    return f"{d * 100:+.1f} pp vs {how.lower()}" if mt.M[k]["unit"] == "%" else f"{d:+.2f}x vs {how.lower()}"
+
+
+def kpis_rel(vals, bench=None):
+    """Size-neutral headline numbers; with `bench`, each shows the gap to the industry benchmark."""
+    for row in REL_KPIS:
+        c = st.columns(len(row))
+        for col, (k, lbl) in zip(c, row):
+            dl = gap_txt(k, vals.get(k), bench.get(k)) if bench is not None else None
+            col.metric(lbl, fmtv(k, vals.get(k)), delta=dl, help=mt.M[k]["desc"],
+                       delta_color="off" if dl is None else ("normal" if mt.M[k]["dir"] == "high" else "inverse"))
+
+
+def size_rank(t, field):
+    """(rank, of, share of sector total, value) of company t on revenue / net profit / market cap, or None."""
+    vals = {x: (c.mcap_cr if field == "mcap" else (c.fin[field].iloc[-1] if field in c.fin else np.nan)) for x, c in companies.items()}
+    vals = {x: v for x, v in vals.items() if not pd.isna(v)}
+    if t not in vals:
+        return None
+    order = sorted(vals, key=vals.get, reverse=True)
+    pos_total = sum(v for v in vals.values() if v > 0)
+    return order.index(t) + 1, len(order), (vals[t] / pos_total if vals[t] > 0 and pos_total else np.nan), vals[t]
+
+
+def size_line(t):
+    parts = []
+    for field, lbl in (("rev", "revenue"), ("ni", "net profit"), ("mcap", "market cap")):
+        r = size_rank(t, field)
+        if r:
+            rk, n, sh, v = r
+            parts.append(f"{lbl} Rs {money(v)} cr: **#{rk} of {n}**" + (f" ({sh:.0%} of sector)" if field != "ni" and not pd.isna(sh) else ""))
+    return "**Size in sector** - " + " · ".join(parts) if parts else ""
+
+
 st.title(f"{A.name} vs {cmp_name}")
 asof = f"Annual statements to {A.period_end or 'n/a'}" + (f" ({B.name}: {B.period_end})" if B is not None and B.period_end != A.period_end else "")
 st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · {asof} · "
@@ -347,11 +403,15 @@ st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industr
 if A.currency and A.currency != "INR":
     st.warning(f"Yahoo reports {A.name}'s financials in {A.currency}; the dashboard assumes INR crore.")
 
-hc = st.columns(2) if B is not None else st.columns([3, 2])
+hc = st.columns(2)
 with hc[0]:
     with st.container(border=True):
         banner(A.name, vA, flagsA, scoreA, C1)
-        kpis(A.fin["rev"].iloc[-1], A.fin["ni"].iloc[-1] if "ni" in A.fin else np.nan, vA)
+        if B is not None:
+            kpis(A.fin["rev"].iloc[-1], A.fin["ni"].iloc[-1] if "ni" in A.fin else np.nan, vA)
+        else:
+            st.caption(size_line(t1))
+            kpis_rel(vA, vB)
 with hc[1]:
     with st.container(border=True):
         if B is not None:
@@ -359,8 +419,10 @@ with hc[1]:
             kpis(B.fin["rev"].iloc[-1], B.fin["ni"].iloc[-1] if "ni" in B.fin else np.nan, vB)
         else:
             banner(f"{cmp_name} ({len(peers)} peers)", vB, [], scoreB, CB)
-            kpis(np.nanmedian([p.fin["rev"].iloc[-1] for t, p in companies.items() if t != t1]),
-                 np.nanmedian([p.fin["ni"].iloc[-1] for t, p in companies.items() if t != t1 and "ni" in p.fin]), vB)
+            st.markdown(f"<div class='small'>{how} of the {len(peers)} other {esc(sector)} companies. Rupee amounts (revenue, profit, "
+                        "free cash flow) are ranked, not averaged - see <i>Where it sits in the sector</i> on the Overview tab.</div>",
+                        unsafe_allow_html=True)
+            kpis_rel(vB)
 
 tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
                 "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
@@ -402,6 +464,63 @@ with tabs[0]:
             with cc[i]:
                 st.markdown(card(p), unsafe_allow_html=True)
     st.markdown("")
+    # ---------- sector position: size is ranked, ratios are shown against the whole spread of peers
+    st.markdown("##### Where it sits in the sector")
+    st.caption(f"All {len(companies)} {sector} companies loaded. Left: size, which is ranked rather than averaged. Right: any size-neutral "
+               "metric, with the sector's middle 50% shaded and the median dashed, so you see the spread, not just one average.")
+    HL = {A.name: C1, **({B.name: C2} if B is not None else {})}
+    sl, sr = st.columns(2)
+    with sl:
+        sz = st.segmented_control("Size measure", ["Revenue", "Net profit", "Market cap"], default="Revenue", key="sz-measure") or "Revenue"
+        fld = {"Revenue": "rev", "Net profit": "ni", "Market cap": "mcap"}[sz]
+        sv = sorted([(c.name, c.mcap_cr if fld == "mcap" else (c.fin[fld].iloc[-1] if fld in c.fin else np.nan))
+                     for c in companies.values()], key=lambda x: -np.nan_to_num(x[1], nan=-1e18))
+        sv = [x for x in sv if not pd.isna(x[1])]
+        sfig = go.Figure(go.Bar(x=[v for _, v in sv], y=[n for n, _ in sv], orientation="h",
+                                marker_color=[HL.get(n, "rgba(139,148,158,.45)") for n, _ in sv],
+                                text=[f"#{i + 1}" for i in range(len(sv))], textposition="outside",
+                                hovertemplate="%{y}: Rs %{x:,.0f} cr<extra></extra>"))
+        sfig.update_layout(height=max(320, 22 * len(sv)), template="plotly_white", margin=dict(l=10, r=30, t=10, b=10),
+                           yaxis=dict(autorange="reversed"), xaxis_title=f"{sz} (Rs crore)")
+        st.plotly_chart(sfig, width="stretch", key="size-rank")
+    with sr:
+        d_opts = [k for k, m in mt.M.items() if m["dir"] is not None and m["unit"] != "Rs cr"]
+        mk = st.selectbox("Metric", d_opts, index=d_opts.index("ebitda_margin"), format_func=lambda k: mt.M[k]["label"], key="dist-metric")
+        pts = [(companies[t].name, latest_all[t].get(mk)) for t in companies if not pd.isna(latest_all[t].get(mk))]
+        if len(pts) < 3:
+            st.info("Too few companies have this metric.")
+        else:
+            good_first = (lambda v: -v) if mt.M[mk]["dir"] == "high" else (lambda v: v)
+            pts.sort(key=lambda x: good_first(x[1]))
+            vs = np.array([v for _, v in pts], dtype=float)
+            lo, hi = np.percentile(vs, 5), np.percentile(vs, 95)
+            for nm in HL:                                   # always keep the highlighted companies on scale
+                v_ = dict(pts).get(nm)
+                if v_ is not None:
+                    lo, hi = min(lo, v_), max(hi, v_)
+            pad = (hi - lo) * 0.08 or abs(hi) * 0.1 or 1.0
+            lo, hi = lo - pad, hi + pad
+            xs = np.clip(vs, lo, hi)
+            pct_ax = mt.M[mk]["unit"] == "%"
+            dfig = go.Figure()
+            q1, med, q3 = np.percentile(vs, [25, 50, 75])
+            dfig.add_vrect(x0=q1, x1=q3, fillcolor=CB, opacity=0.12, line_width=0)
+            dfig.add_vline(x=med, line_dash="dash", line_color=CB, annotation_text="median", annotation_position="top")
+            for thr, colr in ((mt.M[mk]["green"], GREEN), (mt.M[mk]["red"], RED)):
+                if thr is not None and lo < thr < hi:
+                    dfig.add_vline(x=thr, line_color=colr, line_width=1, opacity=0.6)
+            dfig.add_scatter(x=xs, y=[n for n, _ in pts], mode="markers",
+                             marker=dict(size=[14 if n in HL else 9 for n, _ in pts], color=[HL.get(n, "rgba(139,148,158,.75)") for n, _ in pts],
+                                         symbol=["diamond" if (v < lo or v > hi) else "circle" for v in vs]),
+                             customdata=[fmtv(mk, v) for v in vs], hovertemplate="%{y}: %{customdata}<extra></extra>")
+            dfig.update_layout(height=max(320, 22 * len(pts)), template="plotly_white", margin=dict(l=10, r=10, t=24, b=10),
+                               yaxis=dict(autorange="reversed"), showlegend=False,
+                               xaxis=dict(range=[lo, hi], tickformat=".0%" if pct_ax else None, title=mt.M[mk]["label"]))
+            st.plotly_chart(dfig, width="stretch", key="dist-plot")
+            rk = [n for n, _ in pts].index(A.name) + 1 if A.name in dict(pts) else None
+            st.caption((f"{A.name} ranks **#{rk} of {len(pts)}** (best at the top). " if rk else "")
+                       + "Green / red lines: healthy and concern thresholds. Diamonds are outliers pinned to the edge (hover for the real value).")
+
     st.markdown("##### Pick a factor")
     sub = st.tabs(mt.GROUPS)
     for gname, t in zip(mt.GROUPS, sub):
@@ -419,7 +538,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Solvency & debt service")
-    section(["Solvency", "Returns"], "sol", f"{GROUP_TITLES['Solvency']} {GROUP_TITLES['Returns']}")
+    section(["Solvency", "Returns", "Growth & margins"], "sol", f"{GROUP_TITLES['Solvency']} {GROUP_TITLES['Returns']}")
     st.markdown("##### Return drivers (DuPont)")
     dpA = mt.dupont(A.fin)
     dpB = mt.dupont(B.fin) if B is not None else None
@@ -1052,5 +1171,6 @@ with tabs[8]:
 - {ADV} **Facility & stress** is a one-year simplified pro-forma: revenue and margin shocks flow to EBITDA; interest scales with the rate change; working-capital change comes from receivable days and revenue-scaled stock and payables; tax at the company's recent rate. New debt proceeds are assumed spent in the business. Debt capacity ignores the tax shield on new interest, so it is conservative.
 - {ADV} **Covenants, scorecard, watchlist, percentile ranks and the credit memo** are analyst aids built on the same metrics. The scorecard blends factor scores with adjustable weights and is not an agency rating.
 - **Not included**: Montier C-score, Kaplan-Zingales, Fulmer H, abnormal-accrual regressions, LLCR and time-adjusted current ratio (these need repayment schedules or receivable ageing).
-- Industry average = the companies listed for that sector in `sectors.py`, not the whole market.
+- Industry average = the companies listed for that sector in `sectors.py` (excluding the selected company), not the whole market. Only size-neutral numbers (ratios, margins, growth, days, scores) are averaged; rupee amounts such as revenue, profit and free cash flow are shown as a rank within the sector instead, because a median of very different-sized companies is not a benchmark.
+- **Growth & margins** (revenue growth, EBITDA, net and free-cash-flow margins) are compared with peers but not rated green/red, because normal margins differ widely between sectors.
 - Insights and the memo are rule-based text, not a credit rating or a lending decision.""", unsafe_allow_html=True)

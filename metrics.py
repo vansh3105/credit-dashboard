@@ -49,6 +49,11 @@ _r("roce", "ROCE", "Returns", "%", None, None, None, "EBIT / (Assets - CL)", "S7
 _r("roic", "ROIC", "Returns", "%", None, None, None, "NOPAT / Avg invested capital", "S7-8")
 _r("roic_spread", "ROIC - cost of debt", "Returns", "%", "high", 0.03, 0.0, "ROIC - Interest / Avg debt", "S7-8 (ROIIC < debt cost = warning)")
 _r("roiic", "ROIIC", "Returns", "%", None, None, None, "Change in NOPAT / Change in invested capital", "S7-8")
+# Growth & margins: scale-free, so they can be compared with an industry average (extension)
+_r("rev_growth", "Revenue growth", "Growth & margins", "%", "high", None, None, "Revenue / prior-year revenue - 1", "extension")
+_r("ebitda_margin", "EBITDA margin", "Growth & margins", "%", "high", None, None, "EBITDA / Revenue", "extension")
+_r("net_margin", "Net profit margin", "Growth & margins", "%", "high", None, None, "Net income / Revenue", "S1-2 DuPont")
+_r("fcf_margin", "Free-cash-flow margin", "Growth & margins", "%", "high", None, None, "(CFO - Capex) / Revenue", "extension")
 # Distress & manipulation scores (Sessions 9-12)
 _r("altman_z", "Altman Z (manufacturing, uses market cap)", "Scores", "score", "high", 2.99, 1.81, "1.2X1+1.4X2+3.3X3+0.6X4+1.0X5", "S7-8: >2.99 safe, <1.81 distress")
 _r("altman_zp", "Altman Z' (private mfg)", "Scores", "score", "high", 2.90, 1.23, "0.717X1+0.847X2+3.107X3+0.42X4+0.998X5", "S7-8")
@@ -62,7 +67,7 @@ _r("beneish", "Beneish M-score", "Scores", "score", "low", -2.22, -2.22, "8-vari
 _r("pe", "P/E", "Market", "x", None, None, None, "Market cap / NI", "S15-16")
 _r("p_ocf", "P/OCF", "Market", "x", None, None, None, "Market cap / CFO", "S15-16 (P/OCF > P/E = profits not cash)")
 
-GROUPS = ["Liquidity", "Solvency", "Earnings quality", "Returns", "Scores", "Market"]
+GROUPS = ["Liquidity", "Solvency", "Earnings quality", "Returns", "Growth & margins", "Scores", "Market"]
 
 # Plain-English meaning of each metric (shown as tooltips / guide in the app)
 DESC = {
@@ -94,6 +99,10 @@ DESC = {
     "roic": "After-tax operating profit relative to capital provided by lenders and owners.",
     "roic_spread": "ROIC minus the interest rate paid. Negative means growth is not covering the cost of debt.",
     "roiic": "Return on the additional capital invested this year.",
+    "rev_growth": "Year-on-year change in revenue. Shows momentum without depending on company size.",
+    "ebitda_margin": "Operating cash earnings per rupee of sales - the cushion before interest, tax and depreciation.",
+    "net_margin": "Profit kept per rupee of sales after every cost.",
+    "fcf_margin": "Free cash flow per rupee of sales - the size-neutral version of free cash flow.",
     "altman_z": "Bankruptcy-risk score using market value of equity. Below 1.81 is distress, above 2.99 is safe.",
     "altman_zp": "Altman score for private manufacturers (book value of equity).",
     "altman_z2": "Altman score for non-manufacturers and emerging-market firms. Below 1.10 is distress, above 2.60 is safe.",
@@ -124,7 +133,8 @@ NEEDS = {
     "zmijewski": ["ni", "ta", "tl", "ca", "cl"], "springate": ["ca", "cl", "ta", "ebit", "pbt", "rev"],
     "piotroski": ["ni", "cfo", "ta", "ca", "cl", "rev", "cogs"],
     "beneish": ["recv", "rev", "cogs", "ca", "ppe", "ta", "da", "sga", "cl", "ltd", "ni", "cfo"],
-    "pe": ["ni"], "p_ocf": ["cfo"],
+    "pe": ["ni"], "p_ocf": ["cfo"], "rev_growth": ["rev"], "ebitda_margin": ["ebitda", "rev"], "net_margin": ["ni", "rev"],
+    "fcf_margin": ["cfo", "capex", "rev"],
 }
 FIELD_NAME = {"ca": "current assets", "cl": "current liabilities", "inv": "inventory", "recv": "receivables", "pay": "payables",
               "cogs": "cost of revenue", "sga": "SG&A", "da": "depreciation", "ppe": "net PP&E", "ltd": "long-term debt",
@@ -158,6 +168,8 @@ def rag(key, v):
     if v is None or pd.isna(v) or m["dir"] is None:
         return None
     g, r = m["green"], m["red"]
+    if key not in ("springate", "beneish", "fcf") and (g is None or r is None):
+        return None                  # comparable but not rated (e.g. margins differ by sector)
     if key == "springate":
         return "G" if v > 0.862 else "R"
     if key == "beneish":
@@ -403,6 +415,11 @@ def compute(d: pd.DataFrame, mcap_cr: float = np.nan, gnp: float = 100.0) -> pd.
     out["roic"] = div(nopat, avg(ic))
     out["roic_spread"] = out["roic"] - div(intr, avg(debt))
     out["roiic"] = div(nopat - nopat.shift(1), ic - ic.shift(1))
+    # Growth & margins
+    out["rev_growth"] = div(rev, rev.shift(1)) - 1
+    out["ebitda_margin"] = div(ebitda, rev)
+    out["net_margin"] = div(ni, rev)
+    out["fcf_margin"] = div(cfo + capex, rev)
     # Altman
     x1, x2, x3, x4b, x5 = div(wc, ta), div(re_, ta), div(ebit, ta), div(eq, tl), div(rev, ta)
     out["altman_z2"] = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4b
@@ -511,7 +528,7 @@ def percentile(key, value, peer_values):
     """Share (0-100) of sector values that `value` beats; higher is always better. NaN if < 3 values."""
     d = M[key]["dir"]
     vals = [v for v in peer_values if v is not None and not pd.isna(v)]
-    if d is None or pd.isna(value) or len(vals) < 3:
+    if d is None or M[key]["unit"] == "Rs cr" or pd.isna(value) or len(vals) < 3:     # rupee amounts rank size, not quality
         return np.nan
     beat = sum(1.0 for v in vals if (value > v if d == "high" else value < v)) + 0.5 * sum(1.0 for v in vals if v == value)
     return 100.0 * beat / len(vals)

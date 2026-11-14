@@ -62,3 +62,17 @@ def test_cards_rank_risks_first(stressed):
     cards = ins.cards("X", ins.latest(m), m, stressed, mt.red_flags(stressed, m), ins.trends(m), ins.root_causes(stressed, m))
     order = [ins.SEV_ORDER[c["severity"]] for c in cards]
     assert order == sorted(order) and cards[0]["severity"] == "High"
+
+
+def test_growth_and_margins(stressed):
+    m = mt.compute(stressed)
+    assert m.at["rev_growth", 2025] == pytest.approx(1150 / 1100 - 1)
+    assert m.at["ebitda_margin", 2025] == pytest.approx(110 / 1150)
+    assert m.at["fcf_margin", 2025] == pytest.approx((-30 - 100) / 1150)
+    assert mt.rag("ebitda_margin", 0.05) is None                    # compared, not rated
+    assert ins.better("ebitda_margin", 0.2, 0.1) is True
+
+
+def test_rupee_amounts_get_no_sector_percentile():
+    assert np.isnan(mt.percentile("fcf", 500, [100, 200, 300, 400]))   # would only rank company size
+    assert mt.percentile("net_margin", 0.25, [0.1, 0.2, 0.3, 0.4]) == 50.0

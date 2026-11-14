@@ -207,7 +207,7 @@ def memo(name, sector, as_of, vals, flags, pillars, score, band_txt, snap_rows, 
 
 
 # ====================================================================== ADVANCED: deeper analysis
-TAB_OF = {"Liquidity": "Liquidity", "Solvency": "Solvency & debt service", "Returns": "Solvency & debt service",
+TAB_OF = {"Liquidity": "Liquidity", "Solvency": "Solvency & debt service", "Returns": "Solvency & debt service", "Growth & margins": "Solvency & debt service",
           "Earnings quality": "Earnings quality", "Market": "Earnings quality", "Scores": "Distress & forensic"}
 ZONE = {"G": 2, "A": 1, "R": 0}
 ZONE_NAME = {"G": "healthy", "A": "watch", "R": "concern"}
