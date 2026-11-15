@@ -251,3 +251,48 @@ def summary(sigs):
     n = {s: sum(1 for x in sigs if x["status"] == s) for s in ("R", "A", "G")}
     level = "ELEVATED CONCERN" if n["R"] >= 3 else ("WATCH" if n["R"] or n["A"] >= 3 else "COMFORTABLE")
     return n, level
+
+
+# ------------------------------------------------------------------ one company, end to end
+def annual_end_of(comp):
+    try:
+        return pd.to_datetime(comp.period_end, format="%b-%Y") + pd.offsets.MonthEnd(0)
+    except Exception:
+        return None
+
+
+def dp_for(comp, q_=None):
+    """Merton default point; prefers the interim balance sheet when it is newer than the annual report."""
+    bs_, ae = (q_.get("bs") if q_ else None), annual_end_of(comp)
+    if bs_ is not None and len(bs_) and "debt" in bs_ and not pd.isna(bs_["debt"].iloc[-1]) and (
+            ae is None or bs_.index[-1] > ae + pd.Timedelta(days=20)):
+        cur_ = bs_["cur_debt"].iloc[-1] if "cur_debt" in bs_ else np.nan
+        return default_point(cur_, bs_["debt"].iloc[-1]), f"{bs_.index[-1]:%b-%y} balance sheet"
+    f_ = comp.fin.iloc[-1]
+    return default_point(f_.get("cur_debt", np.nan), f_.get("debt", np.nan)), f"FY{comp.fin.index[-1]} annual report"
+
+
+def news_flow_signal(news_items):
+    """The news screen as one early-warning signal row."""
+    import news as nw
+    ns = nw.news_signal(news_items)
+    return _sig("News", "News flow (keyword screen)", ns["value"],
+                "Concern: a rating-agency downgrade in the last 180 days · Watch: a high-severity negative headline in 180 days "
+                "or 3+ medium negatives in 90 (a keyword match alone never makes a Concern)", ns["status"],
+                "Defaults, downgrades, probes and auditor exits reach the press before the next filing."
+                + (f" Trigger: “{ns['trigger']}”" if ns["trigger"] else ""))
+
+
+def bundle(comp, peers, px_all, q_, rf, news_items=None):
+    """Every early-warning input and signal for one company. peers: {ticker: Company} of the sector (incl. comp);
+    px_all: daily closes for the sector; q_: data.get_quarterly(); news_items: news.get_news()['items'] or None."""
+    mkt_all = {t: (market_stats(px_all[t]) if t in px_all.columns else None) for t in peers}
+    mk = mkt_all.get(comp.ticker)
+    D, src = dp_for(comp, q_)
+    mert_ = merton(comp.mcap_cr, mk["vol"] if mk else np.nan, D, rf)
+    hist_ = dd_history(px_all[comp.ticker], comp.mcap_cr, D, rf) if comp.ticker in px_all.columns else pd.DataFrame()
+    sigs_ = signals(comp.fin, q_, mk, [m for t, m in mkt_all.items() if t != comp.ticker], mert_, hist_, annual_end_of(comp))
+    if sigs_ and news_items is not None:
+        sigs_.append(news_flow_signal(news_items))
+    n_, lvl_ = summary(sigs_)
+    return dict(px_all=px_all, q=q_, mkt_all=mkt_all, mk=mk, D=D, D_src=src, mert=mert_, hist=hist_, sigs=sigs_, n=n_, level=lvl_)

@@ -32,13 +32,14 @@ _TTL = 6 * 3600
 _CACHE: dict = {}
 _LOCK = threading.Lock()
 
-# Names the press actually uses, where the dashboard name differs or is too formal.
+# Names the press actually uses, where the dashboard name differs or is too formal. Never add a bare group name
+# ("Maruti", "Mahindra", "GMR"): it also matches sister and namesake companies.
 ALIASES = {
-    "HCLTECH.NS": ["HCLTech", "HCL Tech"], "LTM.NS": ["LTIMindtree"], "LT.NS": ["L&T"], "M&M.NS": ["M&M", "Mahindra"],
+    "HCLTECH.NS": ["HCLTech", "HCL Tech"], "LTM.NS": ["LTIMindtree"], "LT.NS": ["L&T"], "M&M.NS": ["M&M"],
     "TMPV.NS": ["Tata Motors"], "TMCV.NS": ["Tata Motors"], "HINDUNILVR.NS": ["HUL"], "SUNPHARMA.NS": ["Sun Pharmaceutical"],
     "DRREDDY.NS": ["Dr Reddy"], "NATIONALUM.NS": ["National Aluminium"], "ULTRACEMCO.NS": ["UltraTech"],
-    "TATACONSUM.NS": ["Tata Consumer Products"], "MARUTI.NS": ["Maruti"], "IOC.NS": ["IOC", "IndianOil"],
-    "HINDPETRO.NS": ["Hindustan Petroleum"], "BPCL.NS": ["Bharat Petroleum"], "GMRAIRPORT.NS": ["GMR Airports", "GMR"],
+    "TATACONSUM.NS": ["Tata Consumer Products"], "IOC.NS": ["IndianOil", "IOCL"], "ACC.NS": ["ACC Cement", "ACC Ltd"], "NCC.NS": ["NCC Ltd", "NCC Limited"], "ITC.NS": ["ITC Ltd", "ITC Limited", "ITC shares", "ITC share price"],
+    "HINDPETRO.NS": ["Hindustan Petroleum"], "BPCL.NS": ["Bharat Petroleum"], "GMRAIRPORT.NS": ["GMR Airports"],
     "POWERGRID.NS": ["Powergrid", "Power Grid Corporation"], "SAIL.NS": ["Steel Authority of India"],
     "JINDALSTEL.NS": ["Jindal Steel"], "BOSCHLTD.NS": ["Bosch Ltd"], "MOTHERSON.NS": ["Motherson"],
     "ALKEM.NS": ["Alkem Laboratories"], "DIVISLAB.NS": ["Divi's Lab"], "TORNTPHARM.NS": ["Torrent Pharmaceuticals"],
@@ -52,24 +53,41 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+# Acronyms that are also common words or other bodies (ACC = NZ Accident Compensation, NCC = National Cadet Corps):
+# only the aliases above are used for these.
+ALIAS_ONLY = {"ACC.NS", "NCC.NS", "ITC.NS"}
+
+# Headlines about a sister company or a different meaning of the name, dropped even though the name matches.
+EXCLUDE = {
+    "LT.NS": r"l&t (technology|finance|realty|semiconductor|metro)|larsen & toubro infotech",
+    "PTC.NS": r"ptc india financial",
+    "TATASTEEL.NS": r"tata steel (chess|foundation|marathon|kolkata)",
+}
+
+
 def names_for(name: str, ticker: str) -> list[str]:
     """Search names, most specific first: 'LTM (LTIMindtree)' -> ['LTIMindtree', 'LTM']."""
     out = []
     inner = re.search(r"\(([^)]+)\)", name)
     base = re.sub(r"\s*\([^)]*\)", "", name).strip()
-    for n in ALIASES.get(ticker, []) + ([inner.group(1)] if inner and ticker not in ("TMPV.NS", "TMCV.NS") else []) + [base]:
+    tail = [] if ticker in ALIAS_ONLY else ([inner.group(1)] if inner and ticker not in ("TMPV.NS", "TMCV.NS") else []) + [base]
+    for n in ALIASES.get(ticker, []) + tail:
         if n and n not in out:
             out.append(n)
     return out
 
 
 def mentions(title: str, names: list[str]) -> bool:
+    """Whole-word match. Short all-capital names (CESC, MRF, ITC) must match in capitals: 'Cesc Fabregas' is not CESC."""
     t = _norm(title)
     for n in names:
         k = _norm(n)
         if len(k) < 3 and k not in ("l&t", "m&m"):
             continue
-        if re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", t):
+        if re.fullmatch(r"[A-Z&]{2,6}", n):
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(n) + r"(?![A-Za-z0-9])", title):
+                return True
+        elif re.search(r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])", t):
             return True
     return False
 
@@ -129,6 +147,15 @@ def get_news(name: str, ticker: str, sources: tuple | None = None) -> dict:
         hit = _CACHE.get(ck)
     if hit and time.time() - hit[0] < _TTL:
         return hit[1]
+    import data as dt
+    import snapshot as sn
+    saved = sn.news(ticker) if sources is None else None
+    if saved is not None:
+        saved = {**saved, "items": tag(saved["items"], names_for(name, ticker), ticker)}
+    if saved is not None and not dt.PREFER_LIVE and sn.is_fresh(sn.get()):
+        with _LOCK:
+            _CACHE[ck] = (time.time(), saved)
+        return saved
     names = names_for(name, ticker)
     jobs = {lab: (lambda q=q: _google(q.format(n=names[0]))) for lab, q in QUERIES.items()}
     jobs["Yahoo Finance"] = lambda: _yahoo(ticker)
@@ -142,21 +169,31 @@ def get_news(name: str, ticker: str, sources: tuple | None = None) -> dict:
                 raw += f.result()
             except Exception as e:  # network, parse or rate limit: keep the other sources
                 errors.append(f"{lab}: {type(e).__name__}")
-    cutoff = datetime.now(timezone.utc).timestamp() - DAYS * 86400
-    seen, items = set(), []
-    for it in sorted(raw, key=lambda x: x["date"], reverse=True):
-        k = _key(it["title"])
-        if not it["title"] or k in seen or it["date"].timestamp() < cutoff or not mentions(it["title"], names):
-            continue
-        seen.add(k)
-        it.update(classify(it["title"]))
-        it["rating"] = extract_rating(it["title"], names)
-        items.append(it)
+    items = tag(raw, names, ticker)
     res = {"items": items, "errors": errors, "fetched": datetime.now(timezone.utc), "names": names}
+    if not items and errors and saved is not None:      # every source failed: use the last good copy
+        res = {**saved, "errors": errors + ["showing the saved nightly copy"]}
     if items or not errors:
         with _LOCK:
             _CACHE[ck] = (time.time(), res)
     return res
+
+
+def tag(raw: list[dict], names: list[str], ticker: str) -> list[dict]:
+    """Keep headlines from the window that name the company (and not a sister company), drop duplicates, and tag
+    each with the current keyword rules. Also re-applied to saved snapshot headlines, so rule fixes apply at once."""
+    cutoff = datetime.now(timezone.utc).timestamp() - DAYS * 86400
+    seen, items = set(), []
+    for it in sorted(raw, key=lambda x: x["date"], reverse=True):
+        k = _key(it["title"])
+        if not it["title"] or k in seen or it["date"].timestamp() < cutoff or not mentions(it["title"], names) \
+                or (ticker in EXCLUDE and re.search(EXCLUDE[ticker], _norm(it["title"]))):
+            continue
+        seen.add(k)
+        it = {**it, **classify(it["title"])}
+        it["rating"] = extract_rating(it["title"], names)
+        items.append(it)
+    return items
 
 
 def clear_cache():
@@ -193,6 +230,13 @@ _DELEVER = r"\b((cut|reduc|lower|pare|trim|repay|repaid|prepay|prepaid)\w* (its 
 _MORE_MARKET = r"\b(stocks? (decline|fall|rise|gain|slump|jump)s?|shares on fire|in (\w+'s |today's )?session|upside|downside|(cuts?|raises?) .{0,25}rating to (sell|hold|reduce|neutral|buy|accumulate|add)|kbw|jefferies|nomura|morgan stanley|goldman|clsa|citi\b|ubs|macquarie|motilal)\b"
 
 
+_VICTIM = r"\b(police|arrest\w*|held|dup(ed|ing)|fake|bogus|cyber|apk|loses|impersonat\w*|job (scam|promise)|(ex-|former )employee|misappropriation by|cheat\w*|scam(mer|ster)s?)\b"
+_BENIGN_LEGAL = (r"\b(dismiss\w*|reject\w*|lost .{0,40}case|stays?|stayed|quash\w*|sets? aside|grants? relief|arrangement|scheme of|"
+                 r"amalgamation|demerger|merger|bidder|takeover|acquir\w*|seals .{0,40}deal|wins? .{0,30}bid|"
+                 r"(anti-|)fraud (detection|investigation|prevention|analytics|risk management))")
+_MINOR_AUDITOR = r"\b(cost|secretarial|internal|branch) auditor"
+
+
 def classify(title: str) -> dict:
     t = _norm(title)
     agency = re.search(_AGENCY_WORD, t)
@@ -209,6 +253,10 @@ def classify(title: str) -> dict:
     cat = next((c for c, p in _CAT_RULES if re.search(p, t)), "Other")
     if re.search(_NEG_HIGH, t) and not re.search(_DELEVER, t):
         tone, sev = "negative", "high"
+        if re.search(_BENIGN_LEGAL, t):                 # a plea dismissed, a stay granted, a merger scheme admitted
+            tone, sev = "neutral", "low"
+        elif re.search(_VICTIM, t) or re.search(_MINOR_AUDITOR, t) or title.count(",") >= 2:
+            sev = "medium"                               # company as victim, a minor auditor, or an industry-wide story
     elif re.search(_DELEVER, t):
         tone, sev = "positive", "low"
         cat = "Debt & funding"
@@ -312,18 +360,19 @@ def latest_ratings(items: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------- news risk (feeds early warning)
 
 def news_signal(items: list[dict], now: datetime | None = None) -> dict:
-    """Rule-based news risk: Concern if a high-severity negative headline in the last 90 days or a rating downgrade in
-    the last 180; Watch if 3+ medium negatives in 90 days, or any high-severity negative in the last year."""
+    """Rule-based news risk. Concern only for a rating-agency downgrade in the last 180 days (an agency named in the
+    headline, in the clause that names the company). A keyword match is too blunt to raise a Concern on its own -
+    namesakes and 'company was the victim' stories slip through - so a high-severity negative headline in the last
+    180 days, or 3+ medium negatives in 90, give Watch."""
     now = now or datetime.now(timezone.utc)
     age = lambda it: (now - it["date"]).days
-    hi90 = [it for it in items if it["tone"] == "negative" and it["severity"] == "high" and age(it) <= 90]
     dg = [it for it in items if (it.get("rating") or {}).get("action") == "Downgrade" and age(it) <= 180]
+    hi180 = [it for it in items if it["tone"] == "negative" and it["severity"] == "high" and age(it) <= 180]
     med90 = [it for it in items if it["tone"] == "negative" and it["severity"] == "medium" and age(it) <= 90]
-    hi365 = [it for it in items if it["tone"] == "negative" and it["severity"] == "high"]
-    if hi90 or dg:
-        st, why = "R", (dg or hi90)[0]["title"]
-    elif len(med90) >= 3 or hi365:
-        st, why = "A", (hi365 or med90)[0]["title"]
+    if dg:
+        st, why = "R", dg[0]["title"]
+    elif hi180 or len(med90) >= 3:
+        st, why = "A", (hi180 or med90)[0]["title"]
     else:
         st, why = ("G" if items else None), None
     neg = sum(it["tone"] == "negative" for it in items if age(it) <= 90)

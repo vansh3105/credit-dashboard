@@ -17,6 +17,7 @@ import insights as ins
 import report as rp
 import metrics as mt
 import news as nw
+import snapshot as sn
 import sectors
 
 
@@ -38,6 +39,7 @@ ins = _fresh(ins)
 ew = _fresh(ew)
 rp = _fresh(rp)
 nw = _fresh(nw)
+sn = _fresh(sn)
 SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
@@ -139,10 +141,17 @@ with st.sidebar.expander("Settings", expanded=False):
     how = st.radio("Industry average =", ["Median", "Mean"], horizontal=True)
     gnp = st.number_input("Price index for size term (Ohlson)", 1.0, 1000.0, 100.0,
                           help="Total assets (Rs crore) are divided by this index in the Ohlson size term.")
-if st.sidebar.button("Reload data", help="Discard saved data and fetch again from Yahoo Finance"):
+if st.sidebar.button("Reload data", help="Skip the nightly snapshot and fetch everything again from Yahoo Finance and Google News"):
     dt.clear_cache()
     nw.clear_cache()
     st.rerun()
+_src = dt.source()
+if _src["mode"] == "snapshot":
+    st.sidebar.caption(f"Data: nightly snapshot of {_src['built'].astimezone(dt.IST):%d %b, %H:%M IST} "
+                       f"({_src['age_h']:.0f} h old). *Reload data* fetches live.")
+else:
+    st.sidebar.caption("Data: live from Yahoo Finance" + (f" (last snapshot {_src['built'].astimezone(dt.IST):%d %b} is too old to use)"
+                                                          if _src["built"] else "") + ".")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**How to read signals**  \n✓ Healthy · ! Watch · ✕ Concern  \n"
                     f"{ADV} marks analysis beyond the core ratios.", unsafe_allow_html=True)
@@ -199,6 +208,10 @@ if asof_y is not None and asof_y != year_opts[-1]:
 names = {t: c.name for t, c in companies.items()}
 if errors:
     st.sidebar.warning(f"{len(errors)} ticker(s) failed to load: " + ", ".join(tickers[t] for t in errors))
+_saved = [c.name for c in companies.values() if "saved copy" in (c.fetched_at or "")]
+if _saved:
+    st.sidebar.warning(f"Yahoo did not respond for {len(_saved)} compan{'y' if len(_saved) == 1 else 'ies'}; showing the last "
+                       "nightly copy: " + ", ".join(_saved))
 if not names:
     st.error("No company data could be loaded for this sector.")
     st.write({tickers[t]: e for t, e in errors.items()})
@@ -545,45 +558,16 @@ EW_LATEST = asof_y is None or asof_y == year_opts[-1]
 fpd = lambda p_: "n/a" if p_ is None or pd.isna(p_) else ("< 0.01%" if p_ < 1e-4 else f"{p_:.2%}")
 
 
-def annual_end_of(comp):
-    try:
-        return pd.to_datetime(comp.period_end, format="%b-%Y") + pd.offsets.MonthEnd(0)
-    except Exception:
-        return None
-
-
-def dp_for(comp, q_=None):
-    """Merton default point; prefers the interim balance sheet when it is newer than the annual report."""
-    bs_, ae = (q_.get("bs") if q_ else None), annual_end_of(comp)
-    if bs_ is not None and len(bs_) and "debt" in bs_ and not pd.isna(bs_["debt"].iloc[-1]) and (
-            ae is None or bs_.index[-1] > ae + pd.Timedelta(days=20)):
-        cur_ = bs_["cur_debt"].iloc[-1] if "cur_debt" in bs_ else np.nan
-        return ew.default_point(cur_, bs_["debt"].iloc[-1]), f"{bs_.index[-1]:%b-%y} balance sheet"
-    f_ = comp.fin.iloc[-1]
-    return ew.default_point(f_.get("cur_debt", np.nan), f_.get("debt", np.nan)), f"FY{comp.fin.index[-1]} annual report"
+annual_end_of = ew.annual_end_of
+dp_for = ew.dp_for
 
 
 def ew_bundle(comp, rf):
     """Everything the early-warning view needs for one company (prices for the whole sector, cached 6 hours)."""
-    px_all = dt.get_prices(list(companies))
-    q_ = dt.get_quarterly(comp.ticker)
-    mkt_all = {t: (ew.market_stats(px_all[t]) if t in px_all.columns else None) for t in companies}
-    mk = mkt_all.get(comp.ticker)
-    D, src = dp_for(comp, q_)
-    mert_ = ew.merton(comp.mcap_cr, mk["vol"] if mk else np.nan, D, rf)
-    hist_ = ew.dd_history(px_all[comp.ticker], comp.mcap_cr, D, rf) if comp.ticker in px_all.columns else pd.DataFrame()
-    sigs_ = ew.signals(comp.fin, q_, mk, [m for t, m in mkt_all.items() if t != comp.ticker], mert_, hist_, annual_end_of(comp))
     news_ = nw.get_news(comp.name, comp.ticker)
-    if sigs_:
-        ns = nw.news_signal(news_["items"])
-        sigs_.append(dict(area="News", signal="News flow (keyword screen)", value=ns["value"], status=ns["status"],
-                          rule="Concern: high-severity negative headline in 90 days or agency downgrade in 180 · "
-                               "Watch: 3+ medium negatives in 90 days or a high-severity one in the year",
-                          why="Defaults, downgrades, probes and auditor exits reach the press before the next filing."
-                              + (f" Trigger: “{ns['trigger']}”" if ns["trigger"] else "")))
-    n_, lvl_ = ew.summary(sigs_)
-    return dict(px_all=px_all, q=q_, mkt_all=mkt_all, mk=mk, D=D, D_src=src, mert=mert_, hist=hist_, sigs=sigs_, n=n_, level=lvl_,
-                news=news_)
+    b_ = ew.bundle(comp, companies, dt.get_prices(list(companies)), dt.get_quarterly(comp.ticker), rf, news_["items"])
+    b_["news"] = news_
+    return b_
 
 
 tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
@@ -591,6 +575,25 @@ tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings qu
 
 # ------------------------------------------------------------------ Overview
 with tabs[0]:
+    _hist = sn.history()
+    _chg = sn.changes(_hist, companies) if len(_hist) else pd.DataFrame()
+    if len(_hist) and _hist["date"].nunique() >= 2:
+        _worse = int((_chg["Direction"] == "worse").sum()) if len(_chg) else 0
+        _lbl = (f"What changed in {sector} since {_chg.attrs['since']:%d %b}: " +
+                (f"{len(_chg)} change(s), {_worse} for the worse" if len(_chg) else "nothing"))
+        with st.expander(_lbl, expanded=_worse > 0):
+            if len(_chg):
+                st.dataframe(style_cells(_chg.drop(columns=["ticker"]), lambda v: {"worse": SIG_CSS["✕ Concern"], "better": SIG_CSS["✓ Healthy"]}.get(v, ""),
+                                         ["Direction"]), hide_index=True, width="stretch")
+            st.caption(f"Compares the last two nightly snapshots ({_chg.attrs['since']:%d %b} → {_chg.attrs['until']:%d %b}) on "
+                       "textbook cut-offs and default weights: grade, headline signal, early-warning level, news flow, and score moves of 5+ points.")
+            _t = _hist[_hist["ticker"] == t1].sort_values("date")
+            if len(_t) >= 2:
+                _f = go.Figure(go.Scatter(x=_t["date"], y=_t["score"], mode="lines+markers", line=dict(color=C1, width=2.4),
+                                          text=_t["grade"], hovertemplate="%{x|%d %b}: score %{y:.0f} · %{text}<extra></extra>"))
+                _f.update_layout(height=200, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                 title=dict(text=f"{names[t1]}: score by night", font=dict(size=13)), yaxis=dict(range=[0, 100]))
+                st.plotly_chart(_f, width="stretch", key="hist-score")
     st.markdown("##### Scorecard by factor")
     st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
                "Weights and the overall score are an advanced extension (see Credit workbench).")
@@ -1880,7 +1883,7 @@ with tabs[10]:
   concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
   textbook cut-off.
 - {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate editable (default 6.5%); probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
-- {ADV} **News & ratings** runs three Google News searches per company (debt and ratings; legal and governance; rating agencies) plus Yahoo Finance's feed, keeps headlines from the last 12 months that name the company, and drops duplicates. A **keyword screen** tags each with a category, a tone for lenders and a severity; share-price chatter and broker calls (\"downgraded to Sell\") are treated as neutral. **News flow signal**: Concern if a high-severity negative headline (default, insolvency, fraud, downgrade, ban, auditor exit…) appeared in the last 90 days or an agency downgrade in the last 180; Watch if three or more medium negatives in 90 days or a high-severity one in the year. **Ratings** are read from headlines naming CRISIL, ICRA, CARE, India Ratings, Acuite, Brickwork, Moody's, Fitch or S&P, only from the clause that names the company. National-scale ratings map to CR grades (AAA→CR1, AA→CR2, A→CR3, BBB→CR4, BB→CR5, B+→CR6, B/B-→CR7, CCC→CR8, below→CR9); global-scale ratings are shown but not compared, since they sit under India's sovereign ceiling. The **AI read** (optional, needs an Anthropic API key) sends the non-chatter headlines to Claude, which returns a per-headline judgement, rating actions, a news-risk level, a digest and questions for management. It never changes the grade or the early-warning signal.
+- {ADV} **News & ratings** runs three Google News searches per company (debt and ratings; legal and governance; rating agencies) plus Yahoo Finance's feed, keeps headlines from the last 12 months that name the company, and drops duplicates. A **keyword screen** tags each with a category, a tone for lenders and a severity; share-price chatter and broker calls (\"downgraded to Sell\") are treated as neutral. **News flow signal**: Concern only for a rating-agency downgrade in the last 180 days; Watch if a high-severity negative headline (default, insolvency, fraud, asset seizure, ban, auditor exit…) appeared in the last 180 days or three or more medium negatives in 90. A keyword match alone never makes a Concern, because namesakes (\"Cesc\" vs CESC) and stories where the company is the victim of a fraud slip through; short capitalised names must match in capitals. Testing on all 203 companies, only about 1 in 6 high-severity keyword hits was a genuine credit event. **Ratings** are read from headlines naming CRISIL, ICRA, CARE, India Ratings, Acuite, Brickwork, Moody's, Fitch or S&P, only from the clause that names the company. National-scale ratings map to CR grades (AAA→CR1, AA→CR2, A→CR3, BBB→CR4, BB→CR5, B+→CR6, B/B-→CR7, CCC→CR8, below→CR9); global-scale ratings are shown but not compared, since they sit under India's sovereign ceiling. The **AI read** (optional, needs an Anthropic API key) sends the non-chatter headlines to Claude, which returns a per-headline judgement, rating actions, a news-risk level, a digest and questions for management. It never changes the grade or the early-warning signal.
 - {ADV} **Credit memo and internal grade.** The quantitative score on *textbook* cut-offs maps to a 9-step internal scale (CR1 ≈ AAA … CR9 ≈ CC/C) with an indicative one-year PD - a rounded long-run average default rate for the equivalent agency grade, not a company-specific estimate. Whole-notch adjustments: early warning (Watch −1, Elevated −2), management (Strong +1, Weak −1), negative industry outlook (−1), capped at ±2 together; security cover of 1.5x or more lifts the facility (not the issuer) one notch. The grade never depends on the screen's scoring basis; the sector-relative score is shown beside it as relative standing, with a warning when a weak grade mainly reflects the sector (e.g. utilities). PDF and Word files are built only when a download button is clicked.
 - **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
   of total assets respectively.

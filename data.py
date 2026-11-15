@@ -165,13 +165,42 @@ def is_cached(ticker):
     return bool(e) and _fresh(e)
 
 
+PREFER_LIVE = False      # set by clear_cache(): after "Reload data" go to Yahoo even if a fresh snapshot exists
+
+
+def _snap():
+    import snapshot
+    return snapshot
+
+
+def source():
+    """Where data comes from right now: dict(mode='snapshot'|'live', built=datetime|None, age_h=float)."""
+    sn = _snap()
+    s = sn.get()
+    return {"mode": "snapshot" if (s and sn.is_fresh(s) and not PREFER_LIVE) else "live",
+            "built": sn.built_at(s), "age_h": sn.age_hours(s)}
+
+
 def get_company(ticker, name):
-    """Return (Company | None, error | None), using the 6-hour cache when possible."""
+    """Return (Company | None, error | None), using the 6-hour cache when possible.
+    Order: memory cache -> fresh nightly snapshot -> live Yahoo -> any saved snapshot (marked as a saved copy)."""
     with _LOCK:
         e = _CACHE.get(ticker)
     if e and _fresh(e):
         return e[1], e[2]
+    sn = _snap()
+    if not PREFER_LIVE and sn.is_fresh(sn.get()):
+        comp = sn.company(ticker)
+        if comp is not None:
+            with _LOCK:
+                _CACHE[ticker] = (time.time(), comp, None)
+            return comp, None
     comp, err = fetch_live(ticker, name)
+    if comp is None:
+        saved = sn.company(ticker)
+        if saved is not None:                  # Yahoo failed: fall back to the last good copy
+            saved.fetched_at = f"{saved.fetched_at} (saved copy - Yahoo unavailable)"
+            comp, err = saved, None
     with _LOCK:
         _CACHE[ticker] = (time.time(), comp, err)
     return comp, err
@@ -183,6 +212,9 @@ def mark_failed(ticker, error):
 
 
 def clear_cache():
+    global PREFER_LIVE
+    PREFER_LIVE = True
+    _snap().reset()
     with _LOCK:
         _CACHE.clear()
         _QCACHE.clear()
@@ -220,6 +252,12 @@ def get_quarterly(ticker):
         e = _QCACHE.get(ticker)
     if e and time.time() - e[0] < CACHE_TTL:
         return e[1]
+    sn = _snap()
+    saved = sn.quarterly(ticker)
+    if saved is not None and not PREFER_LIVE and sn.is_fresh(sn.get()):
+        with _LOCK:
+            _QCACHE[ticker] = (time.time(), saved)
+        return saved
     import yfinance as yf
     res = {"is": pd.DataFrame(), "bs": pd.DataFrame()}
     try:
@@ -227,6 +265,8 @@ def get_quarterly(ticker):
         res = {"is": _frame(t.quarterly_income_stmt, QMAP_IS), "bs": _frame(t.quarterly_balance_sheet, QMAP_BS)}
     except Exception:
         pass
+    if not len(res["is"]) and saved is not None:
+        res = saved
     with _LOCK:
         _QCACHE[ticker] = (time.time() if len(res["is"]) else time.time() - CACHE_TTL + FAIL_TTL, res)
     return res
@@ -239,6 +279,12 @@ def get_prices(tickers):
         e = _PCACHE.get(key)
     if e and time.time() - e[0] < CACHE_TTL:
         return e[1]
+    sn = _snap()
+    saved = sn.prices(key)
+    if not PREFER_LIVE and sn.is_fresh(sn.get()) and len(saved) and set(key) <= set(saved.columns):
+        with _LOCK:
+            _PCACHE[key] = (time.time(), saved)
+        return saved
     import yfinance as yf
     try:
         px = yf.download(list(key), period="2y", auto_adjust=True, progress=False, threads=True)["Close"]
@@ -247,6 +293,8 @@ def get_prices(tickers):
         px = px.dropna(how="all")
     except Exception:
         px = pd.DataFrame()
+    if px.empty and len(saved):
+        px = saved
     with _LOCK:
         _PCACHE[key] = (time.time() if len(px) else time.time() - CACHE_TTL + FAIL_TTL, px)
     return px

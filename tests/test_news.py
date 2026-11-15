@@ -21,6 +21,9 @@ def test_names_and_matching():
     assert nw.mentions("Dr Reddy's gets USFDA nod", nw.names_for("Dr. Reddy's", "DRREDDY.NS"))
     assert not nw.mentions("CARE Ratings reaffirms Tata Chemicals", ["Tata Steel"])
     assert not nw.mentions("Steel Authority news", ["SAIL"])            # word boundary, not substring
+    assert not nw.mentions("Cesc Fabregas completes loan move", ["CESC"])   # capitalised acronyms match in capitals only
+    assert nw.mentions("CESC Q2 profit rises", ["CESC"])
+    assert "ACC" not in nw.names_for("ACC", "ACC.NS")
 
 
 def test_classification():
@@ -38,6 +41,11 @@ def test_classification():
     assert c("NTPC terminates contract after contractor default")["severity"] != "high"
     assert c("Vedanta plans to cut debt by over Rs 20,000 crore")["tone"] == "positive"
     assert c("HCLTech probe finds no systems breach")["tone"] == "neutral"
+    # company as victim, minor auditors, benign legal steps, industry-wide stories
+    assert c("Kanpur Police book bogus firms in Rs 15 crore ITC fraud")["severity"] == "medium"
+    assert c("Schaeffler India cost auditor resigns")["severity"] == "medium"
+    assert c("NCLT admits L&T Realty arrangement petition")["tone"] == "neutral"
+    assert c("Infosys, Tata, Wipro, Microsoft suspended from US programme over visa fraud claims")["severity"] == "medium"
 
 
 def test_rating_extraction_and_scale():
@@ -59,9 +67,9 @@ def test_news_signal_and_latest_ratings():
     calm = [item("Tata Steel opens new plant", 5), item("Tata Steel Q2 profit rises 16%", 20)]
     assert nw.news_signal(calm, NOW)["status"] == "G"
     assert nw.news_signal([], NOW)["status"] is None
-    assert nw.news_signal([item("SEBI orders forensic audit of XYZ", 30)] + calm, NOW)["status"] == "R"
-    assert nw.news_signal([item("SEBI orders forensic audit of XYZ", 200)] + calm, NOW)["status"] == "A"
-    assert nw.news_signal([item("CRISIL downgrades XYZ to BBB", 150)], NOW)["status"] == "R"
+    assert nw.news_signal([item("SEBI orders forensic audit of XYZ", 30)] + calm, NOW)["status"] == "A"   # keywords alone: Watch
+    assert nw.news_signal([item("SEBI orders forensic audit of XYZ", 200)] + calm, NOW)["status"] == "G"
+    assert nw.news_signal([item("CRISIL downgrades XYZ to BBB", 150)], NOW)["status"] == "R"             # agency downgrade: Concern
     lr = nw.latest_ratings([item("ICRA reaffirms XYZ at AA; outlook stable", 100), item("ICRA upgrades XYZ to AA+", 20),
                             item("Fitch affirms XYZ at BBB-", 5)])
     assert lr[0]["agency"] == "ICRA" and lr[0]["rating"] == "AA+" and lr[-1]["scale"] == "global"

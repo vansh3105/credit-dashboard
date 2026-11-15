@@ -1,0 +1,48 @@
+name: Tests
+
+# Every push to main runs the tests on two Python versions. Only if they pass is the `live` branch moved to the
+# same commit - point Streamlit Cloud at `live` so a broken push never reaches the public app.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+      - name: App starts without errors
+        run: |
+          python - <<'PY'
+          from streamlit.testing.v1 import AppTest
+          at = AppTest.from_file("app.py", default_timeout=600)
+          at.run()
+          errs = [e.value for e in at.exception]
+          print("exceptions:", errs)
+          assert not errs, errs
+          PY
+
+  promote:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Move live branch to this commit
+        run: git push --force origin HEAD:refs/heads/live
