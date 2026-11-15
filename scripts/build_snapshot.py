@@ -44,7 +44,8 @@ def main():
     import metrics as mt
     import news as nw
     import report as rp
-    from sectors import SECTORS
+    from sectors import SECTORS, FIN_SECTORS
+    import banks as bk
 
     dt.PREFER_LIVE = True                     # always fetch live; the previous snapshot is only a fallback
     mt.set_strictness("Standard")
@@ -117,6 +118,19 @@ def main():
         peers = {t: c for t, c in companies.items() if universe[t][0] == sec}
         sec_px = px[[t for t in peers if t in px.columns]] if len(px) else pd.DataFrame()
         for t, c in peers.items():
+            if sec in FIN_SECTORS:                      # banks / NBFCs: lender ratios, no Merton
+                try:
+                    lv = bk.latest(bk.compute(c.fin))
+                    s_ = bk.score(bk.pillar_scores(lv, FIN_SECTORS[sec]))
+                    gi = rp.grade_index(s_)
+                    rows.append({"date": today, "ticker": t, "sector": sec, "name": c.name,
+                                 "score": None if pd.isna(s_) else round(float(s_), 1),
+                                 "grade": rp.GRADES[gi][1] if gi is not None else None, "signal": bk.signal(lv, FIN_SECTORS[sec]),
+                                 "ew_level": None, "news": nw.news_signal(news[t]["items"])["status"], "dd": None, "pd": None,
+                                 "carried": t in carried})
+                except Exception as e:
+                    print(f"  status row failed for {t}: {type(e).__name__}: {e}")
+                continue
             try:
                 m = mt.compute(c.fin, c.mcap_cr, 100.0)
                 vals = ins.latest(m)

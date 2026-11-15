@@ -93,3 +93,26 @@ SECTORS = {
         "JKIL.NS": "J. Kumar Infraprojects", "PATELENG.NS": "Patel Engineering", "HCC.NS": "Hindustan Construction Co",
     },
 }
+
+# Financial companies need different ratios (no current assets, no EBITDA; deposits are raw material, not debt), so
+# they get their own module (banks.py) and are kept out of the non-financial scoring.
+SECTORS["Banks"] = {
+    "HDFCBANK.NS": "HDFC Bank", "ICICIBANK.NS": "ICICI Bank", "SBIN.NS": "State Bank of India", "KOTAKBANK.NS": "Kotak Mahindra Bank",
+    "AXISBANK.NS": "Axis Bank", "INDUSINDBK.NS": "IndusInd Bank", "BANKBARODA.NS": "Bank of Baroda", "PNB.NS": "Punjab National Bank",
+    "CANBK.NS": "Canara Bank", "UNIONBANK.NS": "Union Bank of India", "IDFCFIRSTB.NS": "IDFC First Bank", "FEDERALBNK.NS": "Federal Bank",
+    "BANDHANBNK.NS": "Bandhan Bank", "AUBANK.NS": "AU Small Finance Bank", "YESBANK.NS": "Yes Bank", "INDIANB.NS": "Indian Bank",
+    "BANKINDIA.NS": "Bank of India", "IOB.NS": "Indian Overseas Bank", "RBLBANK.NS": "RBL Bank", "KARURVYSYA.NS": "Karur Vysya Bank",
+    "CUB.NS": "City Union Bank", "CENTRALBK.NS": "Central Bank of India", "MAHABANK.NS": "Bank of Maharashtra",
+    "UCOBANK.NS": "UCO Bank", "J&KBANK.NS": "Jammu & Kashmir Bank",
+}
+SECTORS["NBFCs & Housing Finance"] = {
+    "BAJFINANCE.NS": "Bajaj Finance", "SHRIRAMFIN.NS": "Shriram Finance", "CHOLAFIN.NS": "Cholamandalam Investment",
+    "MUTHOOTFIN.NS": "Muthoot Finance", "MANAPPURAM.NS": "Manappuram Finance", "LICHSGFIN.NS": "LIC Housing Finance",
+    "PFC.NS": "Power Finance Corporation", "RECLTD.NS": "REC", "IRFC.NS": "Indian Railway Finance Corp", "M&MFIN.NS": "Mahindra Finance",
+    "SUNDARMFIN.NS": "Sundaram Finance", "POONAWALLA.NS": "Poonawalla Fincorp", "ABCAPITAL.NS": "Aditya Birla Capital",
+    "LTF.NS": "L&T Finance", "HUDCO.NS": "HUDCO", "PNBHOUSING.NS": "PNB Housing Finance", "IIFL.NS": "IIFL Finance",
+    "CREDITACC.NS": "CreditAccess Grameen", "IREDA.NS": "IREDA", "AAVAS.NS": "Aavas Financiers", "HOMEFIRST.NS": "Home First Finance",
+    "CANFINHOME.NS": "Can Fin Homes", "SBICARD.NS": "SBI Cards",
+}
+FIN_SECTORS = {"Banks": "bank", "NBFCs & Housing Finance": "nbfc"}
+FIN_KIND = {t: kind for sec, kind in FIN_SECTORS.items() for t in SECTORS[sec]}     # ticker -> 'bank' / 'nbfc'

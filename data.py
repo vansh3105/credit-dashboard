@@ -51,6 +51,30 @@ MAP = {
     "divs":     ("cf", ["Cash Dividends Paid", "Common Stock Dividend Paid"]),
     "netdebt":  ("cf", ["Net Issuance Payments Of Debt", "Net Long Term Debt Issuance"]),
 }
+# Banks and NBFCs: their own fields (see banks.py). Deposits sit inside total liabilities; "debt" is borrowings.
+BMAP = {
+    "ta":       ("bs", ["Total Assets"]),
+    "loans":    ("bs", ["Net Loan", "Loans Receivable", "Gross Loan"]),
+    "equity":   ("bs", ["Stockholders Equity", "Common Stock Equity"]),
+    "debt":     ("bs", ["Total Debt"]),
+    "tl":       ("bs", ["Total Liabilities Net Minority Interest"]),
+    "cash":     ("bs", ["Cash And Cash Equivalents", "Cash Financial"]),
+    "invest":   ("bs", ["Investments And Advances", "Investmentin Financial Assets"]),
+    "rev":      ("is", ["Total Revenue", "Operating Revenue"]),
+    "ii":       ("is", ["Interest Income"]),
+    "ie":       ("is", ["Interest Expense"]),
+    "nii":      ("is", ["Net Interest Income"]),
+    "opex_op":  ("is", ["Operating Expense"]),
+    "sga":      ("is", ["Selling General And Administration"]),
+    "occ":      ("is", ["Occupancy And Equipment"]),
+    "da":       ("is", ["Depreciation And Amortization In Income Statement", "Reconciled Depreciation"]),
+    "pbt":      ("is", ["Pretax Income"]),
+    "tax":      ("is", ["Tax Provision"]),
+    "ni":       ("is", ["Net Income", "Net Income Common Stockholders"]),
+    "cfo":      ("cf", ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]),
+    "shares":   ("bs", ["Share Issued", "Ordinary Shares Number"]),
+}
+BOPTIONAL = {"loans", "invest", "opex_op", "sga", "occ", "da", "cfo", "shares", "debt", "cash", "ii", "ie"}
 NON_MONEY = {"shares"}
 OPTIONAL = {"shares", "sga", "cur_debt", "retained", "ltd", "cff", "divs", "netdebt"}   # missing is tolerated
 
@@ -106,10 +130,11 @@ def structural_zeros(fin, missing):
     return fin, missing
 
 
-def _standardise(ticker, name, bs, is_, cf, info):
+def _standardise(ticker, name, bs, is_, cf, info, fmap=None):
     stm = {"bs": bs, "is": is_, "cf": cf}
     cols, missing = {}, []
-    for k, (s, names) in MAP.items():
+    fmap = fmap or MAP
+    for k, (s, names) in fmap.items():
         row = _first_row(stm[s], names)
         if row is None:
             missing.append(k)
@@ -124,7 +149,7 @@ def _standardise(ticker, name, bs, is_, cf, info):
     if "ebit" not in fin and {"pbt", "interest"} <= set(fin):
         fin["ebit"] = fin["pbt"] + fin["interest"]
     fin, missing = structural_zeros(fin, missing)
-    core = [c for c in ["rev", "ta", "cfo"] if c in fin]
+    core = [c for c in (["ta", "ni"] if fmap is BMAP else ["rev", "ta", "cfo"]) if c in fin]
     fin = fin.dropna(subset=core, how="any") if core else fin
     # period end date of the latest year, for the "data as of" stamp
     period_end = ""
@@ -168,7 +193,8 @@ def fetch_live(ticker, name, retries=2):
                     info = {**info, "marketCap": float(t.fast_info["market_cap"])}
                 except Exception:
                     pass
-            return _standardise(ticker, name, bs, is_, cf, info), None
+            from sectors import FIN_KIND
+            return _standardise(ticker, name, bs, is_, cf, info, BMAP if ticker in FIN_KIND else MAP), None
         except Exception as e:                      # network, rate limit, unknown ticker
             last = f"{type(e).__name__}: {str(e)[:120]}"
             time.sleep(1.0)

@@ -46,7 +46,10 @@ grp = _fresh(grp)
 mc = _fresh(mc)
 nw = _fresh(nw)
 sn = _fresh(sn)
-SECTORS = _fresh(sectors).SECTORS
+sectors = _fresh(sectors)
+SECTORS, FIN_SECTORS = sectors.SECTORS, sectors.FIN_SECTORS
+import banks as bk
+bk = _fresh(bk)
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", page_icon="📊")
@@ -250,6 +253,126 @@ with top[3]:
             st.error("Need at least two loaded companies for a peer review.")
             st.stop()
         t2 = st.selectbox("Company 2", rest, format_func=lambda t: names[t])
+
+# ------------------------------------------------------------------ banks and NBFCs: their own view
+if sector in FIN_SECTORS:
+    KIND = FIN_SECTORS[sector]
+    st.info(f"**{sector}** use lender ratios - capital, asset quality, earnings, efficiency - instead of the corporate "
+            "scorecard. Bad-loan (NPA) and capital-adequacy (CRAR) figures are not in Yahoo's data: enter them from the "
+            "latest results to complete the asset-quality and capital scores.", icon=":material/account_balance:")
+    LM = {t: bk.compute(c.fin) for t, c in companies.items()}
+    def lv(t):
+        man = {k: st.session_state.get(f"bk-man-{t}-{k}") for k in bk.MANUAL}
+        return bk.with_manual(bk.latest(LM[t]), man)
+    LV = {t: lv(t) for t in companies}
+    def lscore(t):
+        p_ = bk.pillar_scores(LV[t], KIND)
+        return p_, bk.score(p_)
+    sel = [t1] + ([t2] if t2 else [])
+    LSEC = st.tabs(["Overview", "Ratios & trends", "Sector ranking", "News & ratings", "Method"])
+    with LSEC[0]:
+        cols_ = st.columns(len(sel))
+        for col_, t in zip(cols_, sel):
+            with col_:
+                with st.container(border=True):
+                    p_, s_ = lscore(t)
+                    sig_ = bk.signal(LV[t], KIND)
+                    gi_ = rp.grade_index(s_)
+                    st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[sig_]}'><div class='who' style='color:{C1 if t == t1 else C2}'>● "
+                                f"{esc(names[t])}</div><div class='sig'>{sig_}</div><div>Score <b>{'n/a' if pd.isna(s_) else f'{s_:.0f}/100'}</b>"
+                                f" · grade <b>{rp.GRADES[gi_][1] + ' (≈ ' + rp.GRADES[gi_][2] + ')' if gi_ is not None else 'n/a'}</b></div></div>",
+                                unsafe_allow_html=True)
+                    k_ = st.columns(4)
+                    for kc, key in zip(k_, ["roa", "nim", "eq_assets", "cost_income"]):
+                        kc.metric(bk.BM[key][0], bk.fmt(key, LV[t].get(key)), help=bk.BM[key][6])
+                    with st.popover("Enter NPA and CRAR from the results", width="stretch"):
+                        st.caption("From the latest quarterly results or investor presentation (in %). Kept for this session.")
+                        for key in bk.MANUAL:
+                            st.number_input(bk.BM[key][0].replace(" (entered)", " (%)"), 0.0, 100.0, None, 0.05,
+                                            key=f"bk-man-{t}-{key}", placeholder="not entered", help=bk.BM[key][6])
+                    pf = go.Figure(go.Bar(x=[p_.get(p) for p in bk.PILLARS], y=bk.PILLARS, orientation="h",
+                                          marker_color=[score_color(p_.get(p)) if not pd.isna(p_.get(p)) else "#8b949e" for p in bk.PILLARS],
+                                          text=["n/a" if pd.isna(p_.get(p)) else f"{p_.get(p):.0f}" for p in bk.PILLARS], textposition="outside"))
+                    pf.update_layout(height=210, template="plotly_white", margin=dict(l=10, r=30, t=10, b=10), xaxis=dict(range=[0, 110]),
+                                     yaxis=dict(autorange="reversed"))
+                    st.plotly_chart(pf, width="stretch", key=f"bk-pil-{t}")
+                    for n_ in LM[t].attrs.get("notes", []):
+                        st.caption("⚠ " + n_)
+                    if all(pd.isna(LV[t].get(k)) for k in bk.MANUAL):
+                        st.caption("Asset quality and capital are scored on derived figures only until NPA and CRAR are entered.")
+        st.caption(f"Score = weighted factor scores ({', '.join(f'{p} {w}%' for p, w in bk.WEIGHTS.items())}), mapped to the same "
+                   "CR1-CR9 scale as corporates. Rule-based and not calibrated against bank ratings.")
+    with LSEC[1]:
+        bench = {k: np.nanmedian([LV[t].get(k) for t in companies]) if any(not pd.isna(LV[t].get(k)) for t in companies) else np.nan
+                 for k in bk.BM}
+        rows_ = []
+        for key, spec in bk.BM.items():
+            g_, r_ = bk.thresholds(key, KIND)
+            row = {"Metric": spec[0], "Factor": spec[1]}
+            for t in sel:
+                row[names[t]] = bk.fmt(key, LV[t].get(key))
+                row[f"{names[t]} signal"] = {"G": "✓ Healthy", "A": "! Watch", "R": "✕ Concern"}.get(bk.rag(key, LV[t].get(key), KIND), "–")
+            row[f"{sector} median"] = bk.fmt(key, bench[key])
+            row["Healthy / concern"] = "context" if g_ is None else (f"≥ {bk.fmt(key, g_)} / < {bk.fmt(key, r_)}" if spec[3] == "high"
+                                                                      else f"≤ {bk.fmt(key, g_)} / > {bk.fmt(key, r_)}")
+            rows_.append(row)
+        rdf = pd.DataFrame(rows_)
+        st.dataframe(style_cells(rdf, lambda v: {"✕ Concern": SIG_CSS["✕ Concern"], "! Watch": SIG_CSS["! Watch"],
+                                                 "✓ Healthy": SIG_CSS["✓ Healthy"]}.get(v, ""), [c for c in rdf.columns if c.endswith("signal")]),
+                     hide_index=True, width="stretch")
+        tk = st.segmented_control("Trend", [bk.BM[k][0] for k in bk.BM if k not in bk.MANUAL], default=bk.BM["roa"][0], key="bk-trend") \
+            or bk.BM["roa"][0]
+        key = next(k for k in bk.BM if bk.BM[k][0] == tk)
+        tf = go.Figure()
+        for t in sel:
+            s_ = LM[t].loc[key].dropna()
+            tf.add_trace(go.Scatter(x=[f"FY{y}" for y in s_.index], y=s_.values, name=names[t], mode="lines+markers",
+                                    line=dict(color=C1 if t == t1 else C2, width=2.6)))
+        g_, r_ = bk.thresholds(key, KIND)
+        if g_ is not None:
+            tf.add_hline(y=g_, line_dash="dot", line_color=GREEN); tf.add_hline(y=r_, line_dash="dot", line_color=RED)
+        tf.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(type="category"),
+                         yaxis=dict(tickformat=".1f" if bk.BM[key][2] == "x" else ".1%"))
+        st.plotly_chart(tf, width="stretch", key="bk-trend-fig")
+    with LSEC[2]:
+        rk = []
+        for t in companies:
+            p_, s_ = lscore(t)
+            gi_ = rp.grade_index(s_)
+            rk.append({"Lender": names[t], "Score": s_, "Grade": rp.GRADES[gi_][1] if gi_ is not None else "n/a",
+                       "Signal": bk.signal(LV[t], KIND).title(), **{bk.BM[k][0]: bk.fmt(k, LV[t].get(k))
+                                                                     for k in ("roa", "roe", "nim", "eq_assets", "cost_income", "credit_cost", "loan_growth")}})
+        rkd = pd.DataFrame(rk).sort_values("Score", ascending=False)
+        rkd["Score"] = rkd["Score"].map(lambda v: "n/a" if pd.isna(v) else f"{v:.0f}")
+        st.dataframe(style_cells(rkd, lambda v: {"Elevated Concern": SIG_CSS["✕ Concern"], "Watch": SIG_CSS["! Watch"],
+                                                 "Comfortable": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Signal"]), hide_index=True, width="stretch")
+        st.caption("Ranked on derived figures plus any NPA / CRAR you entered.")
+    with LSEC[3]:
+        for t in sel:
+            nres_ = nw.get_news(names[t], t)
+            its = nres_["items"]
+            ns_ = nw.news_signal(its)
+            st.markdown(f"**{names[t]}** - news flow: {({'R': 'Concern', 'A': 'Watch', 'G': 'Clear', None: 'no headlines'})[ns_['status']]} "
+                        f"({ns_['value']})" + (f" · driven by “{ns_['trigger']}”" if ns_["trigger"] else ""))
+            rats_ = [r_ for r_ in nw.latest_ratings(its) if r_.get("rating")]
+            if rats_:
+                st.caption("Ratings in headlines: " + "; ".join(f"{r_['agency']} {r_['rating']} ({r_['date']:%b %Y})" for r_ in rats_[:4]))
+            vis = [it for it in its if it["category"] != "Market commentary"][:25]
+            if vis:
+                st.dataframe(pd.DataFrame([{"Date": it["date"].strftime("%d %b %Y"), "Headline": it["title"], "Source": it["source"] or it["via"],
+                                            "Tone": it["tone"], "Severity": it["severity"], "Link": it["url"] or None} for it in vis]),
+                             hide_index=True, width="stretch",
+                             column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                            "Headline": st.column_config.TextColumn(width="large")})
+    with LSEC[4]:
+        st.markdown(bk.__doc__.replace("\n", "  \n"))
+        st.markdown("**Cut-offs** (healthy / concern), " + ("banks" if KIND == "bank" else "NBFCs") + ":  \n" + "  \n".join(
+            f"- {spec[0]}: " + ("context only" if bk.thresholds(k, KIND)[0] is None else
+                                f"{bk.fmt(k, bk.thresholds(k, KIND)[0])} / {bk.fmt(k, bk.thresholds(k, KIND)[1])}") + f" - {spec[6]}"
+            for k, spec in bk.BM.items()))
+        st.caption("Not covered for lenders: Merton distance-to-default (a bank's liabilities are mostly deposits), the corporate "
+                   "forensic models (Beneish, Altman, Piotroski), and the credit workbench.")
+    st.stop()
 
 # ------------------------------------------------------------------ compute
 all_m = {t: mt.compute(c.fin, c.mcap_cr, gnp) for t, c in companies.items()}
