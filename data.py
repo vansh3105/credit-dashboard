@@ -93,6 +93,16 @@ def structural_zeros(fin, missing):
         fin = fin.copy()
         fin["inv"] = 0.0
         missing = [m for m in missing if m != "inv"]
+    # Retained earnings reported in earlier years but blank in later ones: roll forward with profit less dividends
+    # (RE_t = RE_t-1 + NI_t - dividends_t). Without it Altman Z goes blank for the latest year.
+    if "retained" in fin and "ni" in fin and fin["retained"].notna().any() and fin["retained"].isna().any():
+        fin = fin.copy()
+        re_ = fin["retained"].copy()
+        divs = fin["divs"].abs() if "divs" in fin else pd.Series(np.nan, index=fin.index)
+        for i in range(1, len(re_)):              # only when the year's dividend is known: high-payout firms would overshoot
+            if pd.isna(re_.iloc[i]) and not pd.isna(re_.iloc[i - 1]) and not pd.isna(fin["ni"].iloc[i]) and not pd.isna(divs.iloc[i]):
+                re_.iloc[i] = re_.iloc[i - 1] + fin["ni"].iloc[i] - divs.iloc[i]
+        fin["retained"] = re_
     return fin, missing
 
 

@@ -843,3 +843,31 @@ def explain(key, d, year=None):
     }
     f = E.get(key)
     return f() if f else None
+
+
+# ---- score attribution ------------------------------------------------------------------
+def score_attribution(v_now, v_prev, gov=None, weights=None):
+    """Why the overall score moved between two years. Each metric whose rating changed gets its share of the move:
+    pillar weight / total weight x change in its points (100 / 50 / 0) / number of rated metrics in the pillar.
+    What is left (a metric newly rated or no longer rated, governance) is reported as 'other'.
+    Returns dict(now, prev, delta, items=[dict(key, label, pillar, was, now, impact)], other)."""
+    w = weights or DEFAULT_WEIGHTS
+    p_now, p_prev = pillar_scores(v_now, gov), pillar_scores(v_prev, gov)
+    s_now, s_prev = overall_score(p_now, w), overall_score(p_prev, w)
+    den = sum(wt for p, wt in w.items() if wt > 0 and not pd.isna(p_now.get(p, np.nan)))
+    items = []
+    for p, groups in PILLARS.items():
+        keys = [k for k, m in M.items() if m["group"] in groups]
+        rated_now = [k for k in keys if rag(k, v_now.get(k))]
+        if not rated_now or not den:
+            continue
+        for k in rated_now:
+            r0, r1 = rag(k, v_prev.get(k)), rag(k, v_now.get(k))
+            if r0 and r0 != r1:
+                impact = w.get(p, 0) / den * (RAG_PTS[r1] - RAG_PTS[r0]) / len(rated_now)
+                items.append(dict(key=k, label=M[k]["label"], pillar=p, was=r0, now=r1, impact=impact,
+                                  v_was=v_prev.get(k), v_now=v_now.get(k)))
+    items.sort(key=lambda x: x["impact"])
+    delta = s_now - s_prev if not (pd.isna(s_now) or pd.isna(s_prev)) else np.nan
+    other = delta - sum(x["impact"] for x in items) if not pd.isna(delta) else np.nan
+    return dict(now=s_now, prev=s_prev, delta=delta, items=items, other=other)

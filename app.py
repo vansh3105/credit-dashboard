@@ -15,6 +15,7 @@ import data as dt
 import early_warning as ew
 import insights as ins
 import report as rp
+import scenario as scn
 import metrics as mt
 import macro as mc
 import news as nw
@@ -39,6 +40,7 @@ mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
 ew = _fresh(ew)
 rp = _fresh(rp)
+scn = _fresh(scn)
 mc = _fresh(mc)
 nw = _fresh(nw)
 sn = _fresh(sn)
@@ -51,7 +53,7 @@ st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", pa
 # section is hidden their values are re-saved here; that keeps memo notes, weights and overrides when you switch sections.
 _PERSIST = {"Decide": ("m_", "w_", "fa_", "fd_", "fn_", "fr_", "ft_", "sdd_", "sdm_", "sdr_", "sg_", "cov_", "borrower"),
             "Monitor": ("nw-man-", "nw-cat", "nw-tone", "nw-hide-mkt", "mon-co", "ew-rf"),
-            "Analyse": ("ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
+            "Analyse": ("ov-co", "wi-", "ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
 _shown = st.session_state.get("section") or "Analyse"
 for _k in list(st.session_state.keys()):
     if any(_k.startswith(p_) for sec_, ps_ in _PERSIST.items() if sec_ != _shown for p_ in ps_):
@@ -644,6 +646,35 @@ for _t, _slot in CV_SLOT.items():
     _slot.markdown(credit_view(companies[_t]), unsafe_allow_html=True)
 
 
+@st.fragment
+def _whatif(comp):
+    """Live sliders: shock revenue, margin and rates on the latest year; show cover, score and grade, and where cover breaks.
+    A fragment, so moving a slider reruns only this box."""
+    w1, w2, w3 = st.columns(3)
+    g_ = w1.slider("Revenue (%)", -60, 30, 0, 5, key=f"wi-g-{comp.ticker}") / 100
+    dm_ = w2.slider("EBITDA margin (pp)", -15.0, 5.0, 0.0, 0.5, key=f"wi-m-{comp.ticker}") / 100
+    dr_ = w3.slider("Interest rate (pp)", -2.0, 5.0, 0.0, 0.25, key=f"wi-r-{comp.ticker}") / 100
+    r_ = scn.run(comp.fin, comp.mcap_cr, gnp, comp.gov, W, g_, dm_, dr_)
+    rows_ = []
+    for k_ in ("dscr", "icr", "nd_ebitda", "de", "current_ratio"):
+        a_, b_ = r_["base"].get(k_), r_["shocked"].get(k_)
+        rows_.append({"Metric": mt.M[k_]["label"], "Now": fmtv(k_, a_), "What-if": fmtv(k_, b_),
+                      "Signal": {"G": "✓ Healthy", "A": "! Watch", "R": "✕ Concern"}.get(mt.rag(k_, b_), "–")})
+    gl = lambda i: rp.GRADES[i][1] if i is not None else "n/a"
+    rows_.append({"Metric": "Score / grade", "Now": f"{r_['score0']:.0f} · {gl(r_['grade0'])}" if not pd.isna(r_["score0"]) else "n/a",
+                  "What-if": f"{r_['score1']:.0f} · {gl(r_['grade1'])}" if not pd.isna(r_["score1"]) else "n/a", "Signal": ""})
+    st.dataframe(style_cells(pd.DataFrame(rows_), lambda v: {"✕ Concern": SIG_CSS["✕ Concern"], "! Watch": SIG_CSS["! Watch"],
+                                                             "✓ Healthy": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Signal"]),
+                 hide_index=True, width="stretch")
+    bp_ = scn.breakpoints(comp.fin, dm_, dr_)
+    txt_ = []
+    for k_, v_ in bp_.items():
+        txt_.append(f"{k_}: " + ("already below" if v_ == 0 else "holds even at a 90% revenue fall" if v_ is None else f"at a **{v_}%** revenue fall"))
+    st.markdown("Break points" + (" (with the margin and rate shocks above)" if dm_ or dr_ else "") + ":  \n" + "  \n".join(txt_))
+    st.caption("Revenue moves with the margin held unless you change it; the whole debt book reprices; working-capital days stay "
+               "the same. Simplified - the Credit workbench stresses a new facility in detail.")
+
+
 # ------------------------------------------------------------------ sections
 # Four sections instead of eleven tabs. Only the chosen section's code runs, so each page is also faster.
 # tabs[k] keeps the original numbering: 0 Overview, 1 Liquidity, 2 Solvency, 3 Earnings quality, 4 Distress & forensic,
@@ -694,6 +725,41 @@ if tabs[0] is not None:
                     _f.update_layout(height=200, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
                                      title=dict(text=f"{names[t1]}: score by night", font=dict(size=13)), yaxis=dict(range=[0, 100]))
                     st.plotly_chart(_f, width="stretch", key="hist-score")
+        # ---- why the score moved, and what would break it
+        OC = A if B is None else {A.name: A, B.name: B}[st.radio("Company for the two panels below", [A.name, B.name], horizontal=True,
+                                                               key="ov-co", label_visibility="collapsed")]
+        _m = all_m[OC.ticker]
+        ox1, ox2 = st.columns(2)
+        with ox1:
+            with st.container(border=True):
+                if _m.shape[1] >= 2:
+                    _att = mt.score_attribution(latest_all[OC.ticker], ins.latest(_m.iloc[:, :-1]), OC.gov, W)
+                    _y0, _y1 = _m.columns[-2], _m.columns[-1]
+                    st.markdown(f"**Why the score moved, FY{_y0} → FY{_y1}**")
+                    if pd.isna(_att["delta"]):
+                        st.caption("Not enough data for both years.")
+                    else:
+                        st.markdown(f"Score **{_att['prev']:.0f} → {_att['now']:.0f}** ({_att['delta']:+.1f} points)")
+                        _items = _att["items"]
+                        if _items:
+                            _lbl = [f"{x['label']} ({x['was']}→{x['now']})" for x in _items] + (["Other"] if abs(_att["other"]) >= 0.5 else [])
+                            _val = [x["impact"] for x in _items] + ([_att["other"]] if abs(_att["other"]) >= 0.5 else [])
+                            _f = go.Figure(go.Bar(x=_val, y=_lbl, orientation="h", marker_color=[GREEN if v_ > 0 else RED for v_ in _val],
+                                                  text=[f"{v_:+.1f}" for v_ in _val], textposition="outside",
+                                                  hovertemplate="%{y}: %{x:+.1f} points<extra></extra>"))
+                            _f.update_layout(height=max(160, 34 * len(_val) + 40), template="plotly_white", margin=dict(l=10, r=40, t=10, b=10),
+                                             yaxis=dict(autorange="reversed"), xaxis_title="points")
+                            st.plotly_chart(_f, width="stretch", key="ov-attr")
+                        else:
+                            st.caption("No metric changed rating; the move comes from small shifts in metrics that were not rated before.")
+                        st.caption("Each metric that changed rating (G/A/R) gets its share of the move, by factor weight. Uses the "
+                                   "cut-offs and weights in force.")
+                else:
+                    st.caption("Only one year of data - nothing to compare.")
+        with ox2:
+            with st.container(border=True):
+                st.markdown("**What if…** (latest year)")
+                _whatif(OC)
         st.markdown("##### Scorecard by factor")
         st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
                "Weights and the overall score are an advanced extension (see Credit workbench).")
