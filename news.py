@@ -43,7 +43,7 @@ ALIASES = {
     "POWERGRID.NS": ["Powergrid", "Power Grid Corporation"], "SAIL.NS": ["Steel Authority of India"],
     "JINDALSTEL.NS": ["Jindal Steel"], "BOSCHLTD.NS": ["Bosch Ltd"], "MOTHERSON.NS": ["Motherson"],
     "ALKEM.NS": ["Alkem Laboratories"], "DIVISLAB.NS": ["Divi's Lab"], "TORNTPHARM.NS": ["Torrent Pharmaceuticals"],
-    "HYUNDAI.NS": ["Hyundai India"], "TCS.NS": ["Tata Consultancy Services", "TCS"], "HCC.NS": ["HCC", "Hindustan Construction Company"], "ADANIPORTS.NS": ["APSEZ"], "RELIANCE.NS": ["RIL"], "TVSMOTOR.NS": ["TVS Motor Company"],
+    "HYUNDAI.NS": ["Hyundai India"], "GLAXO.NS": ["GlaxoSmithKline Pharmaceuticals", "GSK Pharmaceuticals", "GSK India"], "TCS.NS": ["Tata Consultancy Services", "TCS"], "HCC.NS": ["HCC", "Hindustan Construction Company"], "ADANIPORTS.NS": ["APSEZ"], "RELIANCE.NS": ["RIL"], "TVSMOTOR.NS": ["TVS Motor Company"],
 }
 
 # ---------------------------------------------------------------- names and matching

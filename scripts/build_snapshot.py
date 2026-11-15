@@ -54,7 +54,7 @@ def main():
     print(f"{len(universe)} companies in {len(SECTORS)} sectors")
 
     # ---- annual statements (a few parallel requests; Yahoo rate-limits bursts)
-    companies, carried = {}, []
+    companies, carried, mcap_carried = {}, [], []
     def fetch(t):
         comp, err = dt.fetch_live(t, universe[t][1], retries=3)
         return t, comp, err
@@ -64,8 +64,18 @@ def main():
                 comp = sn.company(t)
                 if comp is not None:
                     carried.append(t)
+            elif pd.isna(comp.mcap_cr) or not comp.gov:      # statements fine but market cap / governance missing
+                old = sn.company(t)
+                if old is not None:
+                    if pd.isna(comp.mcap_cr) and not pd.isna(old.mcap_cr):
+                        comp.mcap_cr = old.mcap_cr
+                        mcap_carried.append(t)
+                    if not comp.gov and old.gov:
+                        comp.gov = old.gov
             if comp is not None and not comp.fin.empty:
                 companies[t] = comp
+    no_mcap = [t for t, c in companies.items() if pd.isna(c.mcap_cr)]
+    print(f"market cap: {len(mcap_carried)} carried from last night, still missing: {no_mcap}")
     print(f"annual: {len(companies) - len(carried)} live, {len(carried)} carried over, "
           f"{len(universe) - len(companies)} missing ({time.time() - t0:.0f}s)")
     if not companies:

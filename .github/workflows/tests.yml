@@ -29,7 +29,16 @@ jobs:
           from streamlit.testing.v1 import AppTest
           at = AppTest.from_file("app.py", default_timeout=600)
           at.run()
-          errs = [e.value for e in at.exception]
+          errs = [("start", e.value) for e in at.exception]
+          years = [int(o[2:6]) for o in at.selectbox(key="asof").options] if not errs else []
+          for mode in ["Individual vs industry average", "Peer company review"]:
+              [s for s in at.selectbox if s.label == "2 · Analysis type"][0].set_value(mode)
+              for y in years[:2]:                      # latest year and one past year
+                  at.session_state["asof"] = y
+                  for section in ["Analyse", "Monitor", "Decide", "Method"]:
+                      at.session_state["section"] = section
+                      at.run()
+                      errs += [(f"{mode[:4]} FY{y} {section}", e.value) for e in at.exception]
           print("exceptions:", errs)
           assert not errs, errs
           PY

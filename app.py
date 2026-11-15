@@ -1777,7 +1777,7 @@ if tabs[8] is not None:
             if ew_b and ew_b.get("news"):
                 n_items = ew_b["news"]["items"]
                 n_rats = agency_ratings(BC, n_items)
-            news_ctx = dict(signal=nw.news_signal(n_items),
+                news_ctx = dict(signal=nw.news_signal(n_items),
                                 ratings=[dict(r_, cr=nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None)
                                          for r_ in n_rats][:4],
                                 top=[it for it in n_items if it["tone"] == "negative" and it["severity"] in ("high", "medium")][:5])

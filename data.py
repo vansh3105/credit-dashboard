@@ -86,6 +86,16 @@ def fiscal_label(period_end):
     return ts.year + 1 if ts.month >= 10 else ts.year
 
 
+def structural_zeros(fin, missing):
+    """Yahoo leaves out a balance-sheet line that is zero. A company with no inventory line at all (IT, services) has no
+    inventory, so it is set to 0 - otherwise the quick ratio and cash conversion cycle go blank for the whole sector."""
+    if "inv" not in fin and "ca" in fin and len(fin):
+        fin = fin.copy()
+        fin["inv"] = 0.0
+        missing = [m for m in missing if m != "inv"]
+    return fin, missing
+
+
 def _standardise(ticker, name, bs, is_, cf, info):
     stm = {"bs": bs, "is": is_, "cf": cf}
     cols, missing = {}, []
@@ -103,6 +113,7 @@ def _standardise(ticker, name, bs, is_, cf, info):
         fin["ebitda"] = fin["ebit"] + fin["da"]
     if "ebit" not in fin and {"pbt", "interest"} <= set(fin):
         fin["ebit"] = fin["pbt"] + fin["interest"]
+    fin, missing = structural_zeros(fin, missing)
     core = [c for c in ["rev", "ta", "cfo"] if c in fin]
     fin = fin.dropna(subset=core, how="any") if core else fin
     # period end date of the latest year, for the "data as of" stamp
@@ -142,6 +153,11 @@ def fetch_live(ticker, name, retries=2):
                 info = t.get_info() or {}
             except Exception:
                 info = {}
+            if not info.get("marketCap"):                 # the info endpoint is throttled first; fast_info is separate
+                try:
+                    info = {**info, "marketCap": float(t.fast_info["market_cap"])}
+                except Exception:
+                    pass
             return _standardise(ticker, name, bs, is_, cf, info), None
         except Exception as e:                      # network, rate limit, unknown ticker
             last = f"{type(e).__name__}: {str(e)[:120]}"

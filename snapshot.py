@@ -62,10 +62,11 @@ def company_out(c) -> dict:
 
 def company_in(d: dict):
     import data as dt
-    return dt.Company(ticker=d["ticker"], name=d["name"], fin=df_in(d["fin"]),
+    fin, missing = dt.structural_zeros(df_in(d["fin"]), d.get("missing") or [])
+    return dt.Company(ticker=d["ticker"], name=d["name"], fin=fin,
                       mcap_cr=np.nan if d.get("mcap_cr") is None else d["mcap_cr"],
                       raw_values={int(k): v for k, v in (d.get("raw_values") or {}).items()}, gov=d.get("gov") or {},
-                      currency=d.get("currency", "INR"), missing=d.get("missing") or [], period_end=d.get("period_end", ""),
+                      currency=d.get("currency", "INR"), missing=missing, period_end=d.get("period_end", ""),
                       fetched_at=d.get("fetched_at", ""))
 
 

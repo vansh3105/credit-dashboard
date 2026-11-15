@@ -389,7 +389,6 @@ def fix_targets(fin):
         ("debt", "cash", "ebitda", "ebit", "interest", "cfo", "cur_debt", "ca", "cl", "equity"))
     cur = 0.0 if pd.isna(cur) else cur
     fixes, cush = [], []
-    M_ = mt.M
 
     nd = debt - cash
     if not (pd.isna(nd) or pd.isna(ebitda)) and ebitda > 0:
