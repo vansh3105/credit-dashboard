@@ -168,56 +168,6 @@ def conditions(vals, stance_txt):
     return acts or ["Standard monitoring; refresh after the next results."]
 
 
-def memo(name, sector, as_of, vals, flags, pillars, score, band_txt, snap_rows, req=None, scen=None, cov_rows=None,
-         bf=None, cmp_name=None):
-    """Return the credit-appraisal note as markdown. All inputs are pre-computed by the app."""
-    v = verdict(vals, flags)
-    lines = [f"# Credit appraisal note - {name}", "",
-             f"*{sector} · {as_of} · draft for analyst review - generated from public data, not a credit decision*", ""]
-    lines += ["## 1. Borrower and request", f"- Borrower: **{name}** ({sector})"]
-    if req:
-        lines += [f"- Request: **{req['type']}** of **Rs {req['amount']:,.0f} cr** at **{req['rate']:.1%}**"
-                  + (f" over {req['tenor']:.0f} years" if req["type"].startswith("Term") else " (revolving)"),
-                  f"- Largest facility keeping DSCR at or above {req['target']:.2f}x: **Rs {req['capacity']:,.0f} cr**"]
-    else:
-        lines += ["- Request: none entered (monitoring view)"]
-    lines += ["", "## 2. Financial snapshot", "", "| Metric | " + " | ".join(snap_rows["cols"]) + " |",
-              "|---|" + "---|" * len(snap_rows["cols"])]
-    for label, vals_ in snap_rows["rows"]:
-        lines.append(f"| {label} | " + " | ".join(vals_) + " |")
-    lines += ["", "## 3. Indicative risk score",
-              f"- Overall: **{score:.0f}/100 - {band_txt}** (rule-based; adjustable weights)",
-              "- Pillars: " + "; ".join(f"{p} {s:.0f}" for p, s in pillars.items() if not pd.isna(s)),
-              f"- Headline signal: **{v['signal']}** ({v['g']} green / {v['a']} amber / {v['r']} red)", ""]
-    strengths = [f"{mt.M[k]['label']} {fmt(k, vals[k])}" for k in KEY_STRENGTH if mt.rag(k, vals.get(k)) == "G"][:5]
-    concerns = [f"{mt.M[k]['label']} {fmt(k, vals[k])}" for k in mt.M if mt.rag(k, vals.get(k)) == "R"][:8]
-    lines += ["## 4. Strengths", *([f"- {s}" for s in strengths] or ["- None clearly in the green zone"]), "",
-              "## 5. Risks and red flags", *([f"- {c}" for c in concerns] or ["- No red metrics"]),
-              *[f"- {t}" for s, t in flags]]
-    if bf and bf.get("flag") is not None:
-        lines.append(f"- Benford screen: KS {bf['ks']:.3f} vs cut-off {bf['cutoff']:.3f} - "
-                     + ("unusual leading-digit pattern, verify source data" if bf["flag"] else "no unusual pattern"))
-    lines.append("")
-    if scen:
-        lines += ["## 6. Pro-forma and stress", "", "| | Current | With facility | Stressed |", "|---|---|---|---|"]
-        for label, k, f in (("Interest cover", "icr", "{:.2f}x"), ("DSCR", "dscr", "{:.2f}x"), ("Debt / Equity", "de", "{:.2f}x"),
-                            ("Net debt / EBITDA", "nd_ebitda", "{:.2f}x"), ("Operating cash flow (Rs cr)", "cfo", "{:,.0f}")):
-            cells = [("n/a" if pd.isna(scen[c][k]) else f.format(scen[c][k])) for c in ("base", "pro", "stress")]
-            lines.append(f"| {label} | " + " | ".join(cells) + " |")
-        lines += ["", f"*Stress case: {scen['desc']}*", ""]
-    if cov_rows:
-        lines += ["## 7. Covenant headroom (latest year)", "", "| Covenant | Actual | Limit | Status |", "|---|---|---|---|"]
-        lines += [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in cov_rows]
-        lines.append("")
-    breaches = sum(1 for r in (cov_rows or []) if r[3] == "Breach")
-    st_, why = stance(v["signal"], scen["pro"]["dscr"] if scen else None, breaches, req["target"] if req else 1.25)
-    acts = conditions(vals, st_)
-    lines += ["## 8. Indicative stance", f"**{st_}.** {why}", "", "### Conditions / next steps",
-              *[f"- {a}" for a in acts], "",
-              "---", "*Limitations: annual public statements only; DSCR is a proxy; no collateral, management or "
-              "industry assessment is included. Figures in Rs crore.*"]
-    return "\n".join(lines)
-
 
 # ====================================================================== ADVANCED: deeper analysis
 TAB_OF = {"Liquidity": "Liquidity", "Solvency": "Solvency & debt service", "Returns": "Solvency & debt service", "Growth & margins": "Solvency & debt service",

@@ -13,6 +13,7 @@ import os
 import data as dt
 import early_warning as ew
 import insights as ins
+import report as rp
 import metrics as mt
 import sectors
 
@@ -33,6 +34,7 @@ dt = _fresh(dt)
 mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
 ew = _fresh(ew)
+rp = _fresh(rp)
 SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
@@ -215,7 +217,8 @@ with top[3]:
 # ------------------------------------------------------------------ compute
 all_m = {t: mt.compute(c.fin, c.mcap_cr, gnp) for t, c in companies.items()}
 latest_all = {t: ins.latest(m) for t, m in all_m.items()}
-mt.set_basis(basis_sel, {k: [lv.get(k) for lv in latest_all.values()] for k in mt.M})
+SECTOR_VALS = {k: [lv.get(k) for lv in latest_all.values()] for k in mt.M}
+mt.set_basis(basis_sel, SECTOR_VALS)
 SECTOR_MODE = basis_sel == "Sector-relative"
 if SECTOR_MODE:
     n_band = sum(mt.is_sector_band(k) for k in mt.M)
@@ -532,6 +535,43 @@ with hc[1]:
                         "free cash flow) are ranked, not averaged - see <i>Where it sits in the sector</i> on the Overview tab.</div>",
                         unsafe_allow_html=True)
             kpis_rel(vB)
+
+# ------------------------------------------------------------------ early-warning helpers (used by the tab and the credit memo)
+EW_LATEST = asof_y is None or asof_y == year_opts[-1]
+fpd = lambda p_: "n/a" if p_ is None or pd.isna(p_) else ("< 0.01%" if p_ < 1e-4 else f"{p_:.2%}")
+
+
+def annual_end_of(comp):
+    try:
+        return pd.to_datetime(comp.period_end, format="%b-%Y") + pd.offsets.MonthEnd(0)
+    except Exception:
+        return None
+
+
+def dp_for(comp, q_=None):
+    """Merton default point; prefers the interim balance sheet when it is newer than the annual report."""
+    bs_, ae = (q_.get("bs") if q_ else None), annual_end_of(comp)
+    if bs_ is not None and len(bs_) and "debt" in bs_ and not pd.isna(bs_["debt"].iloc[-1]) and (
+            ae is None or bs_.index[-1] > ae + pd.Timedelta(days=20)):
+        cur_ = bs_["cur_debt"].iloc[-1] if "cur_debt" in bs_ else np.nan
+        return ew.default_point(cur_, bs_["debt"].iloc[-1]), f"{bs_.index[-1]:%b-%y} balance sheet"
+    f_ = comp.fin.iloc[-1]
+    return ew.default_point(f_.get("cur_debt", np.nan), f_.get("debt", np.nan)), f"FY{comp.fin.index[-1]} annual report"
+
+
+def ew_bundle(comp, rf):
+    """Everything the early-warning view needs for one company (prices for the whole sector, cached 6 hours)."""
+    px_all = dt.get_prices(list(companies))
+    q_ = dt.get_quarterly(comp.ticker)
+    mkt_all = {t: (ew.market_stats(px_all[t]) if t in px_all.columns else None) for t in companies}
+    mk = mkt_all.get(comp.ticker)
+    D, src = dp_for(comp, q_)
+    mert_ = ew.merton(comp.mcap_cr, mk["vol"] if mk else np.nan, D, rf)
+    hist_ = ew.dd_history(px_all[comp.ticker], comp.mcap_cr, D, rf) if comp.ticker in px_all.columns else pd.DataFrame()
+    sigs_ = ew.signals(comp.fin, q_, mk, [m for t, m in mkt_all.items() if t != comp.ticker], mert_, hist_, annual_end_of(comp))
+    n_, lvl_ = ew.summary(sigs_)
+    return dict(px_all=px_all, q=q_, mkt_all=mkt_all, mk=mk, D=D, D_src=src, mert=mert_, hist=hist_, sigs=sigs_, n=n_, level=lvl_)
+
 
 tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
                 "Early warning", "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
@@ -925,7 +965,7 @@ with tabs[5]:
     st.markdown(f"### Early warning {ADV}", unsafe_allow_html=True)
     st.caption("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
                "and the market-implied Merton distance-to-default. These move months before annual ratios do.")
-    if asof_y is not None and asof_y != year_opts[-1]:
+    if not EW_LATEST:
         st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
                 "latest year in View options to see them.")
     else:
@@ -935,31 +975,10 @@ with tabs[5]:
         with e2:
             rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 6.5, 0.25, key="ew-rf",
                                  help="Used by the Merton model; roughly the 1-year Indian T-bill yield.") / 100
-        fpd = lambda p_: "n/a" if p_ is None or pd.isna(p_) else ("< 0.01%" if p_ < 1e-4 else f"{p_:.2%}")
         with st.spinner("Loading quarterly results and share prices…"):
-            px_all = dt.get_prices(list(companies))
-            q_ec = dt.get_quarterly(ec.ticker)
-        mkt_all = {t: (ew.market_stats(px_all[t]) if t in px_all.columns else None) for t in companies}
-        try:
-            ann_end = pd.to_datetime(ec.period_end, format="%b-%Y") + pd.offsets.MonthEnd(0)
-        except Exception:
-            ann_end = None
-
-        def dp_for(comp, q_=None):
-            """Default point; prefers the interim balance sheet when it is newer than the annual report."""
-            bs_ = q_.get("bs") if q_ else None
-            if bs_ is not None and len(bs_) and "debt" in bs_ and not pd.isna(bs_["debt"].iloc[-1]) and (
-                    ann_end is None or bs_.index[-1] > ann_end + pd.Timedelta(days=20)):
-                return ew.default_point(bs_.get("cur_debt", pd.Series([np.nan])).iloc[-1], bs_["debt"].iloc[-1]), f"{bs_.index[-1]:%b-%y} balance sheet"
-            f_ = comp.fin.iloc[-1]
-            return ew.default_point(f_.get("cur_debt", np.nan), f_.get("debt", np.nan)), f"FY{comp.fin.index[-1]} annual report"
-
-        mk_ec = mkt_all.get(ec.ticker)
-        D_ec, D_src = dp_for(ec, q_ec)
-        mert = ew.merton(ec.mcap_cr, mk_ec["vol"] if mk_ec else np.nan, D_ec, rf)
-        hist = ew.dd_history(px_all[ec.ticker], ec.mcap_cr, D_ec, rf) if ec.ticker in px_all.columns else pd.DataFrame()
-        sigs = ew.signals(ec.fin, q_ec, mk_ec, [m for t, m in mkt_all.items() if t != ec.ticker], mert, hist, ann_end)
-        n_, lvl = ew.summary(sigs)
+            ewb = ew_bundle(ec, rf)
+        px_all, q_ec, mkt_all, mk_ec = ewb["px_all"], ewb["q"], ewb["mkt_all"], ewb["mk"]
+        D_ec, D_src, mert, hist, sigs, n_, lvl = ewb["D"], ewb["D_src"], ewb["mert"], ewb["hist"], ewb["sigs"], ewb["n"], ewb["level"]
         st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[lvl]}'><div class='who' style='color:{C1 if ec is A else C2}'>● {esc(ec.name)}</div>"
                     f"<div class='sig'>{lvl}</div><div>{n_['R']} concern · {n_['A']} watch · {n_['G']} clear, across "
                     f"{len(sigs)} early-warning signals</div></div>", unsafe_allow_html=True)
@@ -1206,7 +1225,8 @@ with tabs[7]:
         st.caption(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
         fac.update(dict(req=dict(type=ftype, amount=amount, rate=rate, tenor=tenor, target=target, capacity=capacity),
                         scen=dict(base=r_base, pro=r_pro, stress=r_str,
-                                  desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}")))
+                                  desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}"),
+                        grid=grid, dm_list=dm_list, dr_list=dr_list))
 
     # ---- covenants
     with wb[1]:
@@ -1301,8 +1321,65 @@ with tabs[7]:
     # ---- credit memo
     with wb[4]:
         st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
-        st.caption("Assembled from the numbers on the other tabs (facility inputs, stress case, covenants, scorecard). "
-                   "A draft for analyst review, not a credit decision.")
+        st.caption("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
+                   "below. Download it as PDF or Word with the charts included. A draft for analyst review, not a credit decision.")
+        k_ = BC.ticker
+        req_amt = (fac.get("req") or {}).get("amount", 0.0) or 0.0
+        with st.container(border=True):
+            st.markdown("**Analyst inputs**")
+            a1, a2, a3 = st.columns(3)
+            an_name = a1.text_input("Analyst", key=f"m_name_{k_}", placeholder="Your name")
+            purpose = a2.text_input("Purpose of the facility", key=f"m_purpose_{k_}", placeholder="e.g. capex for a new plant")
+            mgmt = a3.selectbox("Management quality", ["Adequate", "Strong", "Weak"], key=f"m_mgmt_{k_}",
+                                help="Strong +1 notch, Weak −1 notch on the issuer grade.")
+            b1, b2, b3 = st.columns(3)
+            ctype = b1.selectbox("Security", ["Unsecured", "Fixed assets (property, plant)", "Receivables & inventory",
+                                              "Financial securities / deposits", "Corporate or promoter guarantee"], key=f"m_ctype_{k_}")
+            cval = b2.number_input("Security value (Rs cr)", 0.0, 1e8, 0.0, 10.0, key=f"m_cval_{k_}", disabled=ctype == "Unsecured",
+                                   help="Realisable value after haircut. Cover = value ÷ facility amount; 1.5x or more lifts the facility grade a notch.")
+            outlook = b3.selectbox("Industry outlook", ["Stable", "Positive", "Negative"], key=f"m_outlook_{k_}",
+                                   help="Negative −1 notch on the issuer grade.")
+            notes = st.text_area("Analyst notes (go into the memo)", key=f"m_notes_{k_}", height=80,
+                                 placeholder="Business model, customer concentration, promoter track record, site visit…")
+            o1, o2 = st.columns([1, 2])
+            override = o1.selectbox("Recommendation", ["Use system stance", "Supportable", "Supportable with conditions",
+                                                       "Not supportable on current numbers"], key=f"m_ovr_{k_}")
+            ov_reason = o2.text_input("Reason for overriding the system stance", key=f"m_ovr_why_{k_}",
+                                      disabled=override == "Use system stance",
+                                      placeholder="Required when overriding - it is printed in the memo")
+        if override != "Use system stance" and not ov_reason.strip():
+            st.warning("Add a reason for the override - the memo will use the system stance until you do.")
+            override = "Use system stance"
+        cover = (cval / req_amt) if (ctype != "Unsecured" and req_amt > 0) else np.nan
+
+        sc_b, band_b, pb_ = fac.get("score", (np.nan, "n/a", {}))
+        # A grade is an absolute statement, so it always comes from textbook-basis inputs (score and early-warning statuses),
+        # whatever basis the screen shows; the sector-relative score is reported alongside as relative standing.
+        mt.set_basis("Textbook")
+        tb_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
+        ew_b = ew_bundle(BC, st.session_state.get("ew-rf", 6.5) / 100) if EW_LATEST else None
+        ew_ctx = dict(level=ew_b["level"], n=ew_b["n"], sigs=ew_b["sigs"], mert=ew_b["mert"]) if ew_b and ew_b["sigs"] else None
+        mt.set_basis("Sector-relative", SECTOR_VALS)
+        sr_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
+        mt.set_basis(basis_sel, SECTOR_VALS)                    # restore the session's basis
+        rating = rp.rate(tb_score, ew_ctx["level"] if ew_ctx else None, mgmt, outlook, cover)
+        if rating:
+            rating["relative"] = rp.relative_standing(sr_score, tb_score, sector)
+
+        if rating:
+            g1, g2, g3, g4 = st.columns(4)
+            g1.metric("Issuer grade", rating["issuer"]["label"], help=rating["issuer"]["meaning"])
+            g2.metric("Facility grade", rating["facility"]["label"], help="Issuer grade, lifted one notch by security cover of 1.5x or more.")
+            g3.metric("Indicative 1-year PD", f"{rating['facility']['pd']:.2%}",
+                      help="Rounded long-run average default rate for the equivalent agency grade - not a model estimate.")
+            g4.metric("Security cover", "n/a" if pd.isna(cover) else f"{cover:.2f}x")
+            rel = rating["relative"]
+            (st.warning if rel["bias"] else st.caption)(rel["text"])
+            with st.expander("How the grade is built"):
+                st.dataframe(pd.DataFrame(rating["steps"], columns=["Step", "Effect", "Grade"]).fillna(""), hide_index=True, width="stretch")
+                st.dataframe(pd.DataFrame([{"Grade": g, "≈ Agency": e, "Score from": lo, "Indicative 1-yr PD": f"{p_:.2%}", "Meaning": mn}
+                                           for lo, g, e, p_, mn in rp.GRADES]), hide_index=True, width="stretch")
+
         ycols = list(bm.columns)[-3:]
         snap_items = [("Revenue (Rs cr)", None, "rev"), ("EBITDA (Rs cr)", None, "ebitda"), ("Net profit (Rs cr)", None, "ni"),
                       ("Operating cash flow (Rs cr)", None, "cfo"), ("Current ratio", "current_ratio", None), ("Interest cover", "icr", None),
@@ -1318,13 +1395,42 @@ with tabs[7]:
                     v = BC.fin.loc[y, fk] if (fk in BC.fin.columns and y in BC.fin.index) else np.nan
                     vals_.append("n/a" if pd.isna(v) else f"{v:,.0f}")
             srows.append((label, vals_))
-        sc_b, band_b, pb_ = fac.get("score", (np.nan, "n/a", {}))
-        text = ins.memo(BC.name, sector, f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}", bvals, bflags, pb_,
-                        sc_b if not pd.isna(sc_b) else 0.0, band_b, dict(cols=[f"FY{y}" for y in ycols], rows=srows),
-                        fac.get("req"), fac.get("scen"), fac.get("cov_rows"), bfA if BC is A else bfB, cmp_name)
+
+        cmp_m = cmp_df if BC is A else mA
+        cmp_lbl = cmp_name if BC is A else A.name
+        pcmp_ = pB if BC is A else pA
+        hist_b = ew_b["hist"] if ew_b else None
+        ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
+                   vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
+                   req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
+                   cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, security_cover=cover, override=override,
+                   override_reason=ov_reason.strip(),
+                   analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
+                                management=mgmt, outlook=outlook, notes=notes.strip()))
+        fac_now = dict(fac)
+
+        def memo_with_charts():
+            """Runs only when a download button is clicked (on its own thread), so drawing charts never slows the page."""
+            charts = dict(pillars=rp.chart_pillars(pb_ or {}, BC.name, pcmp_, cmp_lbl),
+                          trends=rp.chart_trends(bm, BC.name, cmp_m, cmp_lbl),
+                          heatmap=rp.chart_heatmap(fac_now.get("grid"), (fac_now.get("req") or {}).get("target", 1.25),
+                                                   fac_now.get("dm_list", []), fac_now.get("dr_list", [])),
+                          dd=rp.chart_dd(hist_b))
+            return rp.build_memo({**ctx, "charts": charts})
+
+        blocks = rp.build_memo(ctx)                      # on-screen preview: text only
+        md_text = rp.to_markdown(blocks)
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("Download PDF", lambda: rp.to_pdf(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.pdf",
+                           mime="application/pdf", key="dl-memo-pdf", type="primary", width="stretch")
+        d2.download_button("Download Word", lambda: rp.to_docx(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl-memo-docx", width="stretch")
+        d3.download_button("Download Markdown", md_text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown",
+                           key="dl-memo", width="stretch")
+        st.caption("The PDF and Word versions add four charts: factor scores, key-ratio trends, the DSCR stress heatmap and the "
+                   "distance-to-default trend.")
         with st.container(border=True):
-            st.markdown(text)
-        st.download_button("Download memo (Markdown)", text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown", key="dl-memo")
+            st.markdown(md_text)
 
 # ------------------------------------------------------------------ Insights
 with tabs[8]:
@@ -1514,6 +1620,7 @@ with tabs[9]:
   concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
   textbook cut-off.
 - {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate editable (default 6.5%); probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
+- {ADV} **Credit memo and internal grade.** The quantitative score on *textbook* cut-offs maps to a 9-step internal scale (CR1 ≈ AAA … CR9 ≈ CC/C) with an indicative one-year PD - a rounded long-run average default rate for the equivalent agency grade, not a company-specific estimate. Whole-notch adjustments: early warning (Watch −1, Elevated −2), management (Strong +1, Weak −1), negative industry outlook (−1), capped at ±2 together; security cover of 1.5x or more lifts the facility (not the issuer) one notch. The grade never depends on the screen's scoring basis; the sector-relative score is shown beside it as relative standing, with a warning when a weak grade mainly reflects the sector (e.g. utilities). PDF and Word files are built only when a download button is clicked.
 - **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
   of total assets respectively.
 - **Fiscal-year labels** follow the Indian April-March year: an October-December year end is labelled with the next calendar

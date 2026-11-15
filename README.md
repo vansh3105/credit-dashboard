@@ -18,6 +18,7 @@ Data comes live from Yahoo Finance via `yfinance` (needs internet). The first lo
 | `sectors.py` | Sector → NSE tickers. Edit to change the universe (industry average = these peers). |
 | `data.py` | Yahoo pull + mapping of Yahoo row names to standard fields (INR crore). |
 | `metrics.py` | Every formula, thresholds (green/red), Benford test, red-flag rules. Source session noted per metric. |
+| `report.py` | Credit memo: internal grade and notching, memo content, PDF / Word / Markdown export with charts. |
 | `early_warning.py` | Early-warning tab: quarterly and half-year signals, share-price signals vs sector, Merton distance-to-default. |
 | `insights.py` | Rule-based narrative (no LLM). |
 | `app.py` | Streamlit UI. |
