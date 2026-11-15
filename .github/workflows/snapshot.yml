@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   push:
     branches: [dev]
-    paths: ["scripts/build_snapshot.py", "snapshot.py", ".github/workflows/snapshot.yml"]
+    paths: ["scripts/build_snapshot.py", "scripts/alerts.py", "snapshot.py", "watchlist.txt", ".github/workflows/snapshot.yml"]
 
 concurrency:
   group: snapshot
@@ -31,6 +31,15 @@ jobs:
         run: git clone --depth 1 --branch data "https://github.com/${{ github.repository }}.git" prev || mkdir -p prev
       - name: Build
         run: python scripts/build_snapshot.py --prev prev --out out
+      - name: Watchlist alert (summary on this page; email once mail secrets are set)
+        continue-on-error: true
+        env:
+          ALERT_SMTP_HOST: ${{ secrets.ALERT_SMTP_HOST }}
+          ALERT_SMTP_PORT: ${{ secrets.ALERT_SMTP_PORT }}
+          ALERT_SMTP_USER: ${{ secrets.ALERT_SMTP_USER }}
+          ALERT_SMTP_PASSWORD: ${{ secrets.ALERT_SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: python scripts/alerts.py out/history.csv
       - name: Publish to the data branch
         run: |
           cd out

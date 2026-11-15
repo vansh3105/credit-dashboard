@@ -75,3 +75,16 @@ def test_sectors_groups_and_pledge():
     assert groups.group_of("TATASTEEL.NS") == "Tata" and groups.group_of("INFY.NS") is None
     assert rp.rate(71, None, "Adequate", "Stable", None, 55)["issuer"]["grade"] == "CR5"
     assert rp.rate(71, None, "Adequate", "Stable", None, 30)["issuer"]["grade"] == "CR4"
+
+
+def test_alert_report():
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location("alerts", pathlib.Path(__file__).resolve().parents[1] / "scripts" / "alerts.py")
+    al = importlib.util.module_from_spec(spec); spec.loader.exec_module(al)
+    h = pd.DataFrame([{"date": "2026-11-14", "ticker": "X.NS", "name": "X", "grade": "CR4", "score": 70.0, "signal": "COMFORTABLE",
+                       "ew_level": "COMFORTABLE", "news": "G"},
+                      {"date": "2026-11-15", "ticker": "X.NS", "name": "X", "grade": "CR5", "score": 62.0, "signal": "WATCH",
+                       "ew_level": "COMFORTABLE", "news": "G"}])
+    h["date"] = pd.to_datetime(h["date"])
+    md, worse = al.report(h, ["X.NS", "NOPE.NS"])
+    assert worse == 3 and "CR4 | CR5" in md and "not in the dashboard" in md

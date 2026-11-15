@@ -96,6 +96,13 @@ st.markdown("""<style>
 .cvrow{display:flex;flex-wrap:wrap;gap:6px;margin:-.2rem 0 .5rem}
 .cv{border:1px solid rgba(128,128,128,.28);border-radius:999px;padding:2px 10px;font-size:.8rem}
 .cvl{opacity:.7}
+@media (max-width: 640px){
+  .block-container{padding:1.2rem .7rem 2rem !important}
+  .banner{padding:10px 12px}.banner .sig{font-size:1.1rem}
+  div[data-testid="stMetric"]{padding:6px 8px} div[data-testid="stMetricValue"]{font-size:1.15rem}
+  .cv{font-size:.72rem;padding:1px 7px} h3{font-size:1.2rem} h5{font-size:.95rem}
+  div[data-testid="stSegmentedControl"] button{padding:2px 8px;font-size:.8rem}
+}
 div[data-testid="stMetric"]{background:rgba(128,128,128,.09);padding:8px 12px;border-radius:10px}
 .coname{font-weight:700;font-size:1.05rem;margin:.1rem 0 .3rem 0}
 </style>""", unsafe_allow_html=True)
@@ -103,6 +110,12 @@ div[data-testid="stMetric"]{background:rgba(128,128,128,.09);padding:8px 12px;bo
 
 # ------------------------------------------------------------------ small helpers
 fmtv = ins.fmt
+
+
+def note(*args, **kw):
+    """Explanatory note; hidden when *Show explanations* is off."""
+    if st.session_state.get("show_help", True):
+        st.caption(*args, **kw)
 
 
 def counts(vals, keys):
@@ -158,7 +171,24 @@ with view_box:
                                   "percentiles, Standard the 50th / 25th, Lenient the 40th / 15th. Model cut-offs (Beneish −2.22) never move.") or "Standard"
     show_calc = st.toggle("Show calculations", key="show_calc",
                           help="Adds the formula with the company's own numbers to every comparison table.")
+    st.toggle("Show explanations", True, key="show_help",
+              help="The grey notes under charts and tables. Turn off for a cleaner screen once you know the dashboard.")
 mt.set_strictness(strict)
+
+# ---- watchlist: any companies, kept in the page link (?watch=...) so it can be bookmarked or shared
+ALL_CO = {t: (sec_, n_) for sec_, d_ in SECTORS.items() for t, n_ in d_.items()}
+with st.sidebar.expander("Watchlist", expanded=False):
+    _wq = [t for t in (st.query_params.get("watch") or "").split(",") if t in ALL_CO]
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = _wq
+    WATCH = st.multiselect("Companies to watch", list(ALL_CO), key="watchlist", format_func=lambda t: f"{ALL_CO[t][1]} · {ALL_CO[t][0]}",
+                           placeholder="Add companies from any sector", max_selections=25)
+    if WATCH:
+        st.query_params["watch"] = ",".join(WATCH)
+    elif "watch" in st.query_params:
+        del st.query_params["watch"]
+    note("Saved in this page's link - bookmark it to keep the list. See *Monitor → Watchlist*. For a daily email, list the "
+               "tickers in `watchlist.txt` in the repository (see README).")
 with st.sidebar.expander("Settings", expanded=False):
     how = st.radio("Industry average =", ["Median", "Mean"], horizontal=True)
     gnp = st.number_input("Price index for size term (Ohlson)", 1.0, 1000.0, 100.0,
@@ -286,7 +316,7 @@ if sector in FIN_SECTORS:
                     for kc, key in zip(k_, ["roa", "nim", "eq_assets", "cost_income"]):
                         kc.metric(bk.BM[key][0], bk.fmt(key, LV[t].get(key)), help=bk.BM[key][6])
                     with st.popover("Enter NPA and CRAR from the results", width="stretch"):
-                        st.caption("From the latest quarterly results or investor presentation (in %). Kept for this session.")
+                        note("From the latest quarterly results or investor presentation (in %). Kept for this session.")
                         for key in bk.MANUAL:
                             st.number_input(bk.BM[key][0].replace(" (entered)", " (%)"), 0.0, 100.0, None, 0.05,
                                             key=f"bk-man-{t}-{key}", placeholder="not entered", help=bk.BM[key][6])
@@ -300,7 +330,7 @@ if sector in FIN_SECTORS:
                         st.caption("⚠ " + n_)
                     if all(pd.isna(LV[t].get(k)) for k in bk.MANUAL):
                         st.caption("Asset quality and capital are scored on derived figures only until NPA and CRAR are entered.")
-        st.caption(f"Score = weighted factor scores ({', '.join(f'{p} {w}%' for p, w in bk.WEIGHTS.items())}), mapped to the same "
+        note(f"Score = weighted factor scores ({', '.join(f'{p} {w}%' for p, w in bk.WEIGHTS.items())}), mapped to the same "
                    "CR1-CR9 scale as corporates. Rule-based and not calibrated against bank ratings.")
     with LSEC[1]:
         bench = {k: np.nanmedian([LV[t].get(k) for t in companies]) if any(not pd.isna(LV[t].get(k)) for t in companies) else np.nan
@@ -346,7 +376,7 @@ if sector in FIN_SECTORS:
         rkd["Score"] = rkd["Score"].map(lambda v: "n/a" if pd.isna(v) else f"{v:.0f}")
         st.dataframe(style_cells(rkd, lambda v: {"Elevated Concern": SIG_CSS["✕ Concern"], "Watch": SIG_CSS["! Watch"],
                                                  "Comfortable": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Signal"]), hide_index=True, width="stretch")
-        st.caption("Ranked on derived figures plus any NPA / CRAR you entered.")
+        note("Ranked on derived figures plus any NPA / CRAR you entered.")
     with LSEC[3]:
         for t in sel:
             nres_ = nw.get_news(names[t], t)
@@ -356,7 +386,7 @@ if sector in FIN_SECTORS:
                         f"({ns_['value']})" + (f" · driven by “{ns_['trigger']}”" if ns_["trigger"] else ""))
             rats_ = [r_ for r_ in nw.latest_ratings(its) if r_.get("rating")]
             if rats_:
-                st.caption("Ratings in headlines: " + "; ".join(f"{r_['agency']} {r_['rating']} ({r_['date']:%b %Y})" for r_ in rats_[:4]))
+                note("Ratings in headlines: " + "; ".join(f"{r_['agency']} {r_['rating']} ({r_['date']:%b %Y})" for r_ in rats_[:4]))
             vis = [it for it in its if it["category"] != "Market commentary"][:25]
             if vis:
                 st.dataframe(pd.DataFrame([{"Date": it["date"].strftime("%d %b %Y"), "Headline": it["title"], "Source": it["source"] or it["via"],
@@ -370,7 +400,7 @@ if sector in FIN_SECTORS:
             f"- {spec[0]}: " + ("context only" if bk.thresholds(k, KIND)[0] is None else
                                 f"{bk.fmt(k, bk.thresholds(k, KIND)[0])} / {bk.fmt(k, bk.thresholds(k, KIND)[1])}") + f" - {spec[6]}"
             for k, spec in bk.BM.items()))
-        st.caption("Not covered for lenders: Merton distance-to-default (a bank's liabilities are mostly deposits), the corporate "
+        note("Not covered for lenders: Merton distance-to-default (a bank's liabilities are mostly deposits), the corporate "
                    "forensic models (Beneish, Altman, Piotroski), and the credit workbench.")
     st.stop()
 
@@ -536,7 +566,7 @@ def charts(groups, tag):
     for i, (k, s) in enumerate(shown):
         with cols[i % 2]:
             st.plotly_chart(trend(k, s), width="stretch", key=f"{tag}-{k}")
-            st.caption(f"{mt.M[k]['desc']}  \n`{mt.M[k]['formula']}`")
+            note(f"{mt.M[k]['desc']}  \n`{mt.M[k]['formula']}`")
     if missing:
         st.info("Not available for this selection: " + "; ".join(missing))
 
@@ -554,7 +584,7 @@ def na_note(groups):
 
 def section(groups, tag, intro=None):
     if intro:
-        st.caption(intro)
+        note(intro)
     st.markdown("##### Comparison (latest fiscal year)")
     df = table_df(groups)
     show_table(df, f"tbl-{tag}")
@@ -571,7 +601,7 @@ def section(groups, tag, intro=None):
             if m["group"] in groups:
                 st.markdown(f"**{m['label']}** - {m['desc']}  \n`{m['formula']}`")
     st.markdown("##### Trends")
-    st.caption("Shaded bands: green = healthy, amber = watch, red = concern.")
+    note("Shaded bands: green = healthy, amber = watch, red = concern.")
     charts(groups, tag)
 
 
@@ -669,7 +699,7 @@ def size_line(t):
 
 st.title(f"{A.name} vs {cmp_name}")
 asof = f"Annual statements to {A.period_end or 'n/a'}" + (f" ({B.name}: {B.period_end})" if B is not None and B.period_end != A.period_end else "")
-st.caption(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · "
+note(f"{sector} · {'Peer company review' if B else 'Individual vs industry ' + how.lower()} · "
            f"scoring: **{basis_sel.lower()}**{'' if strict == 'Standard' else ', ' + strict.lower()} · {asof} · "
            f"fetched {A.fetched_at or 'n/a'} · figures in Rs crore · source: Yahoo Finance (market cap as of fetch)")
 if A.currency and A.currency != "INR":
@@ -683,7 +713,7 @@ with hc[0]:
         if B is not None:
             kpis(A, vA)
         else:
-            st.caption(size_line(t1))
+            note(size_line(t1))
             kpis_rel(vA, vB, A)
 with hc[1]:
     with st.container(border=True):
@@ -798,7 +828,7 @@ def _whatif(comp):
     for k_, v_ in bp_.items():
         txt_.append(f"{k_}: " + ("already below" if v_ == 0 else "holds even at a 90% revenue fall" if v_ is None else f"at a **{v_}%** revenue fall"))
     st.markdown("Break points" + (" (with the margin and rate shocks above)" if dm_ or dr_ else "") + ":  \n" + "  \n".join(txt_))
-    st.caption("Revenue moves with the margin held unless you change it; the whole debt book reprices; working-capital days stay "
+    note("Revenue moves with the margin held unless you change it; the whole debt book reprices; working-capital days stay "
                "the same. Simplified - the Credit workbench stresses a new facility in detail.")
 
 
@@ -809,17 +839,17 @@ def _whatif(comp):
 SECTIONS = {
     "Analyse": [(0, "Overview"), (9, "Insights"), (12, "Peer table"), (1, "Liquidity"), (2, "Solvency & debt service"),
                 (3, "Earnings quality"), (4, "Distress & forensic"), (7, "Cash flow & lifecycle"), (11, "Common-size")],
-    "Monitor": [(5, "Early warning"), (6, "News & ratings"), (13, "Group exposure"), (14, "Sector & market")],
+    "Monitor": [(16, "Watchlist"), (5, "Early warning"), (6, "News & ratings"), (13, "Group exposure"), (14, "Sector & market")],
     "Decide": [(8, None)],          # the workbench's own tabs (facility, covenants, scorecard, watchlist, memo) show directly
-    "Method": [(10, None)],
+    "Method": [(15, "Guide"), (10, "Data & method")],
 }
 SECTION_HELP = {"Analyse": "the company's numbers and what they mean", "Monitor": "what has changed since the last annual report",
-                "Decide": "size the loan, stress it, grade it and write the memo", "Method": "data quality, formulas and cut-offs"}
+                "Decide": "size the loan, stress it, grade it and write the memo", "Method": "how to use it, data quality, formulas and cut-offs"}
 sc1, sc2 = st.columns([2, 3], vertical_alignment="center")
 with sc1:
     SECTION = st.segmented_control("Section", list(SECTIONS), default="Analyse", key="section", label_visibility="collapsed") or "Analyse"
 sc2.caption(f"**{SECTION}** - {SECTION_HELP[SECTION]}.")
-tabs = [None] * 16          # 11 Common-size, 12 Peer table, 13 Group exposure, 14 Sector & market, 15 Guide
+tabs = [None] * 17          # 11 Common-size, 12 Peer table, 13 Group exposure, 14 Sector & market, 15 Guide, 16 Watchlist
 _spec = SECTIONS[SECTION]
 if _spec[0][1] is None:
     tabs[_spec[0][0]] = st.container()
@@ -843,7 +873,7 @@ if tabs[0] is not None:
                 if len(_chg):
                     st.dataframe(style_cells(_chg.drop(columns=["ticker"]), lambda v: {"worse": SIG_CSS["✕ Concern"], "better": SIG_CSS["✓ Healthy"]}.get(v, ""),
                                              ["Direction"]), hide_index=True, width="stretch")
-                st.caption(f"Compares the last two nightly snapshots ({_chg.attrs['since']:%d %b} → {_chg.attrs['until']:%d %b}) on "
+                note(f"Compares the last two nightly snapshots ({_chg.attrs['since']:%d %b} → {_chg.attrs['until']:%d %b}) on "
                        "textbook cut-offs and default weights: grade, headline signal, early-warning level, news flow, and score moves of 5+ points.")
                 _t = _hist[_hist["ticker"] == t1].sort_values("date")
                 if len(_t) >= 2:
@@ -879,7 +909,7 @@ if tabs[0] is not None:
                             st.plotly_chart(_f, width="stretch", key="ov-attr")
                         else:
                             st.caption("No metric changed rating; the move comes from small shifts in metrics that were not rated before.")
-                        st.caption("Each metric that changed rating (G/A/R) gets its share of the move, by factor weight. Uses the "
+                        note("Each metric that changed rating (G/A/R) gets its share of the move, by factor weight. Uses the "
                                    "cut-offs and weights in force.")
                 else:
                     st.caption("Only one year of data - nothing to compare.")
@@ -888,7 +918,7 @@ if tabs[0] is not None:
                 st.markdown("**What if…** (latest year)")
                 _whatif(OC)
         st.markdown("##### Scorecard by factor")
-        st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
+        note("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
                "Weights and the overall score are an advanced extension (see Credit workbench).")
         PILLAR_NOTE_GROUPS = {"Liquidity": ["Liquidity"], "Solvency & coverage": ["Solvency"], "Earnings quality": ["Earnings quality"],
                               "Returns": ["Returns"], "Distress & forensic": ["Scores"]}
@@ -934,7 +964,7 @@ if tabs[0] is not None:
                 gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
                 st.markdown("**Governance: Yahoo / ISS risk scores** (1 = low risk, 10 = high risk)")
                 st.dataframe(gdf, width="stretch")
-                st.caption("Factor score = 100 × (10 − average risk score) ÷ 9. Not available for every company.")
+                note("Factor score = 100 × (10 − average risk score) ÷ 9. Not available for every company.")
                 return
             keys = [k for k, m in mt.M.items() if m["group"] in PILLAR_NOTE_GROUPS[p]]
             rg = [mt.rag(k, vA.get(k)) for k in keys]
@@ -961,11 +991,11 @@ if tabs[0] is not None:
                          column_config={"Sector pct": st.column_config.ProgressColumn("Sector pct", min_value=0, max_value=100, format="%.0f"),
                                         "Trend": st.column_config.LineChartColumn("Trend", width="small"),
                                         f"How {A.name}'s value is calculated": st.column_config.TextColumn(width="large")})
-            st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score."
+            note("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score."
                        + (f" Cut-offs are {sector}'s own percentiles (sector-relative basis)." if SECTOR_MODE else ""))
 
         pill = list(mt.PILLARS) + ["Governance"]
-        st.caption("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
+        note("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
         for r0 in (0, 3):
             cc = st.columns(3)
             for i, p in enumerate(pill[r0:r0 + 3]):
@@ -976,7 +1006,7 @@ if tabs[0] is not None:
         st.markdown("")
         # ---------- sector position: size is ranked, ratios are shown against the whole spread of peers
         st.markdown("##### Where it sits in the sector")
-        st.caption(f"All {len(companies)} {sector} companies loaded. Left: size, which is ranked rather than averaged. Right: any size-neutral "
+        note(f"All {len(companies)} {sector} companies loaded. Left: size, which is ranked rather than averaged. Right: any size-neutral "
                "metric, with the sector's middle 50% shaded and the median dashed, so you see the spread, not just one average.")
         HL = {A.name: C1, **({B.name: C2} if B is not None else {})}
         sl, sr = st.columns(2)
@@ -1028,7 +1058,7 @@ if tabs[0] is not None:
                                    xaxis=dict(range=[lo, hi], tickformat=".0%" if pct_ax else None, title=mt.M[mk]["label"]))
                 st.plotly_chart(dfig, width="stretch", key="dist-plot")
                 rk = [n for n, _ in pts].index(A.name) + 1 if A.name in dict(pts) else None
-                st.caption((f"{A.name} ranks **#{rk} of {len(pts)}** (best at the top). " if rk else "")
+                note((f"{A.name} ranks **#{rk} of {len(pts)}** (best at the top). " if rk else "")
                            + "Green / red lines: healthy and concern thresholds. Diamonds are outliers pinned to the edge (hover for the real value).")
 
         st.markdown("##### Pick a factor")
@@ -1037,7 +1067,7 @@ if tabs[0] is not None:
             with t:
                 gA, gB = (counts(v, [k for k, m in mt.M.items() if m["group"] == gname]) for v in (vA, vB))
                 st.markdown(f"**{gname}** - {GROUP_TITLES[gname]}")
-                st.caption(f"{A.name}: {gA[0]} healthy · {gA[1]} watch · {gA[2]} concern   |   "
+                note(f"{A.name}: {gA[0]} healthy · {gA[1]} watch · {gA[2]} concern   |   "
                        f"{cmp_name}: {gB[0]} healthy · {gB[1]} watch · {gB[2]} concern")
                 d = table_df([gname])
                 show_table(d, f"ov-{gname}")
@@ -1072,7 +1102,7 @@ if tabs[2] is not None:
                     show = dp.copy()
                     show.index = [f"FY{y}" for y in show.index]
                     st.dataframe(show.T.style.format("{:.3f}"), width="stretch")
-        st.caption("Interest burden = pre-tax profit ÷ EBIT (lower means interest eats more of operating profit); tax burden = net profit ÷ pre-tax profit.")
+        note("Interest burden = pre-tax profit ÷ EBIT (lower means interest eats more of operating profit); tax burden = net profit ÷ pre-tax profit.")
         cr, dr_ = vA.get("cce", np.nan), vA.get("debt_ratio", np.nan)
         if not pd.isna(cr) and not pd.isna(dr_):
             cash_rich, asset_rich = cr >= 0.6, dr_ <= 0.5
@@ -1096,7 +1126,7 @@ if tabs[4] is not None:
 
         # ---------- how the forensic scores are calculated
         st.markdown(f"##### How the forensic scores are calculated {ADV}", unsafe_allow_html=True)
-        st.caption("Every number below is traced back to the statement lines it comes from, so each score can be checked by hand.")
+        note("Every number below is traced back to the statement lines it comes from, so each score can be checked by hand.")
         fc1, fc2 = st.columns([2, 3])
         with fc1:
             fcomp = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="fx-co")]
@@ -1136,7 +1166,7 @@ if tabs[4] is not None:
                 st.dataframe(style_cells(fdf, lambda v: {"✕ Flagged": SIG_CSS["✕ Concern"], "✓ Clear": SIG_CSS["✓ Healthy"],
                                                          "! Watch": SIG_CSS["! Watch"]}.get(v, ""), ["Result"]),
                              hide_index=True, width="stretch")
-                st.caption("Beneish, Sloan and the accrual ratios all lean on the gap between profit and operating cash, so they are not fully "
+                note("Beneish, Sloan and the accrual ratios all lean on the gap between profit and operating cash, so they are not fully "
                        "independent. Benford uses every reported figure across all years. None of these proves fraud; they show where to dig.")
 
             with ft[1]:
@@ -1145,7 +1175,7 @@ if tabs[4] is not None:
                 k1.metric("M-score", "n/a" if pd.isna(bd["m"]) else f"{bd['m']:.2f}")
                 k2.metric("Cut-off", f"{bd['cutoff']:.2f}", help="Above −2.22 the model classes the company as a likely manipulator.")
                 k3.metric("Verdict", "n/a" if pd.isna(bd["m"]) else ("Likely manipulator" if bd["m"] > bd["cutoff"] else "Unlikely manipulator"))
-                st.caption(f"M = −4.84 + Σ (weight × index). Each index compares FY{fy} with FY{bd['prev_year']}; 1.0 means no change.")
+                note(f"M = −4.84 + Σ (weight × index). Each index compares FY{fy} with FY{bd['prev_year']}; 1.0 means no change.")
                 fr = lambda k, v: "n/a" if v is None or pd.isna(v) else (f"Rs {v:,.0f} cr" if k == "SGI" else f"{v:.3f}")
                 brows = [{"Index": f"{r['key']} · {r['name']}", f"FY{fy}": fr(r["key"], r["cur"]),
                           f"FY{bd['prev_year']}": "–" if r["prev"] is None else fr(r["key"], r["prev"]),
@@ -1171,12 +1201,12 @@ if tabs[4] is not None:
                     wf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
                                      yaxis_title="Running M-score", showlegend=False)
                     st.plotly_chart(wf, width="stretch", key="beneish-wf")
-                    st.caption("Red bars push the score towards 'manipulator', green bars pull it back. The final bar is the M-score.")
+                    note("Red bars push the score towards 'manipulator', green bars pull it back. The final bar is the M-score.")
                 with st.expander("What each index is looking for"):
                     for r in bd["rows"]:
                         st.markdown(f"**{r['key']} - {r['name']}** `{r['formula']}`  \n{r['meaning']}"
                                     + (" **This company looks like the manipulator sample on this index.**" if r["suspicious"] else ""))
-                    st.caption("Typical values are the sample means in Beneish (1999). An index is marked when it is closer to the manipulator "
+                    note("Typical values are the sample means in Beneish (1999). An index is marked when it is closer to the manipulator "
                            "mean than to the honest mean, for indices whose weight is positive.")
 
             with ft[2]:
@@ -1186,7 +1216,7 @@ if tabs[4] is not None:
                           help="7 or more is strong, 3 or less is weak.")
                 k2.metric("Tests with data", f"{pdt['tested']} of 9")
                 if pdt["tested"] < 9:
-                    st.caption("Tests without data are left out, so the score is out of fewer than 9 points.")
+                    note("Tests without data are left out, so the score is out of fewer than 9 points.")
                 prow = [{"Area": r["area"], "Test": r["test"],
                          "Result": "– no data" if r["passed"] is None else ("✓ Pass (+1)" if r["passed"] else "✕ Fail (0)"),
                          "Numbers used": r["evidence"]} for r in pdt["rows"]]
@@ -1194,7 +1224,7 @@ if tabs[4] is not None:
                 st.dataframe(style_cells(pdf_, lambda v: SIG_CSS["✓ Healthy"] if str(v).startswith("✓") else
                                          (SIG_CSS["✕ Concern"] if str(v).startswith("✕") else ""), ["Result"]),
                              hide_index=True, width="stretch")
-                st.caption(f"Comparisons are FY{fy} vs FY{pdt['prev_year']}. ROA and asset turnover use average total assets.")
+                note(f"Comparisons are FY{fy} vs FY{pdt['prev_year']}. ROA and asset turnover use average total assets.")
 
             with ft[3]:
                 od = mt.ohlson_detail(fcomp.fin, fy, gnp)
@@ -1216,12 +1246,12 @@ if tabs[4] is not None:
                                      xaxis_title="Contribution to T (right = more risk)")
                     st.plotly_chart(of, width="stretch", key="ohlson-bars")
                     st.markdown(f"T = −1.32 + Σ contributions = **{od['T']:.2f}** → P = e^T ÷ (1 + e^T) = **{od['p']:.1%}**")
-                    st.caption(f"The size term divides total assets (Rs crore) by the price index set in the sidebar ({gnp:g}), so large Indian "
+                    note(f"The size term divides total assets (Rs crore) by the price index set in the sidebar ({gnp:g}), so large Indian "
                            "companies get a large negative size term."
                                + (" This is the first year of data, so the change-in-income term uses the same year (0)." if od["first_year"] else ""))
 
         st.markdown("##### What drives the Altman Z″ score")
-        st.caption("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
+        note("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
         fig = go.Figure()
         for comp, color in ((A, C1), (B, C2)):
             if comp is None:
@@ -1257,7 +1287,7 @@ if tabs[4] is not None:
                 st.plotly_chart(fig, width="stretch", key=f"bf-{comp.ticker}")
                 st.write(f"KS = **{r['ks']:.3f}** vs cut-off 1.36/√N = **{r['cutoff']:.3f}** (N = {r['n']}) → "
                          + ("**above cut-off: unusual pattern, investigate**" if r["flag"] else "within cut-off"))
-        st.caption("Benford's law is an anomaly detector, not a fraud detector: it shows where to look.")
+        note("Benford's law is an anomaly detector, not a fraud detector: it shows where to look.")
         st.markdown("##### Governance (Yahoo/ISS risk scores, 1 = low risk, 10 = high risk)")
         gv = {c.name: c.gov for c in (A, B) if c is not None}
         gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
@@ -1277,7 +1307,7 @@ if tabs[4] is not None:
 if tabs[5] is not None:
     with tabs[5]:
         st.markdown(f"### Early warning {ADV}", unsafe_allow_html=True)
-        st.caption("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
+        note("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
                "and the market-implied Merton distance-to-default. These move months before annual ratios do.")
         if not EW_LATEST:
             st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
@@ -1335,7 +1365,7 @@ if tabs[5] is not None:
                     show_q = qt.copy()
                     show_q.index = xq
                     st.dataframe(show_q.T.style.format(lambda v: "n/a" if pd.isna(v) else f"{v:,.2f}"), width="stretch")
-                    st.caption("Year-on-year compares each quarter with the same quarter a year earlier, so seasonality cancels out. "
+                    note("Year-on-year compares each quarter with the same quarter a year earlier, so seasonality cancels out. "
                            "Yahoo gives about five to seven quarters; gaps mean Yahoo did not publish that quarter.")
 
             with et[1]:
@@ -1363,7 +1393,7 @@ if tabs[5] is not None:
                         hf.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
                                          yaxis=dict(title="Distance-to-default", range=[0, top]))
                         st.plotly_chart(hf, width="stretch", key="ew-dd")
-                        st.caption("Monthly over the last year (debt held at today's level). Red zone: DD below 1.645 = PD above 5%; "
+                        note("Monthly over the last year (debt held at today's level). Red zone: DD below 1.645 = PD above 5%; "
                                "amber: DD below 2.326 = PD above 1%.")
                     with st.expander("How the Merton model works"):
                         st.markdown("""
@@ -1426,14 +1456,14 @@ assumes log-normal assets, so read the level loosely and the **trend** carefully
                                       xaxis=dict(title=f"Distance-to-default (capped at {cap:g} for display)"), yaxis=dict(autorange="reversed"))
                     st.plotly_chart(rf_, width="stretch", key="ew-rank")
                     nd_ = [r[0] for r in rows_ if r[3]]
-                    st.caption("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
+                    note("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
                                + (f" No debt (not shown): {', '.join(nd_)}." if nd_ else ""))
 
 # ------------------------------------------------------------------ News & ratings
 if tabs[6] is not None:
     with tabs[6]:
         st.markdown(f"### News & credit ratings {ADV}", unsafe_allow_html=True)
-        st.caption("Headlines from the last 12 months (Google News and Yahoo Finance) that name the company, screened for credit events, "
+        note("Headlines from the last 12 months (Google News and Yahoo Finance) that name the company, screened for credit events, "
                "plus the latest rating-agency actions set against this dashboard's grade. Headlines only - full articles are often paywalled.")
         nc = MON_CO
         with st.spinner("Fetching headlines…"):
@@ -1486,7 +1516,7 @@ if tabs[6] is not None:
                           help="Quantitative score on textbook cut-offs mapped to CR1-CR9, before early-warning and analyst notches - "
                            "the same base grade as the Credit memo.")
             with st.popover("Enter a rating you looked up", width="stretch"):
-                st.caption("From the agency's website or the company's annual report. Kept for this session only.")
+                note("From the agency's website or the company's annual report. Kept for this session only.")
                 m_ag = st.selectbox("Agency", ["CRISIL", "ICRA", "CARE", "India Ratings", "Acuite", "Brickwork"], key=f"nw-man-ag-{nc.ticker}")
                 m_rt = st.selectbox("Long-term rating", ["–", "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB",
                                                          "BB-", "B+", "B", "B-", "C", "D"], key=f"nw-man-rt-{nc.ticker}")
@@ -1522,14 +1552,14 @@ if tabs[6] is not None:
                 st.error(f"The model is {-gap} grades above {r_['agency']} ({r_['rating']}). The agency may be seeing risks the ratios miss - "
                      "contingent liabilities, group exposure, refinancing walls or governance. Read its rationale before relying on the model.")
         if rats:
-            st.caption("Ratings are read from headlines, so check the entity named (group companies share names) and the date. "
+            note("Ratings are read from headlines, so check the entity named (group companies share names) and the date. "
                    "Moody's, Fitch and S&P use a global scale capped near India's sovereign rating (BBB- / Baa3), so they are shown but "
                    "not compared with the national-scale CR grade.")
         if not EW_LATEST:
-            st.caption("The model grade above uses the as-of year chosen in View options; ratings and headlines are always current.")
+            note("The model grade above uses the as-of year chosen in View options; ratings and headlines are always current.")
 
         with st.expander(f"Model vs agencies across the {sector} sector"):
-            st.caption("Searches rating-agency headlines for every company in the sector (one search each, cached 6 hours) and lines up the "
+            note("Searches rating-agency headlines for every company in the sector (one search each, cached 6 hours) and lines up the "
                    "latest national-scale rating against the model grade. A real-world check on how far the model can be trusted.")
             skey = f"nw-sector-{sector}-{asof_y}"
             if st.button("Run the sector check", key="nw-sector-btn"):
@@ -1575,7 +1605,7 @@ if tabs[6] is not None:
                                        xaxis=dict(title="Agency rating (mapped)", range=[-0.5, 8.5], **ticks),
                                        yaxis=dict(title="Model grade", range=[8.5, -0.5], **ticks))
                     st.plotly_chart(fig_, width="stretch", key="nw-sector-fig")
-                    st.caption("Dots on the dotted line agree; below it the model is harsher than the agency, above it more lenient.")
+                    note("Dots on the dotted line agree; below it the model is harsher than the agency, above it more lenient.")
                     st.dataframe(sdf_.drop(columns=["gap", "_m", "_a"]), hide_index=True, width="stretch")
 
         # ---- AI
@@ -1589,7 +1619,7 @@ if tabs[6] is not None:
                 "**Locally:** `.streamlit/secrets.toml` with the same line (that file is git-ignored). "
                 "Everything else on this tab works without it.")
         elif not sent:
-            st.caption("No credit-relevant headlines to analyse.")
+            note("No credit-relevant headlines to analyse.")
         else:
             a1, a2 = st.columns([1, 3])
             if a1.button(f"Analyse {len(sent)} headlines with AI", key=f"nw-ai-btn-{nc.ticker}", type="primary"):
@@ -1624,7 +1654,7 @@ if tabs[6] is not None:
             with st.expander("Headlines the digest cites"):
                 for i_, it in enumerate(sent_items):
                     st.markdown(f"[{i_}] [{esc(it['title'])}]({it.get('url', '')})")
-            st.caption(f"The AI disagrees with the keyword screen on the tone of {dis} headline(s) and judged {irr} not really about "
+            note(f"The AI disagrees with the keyword screen on the tone of {dis} headline(s) and judged {irr} not really about "
                    f"{nc.name}. Model {ai.get('model')}, {ai['usage']['in']:,} input / {ai['usage']['out']:,} output tokens.")
 
         # ---- headlines
@@ -1667,7 +1697,7 @@ if tabs[6] is not None:
                          column_config={"Link": st.column_config.LinkColumn(display_text="open"),
                                         "Headline": st.column_config.TextColumn(width="large"),
                                         "AI note": st.column_config.TextColumn(width="large")})
-            st.caption(f"{len(view)} of {len(items)} headlines shown. Tone and severity come from a transparent keyword screen "
+            note(f"{len(view)} of {len(items)} headlines shown. Tone and severity come from a transparent keyword screen "
                    "(see Data & method); it can misread unusual wording.")
 
 
@@ -1675,7 +1705,7 @@ if tabs[6] is not None:
 if tabs[7] is not None:
     with tabs[7]:
         st.subheader("Cash flow & lifecycle")
-        st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
+        note("Where the cash came from and where it went, and what stage of life the business is in.")
         yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
         yr = st.select_slider("Fiscal year", options=yrs, value=yrs[-1], format_func=lambda y: f"FY{y}")
         wcols = st.columns(2 if B is not None else 1)
@@ -1694,9 +1724,9 @@ if tabs[7] is not None:
                                   template="plotly_white", margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
                 st.plotly_chart(fig, width="stretch", key=f"wf-{comp.ticker}")
                 if approx:
-                    st.caption("Yahoo does not split every cash-flow line for this company, so 'other' items are approximate.")
+                    note("Yahoo does not split every cash-flow line for this company, so 'other' items are approximate.")
         st.markdown("##### Lifecycle stage by year")
-        st.caption("Stage from the signs of operating (CFO), investing (CFI) and financing (CFF) cash flow.")
+        note("Stage from the signs of operating (CFO), investing (CFI) and financing (CFF) cash flow.")
         for comp in (A, B):
             if comp is None:
                 continue
@@ -1713,7 +1743,7 @@ if tabs[7] is not None:
 if tabs[8] is not None:
     with tabs[8]:
         st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
-        st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
+        note("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
         bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
         BC = A if bor_name == A.name else B
         bm = all_m[BC.ticker]; bvals = latest_all[BC.ticker]
@@ -1771,7 +1801,7 @@ if tabs[8] is not None:
             tdf = pd.DataFrame(tbl, columns=["", "Current", "With facility", "Stressed (facility + shocks)"])
             cdf = pd.DataFrame(css, columns=tdf.columns)
             st.dataframe(tdf.style.apply(lambda _: cdf, axis=None), width="stretch", hide_index=True)
-            st.caption("Amber = within 15% of a covenant limit, red = breach (limits are set on the Covenants tab).")
+            note("Amber = within 15% of a covenant limit, red = breach (limits are set on the Covenants tab).")
             m3 = st.columns(3)
             m3[0].metric("Largest facility at target DSCR", money(capacity))
             m3[1].metric("Requested vs capacity", "No room" if capacity == 0 and amount > 0 else ("Within capacity" if amount <= capacity else "Exceeds capacity"))
@@ -1788,7 +1818,7 @@ if tabs[8] is not None:
             hm.update_layout(height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
                              xaxis_title="Change in EBITDA margin", yaxis_title="Change in interest rate")
             st.plotly_chart(hm, width="stretch", key="sens-heat")
-            st.caption(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
+            note(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
             fac.update(dict(req=dict(type=ftype, amount=amount, rate=rate, tenor=tenor, target=target, capacity=capacity),
                             scen=dict(base=r_base, pro=r_pro, stress=r_str,
                                       desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}"),
@@ -1797,7 +1827,7 @@ if tabs[8] is not None:
         # ---- covenants
         with wb[1]:
             st.markdown(f"##### Covenant monitor {ADV}", unsafe_allow_html=True)
-            st.caption("Set the limits a lender might impose; the table shows actual value and status for each year.")
+            note("Set the limits a lender might impose; the table shows actual value and status for each year.")
             cc = st.columns(len(mt.COVENANT_SPECS))
             for col, (k, (label, kind, dflt)) in zip(cc, mt.COVENANT_SPECS.items()):
                 col.number_input(label, 0.0, 50.0, float(dflt), 0.05, key=f"cov_{k}")
@@ -1834,7 +1864,7 @@ if tabs[8] is not None:
         # ---- rating scorecard
         with wb[2]:
             st.markdown(f"##### Indicative risk scorecard {ADV}", unsafe_allow_html=True)
-            st.caption("Weighted blend of the factor scores. It is an internal-style indication, not an agency rating. "
+            note("Weighted blend of the factor scores. It is an internal-style indication, not an agency rating. "
                    "Change the weights to reflect your view; the banner and Overview update.")
             with st.expander("Adjust weights", expanded=False):
                 wc = st.columns(6)
@@ -1857,14 +1887,14 @@ if tabs[8] is not None:
                               xaxis=dict(range=[0, 100], title="Factor score (0-100)"), yaxis=dict(autorange="reversed"),
                               legend=dict(orientation="h", y=-0.2))
             st.plotly_chart(fig, width="stretch", key="pillar-bars")
-            st.caption("Bands: 80+ low risk · 65-80 moderate · 50-65 elevated · 35-50 high · below 35 very high. "
+            note("Bands: 80+ low risk · 65-80 moderate · 50-65 elevated · 35-50 high · below 35 very high. "
                    "Governance uses Yahoo/ISS risk scores and is left out (weights re-normalised) when unavailable.")
             fac["score"] = (sc_b, mt.band(sc_b), pb)
 
         # ---- sector watchlist
         with wb[3]:
             st.markdown(f"##### Sector watchlist - {sector} {ADV}", unsafe_allow_html=True)
-            st.caption("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
+            note("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
             rows = []
             for t, c in companies.items():
                 m_ = all_m[t]
@@ -1887,7 +1917,7 @@ if tabs[8] is not None:
         # ---- credit memo
         with wb[4]:
             st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
-            st.caption("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
+            note("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
                    "below. Download it as PDF or Word with the charts included. A draft for analyst review, not a credit decision.")
             k_ = BC.ticker
             req_amt = (fac.get("req") or {}).get("amount", 0.0) or 0.0
@@ -2008,7 +2038,7 @@ if tabs[8] is not None:
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl-memo-docx", width="stretch")
             d3.download_button("Download Markdown", md_text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown",
                                key="dl-memo", width="stretch")
-            st.caption("The PDF and Word versions add four charts: factor scores, key-ratio trends, the DSCR stress heatmap and the "
+            note("The PDF and Word versions add four charts: factor scores, key-ratio trends, the DSCR stress heatmap and the "
                    "distance-to-default trend.")
             with st.container(border=True):
                 st.markdown(md_text)
@@ -2042,7 +2072,7 @@ if tabs[9] is not None:
         SEV_COL = {"High": RED, "Medium": AMBER, "Low": CB, "Strength": GREEN}
 
         with it[0]:
-            st.caption("Ranked by priority. Each card shows the evidence, why a lender should care, what to ask, and where to look in the dashboard.")
+            note("Ranked by priority. Each card shows the evidence, why a lender should care, what to ask, and where to look in the dashboard.")
             show = st.segmented_control("Show", ["Risks", "Strengths", "All"], default="Risks", key="ins-filter") or "Risks"
             sel = [c for c in i_cards if show == "All" or (show == "Strengths") == (c["severity"] == "Strength")]
             if not sel:
@@ -2054,7 +2084,7 @@ if tabs[9] is not None:
                             f"<b style='font-size:1.02rem'>{esc(c['title'])}</b>", unsafe_allow_html=True)
                     st.markdown(c["body"])
                     if c["evidence"]:
-                        st.caption(" · ".join(c["evidence"]))
+                        note(" · ".join(c["evidence"]))
                     extra = []
                     if c["why"] and c["why"] not in c["body"]:
                         extra.append(f"**Why it matters:** {c['why']}")
@@ -2066,7 +2096,7 @@ if tabs[9] is not None:
         with it[1]:
             worse = [t for t in i_tr if not t["improving"]]
             better_ = [t for t in i_tr if t["improving"]]
-            st.caption(f"Change over the full history available ({len(i_m.columns)} fiscal years). Moves that change zone come first, "
+            note(f"Change over the full history available ({len(i_m.columns)} fiscal years). Moves that change zone come first, "
                    "then moves that are the largest in the sector.")
             l, r = st.columns(2)
             with l:
@@ -2093,7 +2123,7 @@ if tabs[9] is not None:
                         st.plotly_chart(trend(t["key"], sers, h=250), width="stretch", key=f"ins-tr-{t['key']}")
 
         with it[2]:
-            st.caption("Why the key numbers moved, traced back to the statement lines (latest year vs the year before).")
+            note("Why the key numbers moved, traced back to the statement lines (latest year vs the year before).")
             if not i_rc:
                 st.success("No major deterioration that needs explaining in the latest year.")
             for c in sorted(i_rc, key=lambda c: ins.SEV_ORDER[c["severity"]]):
@@ -2102,11 +2132,11 @@ if tabs[9] is not None:
                                 unsafe_allow_html=True)
                     st.markdown(c["text"])
                     if c["evidence"]:
-                        st.caption(" · ".join(c["evidence"]))
+                        note(" · ".join(c["evidence"]))
 
         with it[3]:
             top, bottom = ins.peer_position(i_vals, latest_all)
-            st.caption(f"Percentile = share of the {len(latest_all)} companies loaded in {sector} that {ic.name} beats on each metric "
+            note(f"Percentile = share of the {len(latest_all)} companies loaded in {sector} that {ic.name} beats on each metric "
                    "(higher is always better).")
 
             def pp_table(rows):
@@ -2121,10 +2151,10 @@ if tabs[9] is not None:
                     else:
                         st.write("None.")
             if len(latest_all) < 5:
-                st.caption("Few companies are loaded for this sector, so percentiles are coarse.")
+                note("Few companies are loaded for this sector, so percentiles are coarse.")
 
         with it[4]:
-            st.caption(f"Based on FY{ic.fin.index[-1]} statements. Targets are the healthy thresholds used across the dashboard; "
+            note(f"Based on FY{ic.fin.index[-1]} statements. Targets are the healthy thresholds used across the dashboard; "
                    "each fix assumes everything else stays the same.")
             l, r = st.columns(2)
             with l:
@@ -2143,10 +2173,10 @@ if tabs[9] is not None:
                     with st.container(border=True):
                         st.markdown(f"**{mt.M[c['key']]['label']}**: {fmtv(c['key'], i_vals.get(c['key']))}")
                         st.markdown(c["text"])
-            st.caption("Use the Credit workbench tab to test combined shocks and a new facility.")
+            note("Use the Credit workbench tab to test combined shocks and a new facility.")
 
         with it[5]:
-            st.caption("The original rule-based summary.")
+            note("The original rule-based summary.")
             render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
 
 # ------------------------------------------------------------------ Data & method
@@ -2172,10 +2202,10 @@ if tabs[10] is not None:
             st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
         st.subheader("Metric dictionary and thresholds")
         if SECTOR_MODE:
-            st.caption(f"Cut-offs below are **sector-relative** for {sector} ({strict} strictness): taken from this sector's own "
+            note(f"Cut-offs below are **sector-relative** for {sector} ({strict} strictness): taken from this sector's own "
                    "distribution where at least 6 companies have the metric, otherwise the textbook cut-off.")
         elif strict != "Standard":
-            st.caption(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
+            note(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
         st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
                                     "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
                                     "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1],
@@ -2216,7 +2246,7 @@ if tabs[10] is not None:
 if tabs[11] is not None:
     with tabs[11]:
         st.markdown("### Common-size statements")
-        st.caption("Every line as a share of revenue (income and cash flow) or of total assets (balance sheet), so companies of "
+        note("Every line as a share of revenue (income and cash flow) or of total assets (balance sheet), so companies of "
                    "very different size can be compared line by line. The last column is the sector median for the latest year.")
         CS_IS = [("rev", "Revenue"), ("cogs", "Cost of revenue"), ("sga", "Selling, general & admin"), ("ebitda", "EBITDA"),
                  ("da", "Depreciation"), ("ebit", "EBIT"), ("interest", "Interest"), ("pbt", "Profit before tax"),
@@ -2254,7 +2284,7 @@ if tabs[11] is not None:
             st.dataframe(cs_view.style.format(lambda v: "–" if pd.isna(v) else f"{v:,.1f}")
                          .background_gradient(cmap="RdBu", subset=["vs sector (pp)"], vmin=-25, vmax=25),
                          width="stretch")
-            st.caption(f"Percent of {'revenue' if base == 'rev' else 'total assets'}. *vs sector* = latest year minus the sector "
+            note(f"Percent of {'revenue' if base == 'rev' else 'total assets'}. *vs sector* = latest year minus the sector "
                        "median, in percentage points (blue above, red below - not good or bad by itself: higher debt is "
                        "riskier, higher cash is safer).")
 
@@ -2262,7 +2292,7 @@ if tabs[11] is not None:
 if tabs[12] is not None:
     with tabs[12]:
         st.markdown("### Peer table")
-        st.caption("Up to five companies from the sector side by side on the main credit metrics, with the sector median. "
+        note("Up to five companies from the sector side by side on the main credit metrics, with the sector median. "
                    "Cells are coloured by the cut-offs in force (textbook or sector-relative).")
         _default = [t1] + ([t2] if t2 else [])
         _by_rev = sorted(companies, key=lambda t: -np.nan_to_num(companies[t].fin["rev"].iloc[-1] if "rev" in companies[t].fin else np.nan, nan=-1))
@@ -2304,21 +2334,21 @@ if tabs[12] is not None:
             fig_.update_layout(height=420, template="plotly_white", margin=dict(l=40, r=40, t=30, b=30),
                                polar=dict(radialaxis=dict(range=[0, 100])), legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_, width="stretch", key="pt-radar")
-            st.caption("Factor scores 0-100 (healthy = 100, watch = 50, concern = 0). The deep-dive tabs still compare two "
+            note("Factor scores 0-100 (healthy = 100, watch = 50, concern = 0). The deep-dive tabs still compare two "
                        "companies; this table is the wider view.")
 
 # ------------------------------------------------------------------ Group exposure
 if tabs[13] is not None:
     with tabs[13]:
         st.markdown("### Group exposure")
-        st.caption("Indian credit risk is often group risk: cash, guarantees and reputation move between sister companies, so a "
+        note("Indian credit risk is often group risk: cash, guarantees and reputation move between sister companies, so a "
                    "lender looks at the whole family. Members across all sectors are scored on textbook cut-offs so they are comparable.")
         own_g = grp.group_of(MON_CO.ticker)
         g_names = list(grp.GROUPS)
         g_sel = st.selectbox("Group", g_names, index=g_names.index(own_g) if own_g else 0, key=f"grp-sel-{MON_CO.ticker}",
                              help="Defaults to the selected company's group.")
         if not own_g:
-            st.caption(f"{MON_CO.name} is not part of a group among the dashboard's companies; showing another group to browse.")
+            note(f"{MON_CO.name} is not part of a group among the dashboard's companies; showing another group to browse.")
         ALL_NAMES = {t: (sec_, n_) for sec_, d_ in SECTORS.items() for t, n_ in d_.items()}
         _hist = sn.history()
         _last = _hist[_hist["date"] == _hist["date"].max()].set_index("ticker") if len(_hist) else pd.DataFrame()
@@ -2375,7 +2405,7 @@ if tabs[13] is not None:
                 st.info("State-owned companies are not a group in the usual sense: they do not support each other, but lenders and "
                         "agencies assume government support, which is why their ratings sit well above their standalone numbers.")
             else:
-                st.caption("Read across: a weak or highly indebted member can draw cash, guarantees or management attention from the "
+                note("Read across: a weak or highly indebted member can draw cash, guarantees or management attention from the "
                            "others, and a default anywhere in the group usually hits the whole family's funding. Unlisted holding "
                            "companies and promoter debt are not visible here.")
 
@@ -2383,7 +2413,7 @@ if tabs[13] is not None:
 if tabs[14] is not None:
     with tabs[14]:
         st.markdown(f"### {sector}: market context")
-        st.caption("The sector's equity index, the commodity and currency prices that drive its earnings, and Indian interest rates. "
+        note("The sector's equity index, the commodity and currency prices that drive its earnings, and Indian interest rates. "
                    "Prices from Yahoo Finance (nightly copy first); commodity futures are global benchmarks.")
         mk_items = mc.market_tickers(sector)
         mpx = dt.get_prices([t for t, *_ in mk_items])
@@ -2402,7 +2432,7 @@ if tabs[14] is not None:
         st.dataframe(mdf.style.format({c: pct for c in ("1 month", "3 months", "1 year")})
                      .map(lambda v: "" if v == "" or pd.isna(v) else f"color: {GREEN if v > 0 else RED}", subset=["1 month", "3 months", "1 year"]),
                      hide_index=True, width="stretch", column_config={"Why it matters": st.column_config.TextColumn(width="large")})
-        st.caption("Green / red = up / down, not good / bad: rising crude helps ONGC but hurts refiners and paint makers.")
+        note("Green / red = up / down, not good / bad: rising crude helps ONGC but hurts refiners and paint makers.")
         sel_ = st.multiselect("Chart (rebased to 100 a year ago)", [lbl for _, lbl, _ in mk_items],
                               default=[lbl for _, lbl, _ in mk_items][2:4] or [mk_items[0][1]], key="mk-sel")
         cpx = dt.get_prices(list(companies))
@@ -2430,5 +2460,97 @@ if tabs[14] is not None:
                    RF_LIVE["short_3m"][1] if RF_LIVE.get("short_3m") else None, delta_color="off")
         r4_.metric("10-year G-sec (OECD)", f"{RF_LIVE['gsec_10y'][0]:.2f}%" if RF_LIVE.get("gsec_10y") else "n/a",
                    RF_LIVE["gsec_10y"][1] if RF_LIVE.get("gsec_10y") else None, delta_color="off")
-        st.caption("T-bill cut-offs from the RBI website (latest auction); monthly averages from the OECD. A steeper gap between "
+        note("T-bill cut-offs from the RBI website (latest auction); monthly averages from the OECD. A steeper gap between "
                    "10-year and short rates usually means tighter long-term funding for capital-heavy borrowers.")
+
+# ------------------------------------------------------------------ Watchlist
+if tabs[16] is not None:
+    with tabs[16]:
+        st.markdown("### Watchlist")
+        if not WATCH:
+            st.info("Add companies under **Watchlist** in the sidebar - any sector. The list lives in this page's link, so bookmark "
+                    "it to come back to the same list.")
+        else:
+            _h = sn.history()
+            if _h.empty:
+                st.warning("No nightly status history is available yet, so the watchlist cannot show statuses.")
+            else:
+                _d1 = _h["date"].max()
+                _now = _h[_h["date"] == _d1].set_index("ticker")
+                _chg = sn.changes(_h, WATCH)
+                rows_ = []
+                for t in WATCH:
+                    r_ = _now.loc[t] if t in _now.index else None
+                    moves = _chg[_chg["ticker"] == t] if len(_chg) else pd.DataFrame()
+                    rows_.append({"Company": ALL_CO[t][1], "Sector": ALL_CO[t][0],
+                                  "Grade": r_["grade"] if r_ is not None else "–",
+                                  "Score": f"{r_['score']:.0f}" if r_ is not None and not pd.isna(r_["score"]) else "–",
+                                  "Headline signal": str(r_["signal"]).title() if r_ is not None else "–",
+                                  "Early warning": str(r_["ew_level"]).title() if r_ is not None and not pd.isna(r_["ew_level"]) else "–",
+                                  "News": {"R": "Concern", "A": "Watch", "G": "Clear"}.get(r_["news"] if r_ is not None else None, "–"),
+                                  "Since last night": "; ".join(f"{m['What']} {m['Was']} → {m['Now']}" for _, m in moves.iterrows())
+                                  or ("–" if len(_chg.attrs) else "needs two nights")})
+                wdf = pd.DataFrame(rows_)
+                st.dataframe(style_cells(wdf, lambda v: {"Elevated Concern": SIG_CSS["✕ Concern"], "Concern": SIG_CSS["✕ Concern"],
+                                                         "Watch": SIG_CSS["! Watch"], "Comfortable": SIG_CSS["✓ Healthy"],
+                                                         "Clear": SIG_CSS["✓ Healthy"]}.get(v, ""),
+                                         ["Headline signal", "Early warning", "News"]), hide_index=True, width="stretch")
+                note(f"Statuses from the nightly run of {pd.Timestamp(_d1):%d %b %Y} on textbook cut-offs and default weights. "
+                    "To open a company, pick its sector and name at the top.")
+                hw = _h[_h["ticker"].isin(WATCH)].copy()
+                if hw["date"].nunique() >= 2:
+                    fig_ = go.Figure()
+                    for t in WATCH:
+                        s_ = hw[hw["ticker"] == t].sort_values("date")
+                        fig_.add_trace(go.Scatter(x=s_["date"], y=s_["score"], name=ALL_CO[t][1], mode="lines+markers"))
+                    fig_.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=20, b=10), yaxis=dict(range=[0, 100]),
+                                       yaxis_title="score", legend=dict(orientation="h", y=-0.25))
+                    st.plotly_chart(fig_, width="stretch", key="wl-hist")
+            st.markdown("**Daily email** - put the same tickers, one per line, in `watchlist.txt` in the GitHub repository:")
+            st.code("\n".join(WATCH), language=None)
+
+# ------------------------------------------------------------------ Guide
+if tabs[15] is not None:
+    with tabs[15]:
+        st.markdown("### How to use this dashboard")
+        g1, g2 = st.columns([3, 2])
+        with g1:
+            st.markdown("""
+**What it answers.** Can this listed company repay its debt, are its numbers trustworthy, is anything going wrong right
+now, and should we lend - how much, on what terms?
+
+**The flow**
+1. **Pick** a sector, an analysis type (one company against its sector, or two companies head to head) and a company at the top.
+2. **Read the header cards** - headline signal, score, grade, early warning, news and any agency rating, for each company.
+3. **Analyse → Overview**: the factor scorecard, *why the score moved* since last year, and *what if* revenue, margins or
+   rates move - including the revenue fall at which debt cover breaks.
+4. **Analyse → detail tabs** to find what drives a weak factor: Liquidity, Solvency, Earnings quality, Distress & forensic
+   (Altman, Ohlson, Piotroski, Beneish, Benford), Cash flow. **Peer table** compares up to five companies; **Common-size**
+   puts every line on a % basis.
+5. **Monitor**: Early warning (latest quarters, share price, Merton distance-to-default), News & ratings (credit news,
+   SEBI orders, agency ratings vs the model), Group exposure, Sector & market (indices, commodities, rates), Watchlist.
+6. **Decide**: size the facility and stress it, check covenants, tune the scorecard weights, then fill in the analyst inputs
+   and download the **Credit memo** (PDF, Word, Markdown).
+7. **Method**: data quality for the selected companies and every formula and cut-off.
+""")
+        with g2:
+            st.markdown("""
+**Signs**  
+✓ Healthy · ! Watch · ✕ Concern on every metric.  
+**Score** 0-100 from the factor scores; **grade** CR1 (≈ AAA) to CR9 (≈ CC/C), always on textbook cut-offs.
+
+**Settings (sidebar)**  
+*Scoring basis* - textbook cut-offs or judged against the sector.  
+*Strictness* - lenient / standard / conservative.  
+*As-of year* - see the company as it looked in an earlier year.  
+*Show calculations* - formulas with the company's numbers.  
+*Show explanations* - these grey notes.  
+*Watchlist* - companies from any sector, kept in the page link.  
+*Reload data* - skip the nightly copy and fetch live.
+
+**Banks and NBFCs** have their own view with lender ratios
+(capital, asset quality, earnings, efficiency); enter NPA and CRAR from the results.
+
+**Limits** - public data only, about four years, consolidated accounts; the grade is rule-based and not calibrated;
+news is read from headlines.
+""")
