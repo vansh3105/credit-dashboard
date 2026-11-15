@@ -50,7 +50,16 @@ def grade_info(i):
     return dict(index=i, grade=g, equiv=eq, pd=pd_, meaning=meaning, label=f"{g} (≈ {eq})")
 
 
-def rate(score, ew_level=None, management="Adequate", outlook="Stable", security_cover=None):
+PLEDGE_NOTCH = [(50, -1)]   # promoter pledge (% of promoter holding) at or above 50% -> -1 notch
+
+
+def pledge_notch(pledge_pct):
+    if pledge_pct is None or pd.isna(pledge_pct):
+        return 0
+    return next((n for lo, n in PLEDGE_NOTCH if pledge_pct >= lo), 0)
+
+
+def rate(score, ew_level=None, management="Adequate", outlook="Stable", security_cover=None, pledge_pct=None):
     """Issuer and facility grade with the step-by-step build-up. Returns dict(issuer, facility, steps)."""
     base = grade_index(score)
     if base is None:
@@ -59,7 +68,9 @@ def rate(score, ew_level=None, management="Adequate", outlook="Stable", security
     qual = 0
     for label, n, why in (("Early-warning signals", EW_NOTCH.get(ew_level, 0), ew_level.title() if ew_level else "not available"),
                           ("Management quality", MGMT_NOTCH.get(management, 0), management),
-                          ("Industry outlook", OUTLOOK_NOTCH.get(outlook, 0), outlook)):
+                          ("Industry outlook", OUTLOOK_NOTCH.get(outlook, 0), outlook),
+                          ("Promoter pledge", pledge_notch(pledge_pct),
+                           "not entered" if pledge_pct is None or pd.isna(pledge_pct) else f"{pledge_pct:.0f}% of promoter holding")):
         qual += n
         steps.append((label, f"{why}: {n:+d} notch" + ("" if abs(n) == 1 else "es"), None))
     qual_c = max(-MAX_QUAL, min(MAX_QUAL, qual))
@@ -338,6 +349,10 @@ def build_memo(c):
 
     # 10. analyst assessment
     ass = [f"Management quality: **{a.get('management', 'Adequate')}**", f"Industry outlook: **{a.get('outlook', 'Stable')}**"]
+    if a.get("pledge") is not None and not pd.isna(a.get("pledge")):
+        ass.append(f"Promoter pledge: **{a['pledge']:.0f}%** of promoter holding"
+                   + (" - high; a fall in the share price can force sales and a change of control" if a["pledge"] >= 50 else
+                      " - watch for margin calls if the share price falls" if a["pledge"] >= 20 else ""))
     if a.get("notes"):
         ass.append(f"Analyst notes: {a['notes']}")
     B += [("h2", "10. Analyst assessment"), ("bullets", ass)]

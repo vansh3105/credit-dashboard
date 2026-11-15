@@ -1782,6 +1782,13 @@ if tabs[8] is not None:
                                        help="Realisable value after haircut. Cover = value ÷ facility amount; 1.5x or more lifts the facility grade a notch.")
                 outlook = b3.selectbox("Industry outlook", ["Stable", "Positive", "Negative"], key=f"m_outlook_{k_}",
                                        help="Negative −1 notch on the issuer grade.")
+                c1_, c2_ = st.columns([1, 2])
+                pledge = c1_.number_input("Promoter shares pledged (% of promoter holding)", 0.0, 100.0, None, 1.0,
+                                          key=f"m_pledge_{k_}", placeholder="not entered",
+                                          help="From the latest shareholding pattern (BSE/NSE company page → Shareholding → "
+                                               "Pledged). 50% or more −1 notch. Exchanges block automated download, so enter it here.")
+                c2_.caption("Promoter pledging is one of the strongest early signs of stress in Indian companies: if the share price "
+                            "falls, lenders sell the pledged shares. Find it on the company's BSE or NSE page under *Shareholding pattern*.")
                 notes = st.text_area("Analyst notes (go into the memo)", key=f"m_notes_{k_}", height=80,
                                      placeholder="Business model, customer concentration, promoter track record, site visit…")
                 o1, o2 = st.columns([1, 2])
@@ -1805,7 +1812,7 @@ if tabs[8] is not None:
             mt.set_basis("Sector-relative", SECTOR_VALS)
             sr_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
             mt.set_basis(basis_sel, SECTOR_VALS)                    # restore the session's basis
-            rating = rp.rate(tb_score, ew_ctx["level"] if ew_ctx else None, mgmt, outlook, cover)
+            rating = rp.rate(tb_score, ew_ctx["level"] if ew_ctx else None, mgmt, outlook, cover, pledge)
             if rating:
                 rating["relative"] = rp.relative_standing(sr_score, tb_score, sector)
 
@@ -1857,7 +1864,7 @@ if tabs[8] is not None:
                        cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, rf=dict(rate=st.session_state.get('ew-rf', RF_LIVE['rate']), source=RF_LIVE['source']), security_cover=cover, override=override,
                        override_reason=ov_reason.strip(),
                        analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
-                                    management=mgmt, outlook=outlook, notes=notes.strip()))
+                                    management=mgmt, outlook=outlook, notes=notes.strip(), pledge=pledge))
             fac_now = dict(fac)
 
             def memo_with_charts():
