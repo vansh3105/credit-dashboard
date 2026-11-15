@@ -27,6 +27,8 @@ Data comes from Yahoo Finance via `yfinance`, served from a nightly snapshot (op
 | `scenario.py` | What-if on the latest year (revenue, margin, rate shocks) and the revenue fall at which cover breaks. |
 | `groups.py` | Business groups (Tata, Adani, JSW, PSUs…) for group-exposure checks. |
 | `scripts/alerts.py` | Nightly watchlist summary and optional email. |
+| `shadow.py` | Shadow-rating model: predicts the agency rating from size, PSU/group support, leverage and cover; CRISIL default rates for PD. |
+| `ratings.csv` | Agency ratings used to train it, each with its source (India Ratings' published list, checked headlines). |
 | `early_warning.py` | Early-warning tab: quarterly and half-year signals, share-price signals vs sector, Merton distance-to-default. |
 | `insights.py` | Rule-based narrative (no LLM). |
 | `app.py` | Streamlit UI. |
@@ -35,6 +37,7 @@ Data comes from Yahoo Finance via `yfinance`, served from a nightly snapshot (op
 | `tests/test_snapshot.py` | Snapshot round-trip is lossless, freshness and fallback order, and the what-changed comparison. |
 | `tests/test_macro.py` | RBI / OECD rate parsing and fallback order, SEBI archive merge, matching and severity (offline). |
 | `tests/test_features.py` | Score attribution, what-if and break points, bank ratios, groups, pledge notch, data gap fills, alert report. |
+| `tests/test_shadow.py` | Rating scale, CRISIL PD table, fitting and leave-one-out validation, and that every label has a source. |
 | `tests/test_breakdowns.py` | Checks the score breakdowns reproduce the scores exactly, and the insight rules find the right cause on a deteriorating test firm. |
 
 ## First live run - check these

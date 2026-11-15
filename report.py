@@ -286,6 +286,11 @@ def build_memo(c):
                            + ("The model's base grade is the same." if gap == 0 else
                               f"The model's base grade is {abs(gap)} grade{'s' * (abs(gap) > 1)} {'lower' if gap > 0 else 'higher'}.")
                            + " Agencies also weigh parent/state support, market position and funding access, which the model does not."))
+        sh = c.get("shadow")
+        if sh:
+            B.append(("p", f"Shadow rating (model trained on agency ratings of listed Indian companies): **{sh['rating']}**, "
+                           f"range {sh['high']} to {sh['low']}; 1-year default rate for the category {_pct(sh['pd'], 2)} "
+                           "(CRISIL Ratings default study, fiscals 2014-2024)."))
         B.append(("p", f"Grade scale: CR1 (≈ AAA) to CR9 (≈ CC/C). Indicative PDs are rounded long-run average default rates for the "
                        "equivalent agency grade, not a model estimate for this company."))
 

@@ -17,6 +17,7 @@ import insights as ins
 import report as rp
 import scenario as scn
 import groups as grp
+import shadow as shd
 import metrics as mt
 import macro as mc
 import news as nw
@@ -43,6 +44,7 @@ ew = _fresh(ew)
 rp = _fresh(rp)
 scn = _fresh(scn)
 grp = _fresh(grp)
+shd = _fresh(shd)
 mc = _fresh(mc)
 nw = _fresh(nw)
 sn = _fresh(sn)
@@ -780,6 +782,62 @@ LVL_TXT = {"ELEVATED CONCERN": ("Elevated", RED), "WATCH": ("Watch", AMBER), "CO
 NEWS_TXT = {"R": ("Concern", RED), "A": ("Watch", AMBER), "G": ("Clear", GREEN), None: ("no headlines", "#8b949e")}
 
 
+RATINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratings.csv")
+
+
+def load_ratings():
+    try:
+        return pd.read_csv(RATINGS_PATH, dtype=str).fillna("")
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "name", "sector", "agency", "rating", "outlook", "as_of", "source", "url", "evidence"])
+
+
+@st.cache_resource(show_spinner="Fitting the shadow-rating model…", max_entries=4)
+def shadow_model(rhash, snap_built):
+    """Fit on every rated non-financial company (any sector), with the rule-based grade as the comparison."""
+    rt = load_ratings()
+    rt = rt[~rt["sector"].isin(FIN_SECTORS)]
+    y = shd.labels(rt)
+    X, base = {}, {}
+    prev = mt.basis()
+    mt.set_basis("Textbook")
+    try:
+        for t in y.index:
+            sec_, n_ = ALL_CO.get(t, (None, None))
+            if n_ is None:
+                continue
+            c_, _ = dt.get_company(t, n_)
+            if c_ is None or c_.fin.empty:
+                continue
+            v_ = ins.latest(mt.compute(c_.fin, c_.mcap_cr, 100.0))
+            X[t] = shd.features(c_, v_, grp.group_of(t))
+            gi_ = rp.grade_index(mt.overall_score(mt.pillar_scores(v_, c_.gov), mt.DEFAULT_WEIGHTS))
+            base[t] = shd.CR_TO_NOTCH.get(gi_, np.nan)
+    finally:
+        mt.set_basis(prev, SECTOR_VALS)
+    Xd = pd.DataFrame(X).T
+    y = y.loc[Xd.index]
+    if len(y) < 15:
+        return None
+    return shd.fit(Xd, y, pd.Series(base))
+
+
+def get_shadow():
+    rt = load_ratings()
+    built = dt.source().get("built")
+    return shadow_model(shd.ratings_hash(rt), str(built.date()) if built else "live")
+
+
+def shadow_for(comp):
+    """Shadow rating for one non-financial company on its latest data (None for lenders or past years)."""
+    if comp.ticker in sectors.FIN_KIND or not EW_LATEST:
+        return None
+    m_ = get_shadow()
+    if m_ is None:
+        return None
+    return shd.predict(m_, shd.features(comp, latest_all[comp.ticker], grp.group_of(comp.ticker)))
+
+
 def credit_view(comp):
     """One line under the headline banner: grade, early warning, news flow and the latest agency rating."""
     gi_, _ = textbook_grade(comp.ticker)
@@ -794,6 +852,9 @@ def credit_view(comp):
         nat_ = [r_ for r_ in agency_ratings(comp, b_["news"]["items"]) if r_["scale"] == "national" and r_.get("rating")]
         if nat_:
             parts.append(chip(nat_[0]["agency"], nat_[0]["rating"] + (f" {nat_[0]['outlook']}" if nat_[0].get("outlook") else ""), "inherit"))
+    sh_ = shadow_for(comp)
+    if sh_:
+        parts.append(chip("Shadow rating", f"{sh_['rating']} · PD {fpd(sh_['pd'])}", "inherit"))
     if grp.group_of(comp.ticker):
         parts.append(chip("Group", grp.group_of(comp.ticker).split(" (")[0], "inherit"))
     return "<div class='cvrow'>" + "".join(parts) + "</div>"
@@ -841,7 +902,7 @@ SECTIONS = {
                 (3, "Earnings quality"), (4, "Distress & forensic"), (7, "Cash flow & lifecycle"), (11, "Common-size")],
     "Monitor": [(16, "Watchlist"), (5, "Early warning"), (6, "News & ratings"), (13, "Group exposure"), (14, "Sector & market")],
     "Decide": [(8, None)],          # the workbench's own tabs (facility, covenants, scorecard, watchlist, memo) show directly
-    "Method": [(15, "Guide"), (10, "Data & method")],
+    "Method": [(15, "Guide"), (17, "Model validation"), (10, "Data & method")],
 }
 SECTION_HELP = {"Analyse": "the company's numbers and what they mean", "Monitor": "what has changed since the last annual report",
                 "Decide": "size the loan, stress it, grade it and write the memo", "Method": "how to use it, data quality, formulas and cut-offs"}
@@ -849,7 +910,8 @@ sc1, sc2 = st.columns([2, 3], vertical_alignment="center")
 with sc1:
     SECTION = st.segmented_control("Section", list(SECTIONS), default="Analyse", key="section", label_visibility="collapsed") or "Analyse"
 sc2.caption(f"**{SECTION}** - {SECTION_HELP[SECTION]}.")
-tabs = [None] * 17          # 11 Common-size, 12 Peer table, 13 Group exposure, 14 Sector & market, 15 Guide, 16 Watchlist
+tabs = [None] * 18          # 11 Common-size, 12 Peer table, 13 Group exposure, 14 Sector & market, 15 Guide, 16 Watchlist,
+                            # 17 Model validation
 _spec = SECTIONS[SECTION]
 if _spec[0][1] is None:
     tabs[_spec[0][0]] = st.container()
@@ -1754,7 +1816,7 @@ if tabs[8] is not None:
                     cur_debt=g_("cur_debt"), cash=g_("cash"), recv=g_("recv"), inv=g_("inv"), pay=g_("pay"), cfo=g_("cfo"),
                     eq=g_("equity"), ni=g_("ni"))
         taxr = float(np.clip(g_("tax") / g_("pbt"), 0, 0.4)) if (not pd.isna(g_("tax")) and not pd.isna(g_("pbt")) and g_("pbt") > 0) else 0.25
-        wb = st.tabs(["Facility & stress", "Covenants", "Rating scorecard", "Sector watchlist", "Credit memo"])
+        wb = st.tabs(["Facility & stress", "Covenants", "Rating scorecard", "Shadow rating", "Sector watchlist", "Credit memo"])
         fac = {}
 
         # ---- facility & stress
@@ -1892,7 +1954,7 @@ if tabs[8] is not None:
             fac["score"] = (sc_b, mt.band(sc_b), pb)
 
         # ---- sector watchlist
-        with wb[3]:
+        with wb[4]:
             st.markdown(f"##### Sector watchlist - {sector} {ADV}", unsafe_allow_html=True)
             note("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
             rows = []
@@ -1915,7 +1977,7 @@ if tabs[8] is not None:
             st.download_button("Download watchlist (CSV)", wdf.to_csv(index=False), file_name=f"watchlist_{sector}.csv", mime="text/csv", key="dl-watch")
 
         # ---- credit memo
-        with wb[4]:
+        with wb[5]:
             st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
             note("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
                    "below. Download it as PDF or Word with the charts included. A draft for analyst review, not a credit decision.")
@@ -2014,7 +2076,7 @@ if tabs[8] is not None:
             ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
                        vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
                        req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
-                       cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, rf=dict(rate=st.session_state.get('ew-rf', RF_LIVE['rate']), source=RF_LIVE['source']), security_cover=cover, override=override,
+                       cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, shadow=shadow_for(BC), rf=dict(rate=st.session_state.get('ew-rf', RF_LIVE['rate']), source=RF_LIVE['source']), security_cover=cover, override=override,
                        override_reason=ov_reason.strip(),
                        analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
                                     management=mgmt, outlook=outlook, notes=notes.strip(), pledge=pledge))
@@ -2554,3 +2616,119 @@ now, and should we lend - how much, on what terms?
 **Limits** - public data only, about four years, consolidated accounts; the grade is rule-based and not calibrated;
 news is read from headlines.
 """)
+
+# ------------------------------------------------------------------ Shadow rating (Decide)
+if tabs[8] is not None:
+    with wb[3]:
+        st.markdown("#### Shadow rating")
+        note("What rating an Indian agency would probably give this company, predicted by a model trained on the ratings "
+             "agencies have actually assigned to the dashboard's companies. Default probability from CRISIL's published "
+             "default history for that rating. See *Method → Model validation* for how well it works.")
+        if BC.ticker in sectors.FIN_KIND:
+            st.info("Not available for banks and NBFCs - too few rated lenders to train on.")
+        elif not EW_LATEST:
+            st.info("Uses today's market capitalisation, so it is shown only for the latest year.")
+        else:
+            SM = get_shadow()
+            if SM is None:
+                st.warning("Not enough rated companies to fit the model.")
+            else:
+                x_ = shd.features(BC, latest_all[BC.ticker], grp.group_of(BC.ticker))
+                pr = shd.predict(SM, x_)
+                rt_ = load_ratings()
+                own = rt_[rt_["ticker"] == BC.ticker]
+                gi_, s_ = textbook_grade(BC.ticker)
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Shadow rating", pr["rating"], f"range {pr['high']} to {pr['low']}", delta_color="off",
+                          help="Plus or minus the model's average error in leave-one-out testing.")
+                s2.metric("1-year default probability", fpd(pr["pd"]),
+                          help=f"Average 1-year default rate of the '{shd.category(pr['rating'])}' category. Source: {shd.CRISIL_SRC}.")
+                s3.metric("Agency rating on file", ", ".join(f"{r_.agency} {r_.rating}" for r_ in own.itertuples()) or "none",
+                          help="From ratings.csv (India Ratings' published list and checked headlines).")
+                s4.metric("Rule-based grade", rp.GRADES[gi_][1] + f" (≈ {rp.GRADES[gi_][2]})" if gi_ is not None else "n/a",
+                          help="The dashboard's scorecard grade on textbook cut-offs, for comparison.")
+                if pr["missing"]:
+                    st.caption("Missing inputs filled with the training median: " + ", ".join(pr["missing"]) + ".")
+                p_ = SM["params"]
+                z_ = ((pd.Series(x_)[shd.FEATURES].astype(float).fillna(p_["med"]) - p_["mu"]) / p_["sd"])
+                contrib = -(z_ * SM["coef"])           # minus: a lower notch number is a better rating
+                cf = go.Figure(go.Bar(x=contrib.values, y=[shd.FEATURE_LABEL[k] for k in contrib.index], orientation="h",
+                                      marker_color=[GREEN if v_ > 0 else RED for v_ in contrib.values],
+                                      text=[f"{v_:+.2f}" for v_ in contrib.values], textposition="outside"))
+                cf.update_layout(height=250, template="plotly_white", margin=dict(l=10, r=40, t=30, b=10),
+                                 title=dict(text="What pushes the rating up (green) or down (red), in notches vs an average rated company",
+                                            font=dict(size=13)), yaxis=dict(autorange="reversed"))
+                st.plotly_chart(cf, width="stretch", key="shd-contrib")
+                note(f"Inputs: market cap Rs {BC.mcap_cr:,.0f} cr, net debt / EBITDA {fmtv('nd_ebitda', latest_all[BC.ticker].get('nd_ebitda'))}, "
+                     f"interest cover {fmtv('icr', latest_all[BC.ticker].get('icr'))}"
+                     + (f", group: {grp.group_of(BC.ticker)}" if grp.group_of(BC.ticker) else "") + ". "
+                     "Agencies rate scale, parent or state support and leverage most heavily - which is why the rule-based grade, "
+                     "built only from ratios, can sit far from them.")
+
+# ------------------------------------------------------------------ Model validation (Method)
+if tabs[17] is not None:
+    with tabs[17]:
+        st.markdown("### Model validation")
+        SM = get_shadow()
+        if SM is None:
+            st.warning("Not enough rated companies to fit the shadow-rating model.")
+        else:
+            v_ = SM["validation"]
+            st.markdown(f"**How well does each approach reproduce the {v_['n']} agency ratings on file?** "
+                        "Leave-one-out: every company is predicted by a model fitted on all the *other* companies.")
+            vt = pd.DataFrame([
+                {"Approach": "Shadow-rating model", "Rank correlation": v_["rank_corr"], "Average error (notches)": v_["mae"],
+                 "Within 1 notch": v_["within1"], "Within 2 notches": v_["within2"]},
+                {"Approach": "Rule-based scorecard grade", "Rank correlation": v_.get("base_rank_corr"), "Average error (notches)": v_.get("base_mae"),
+                 "Within 1 notch": v_.get("base_within1"), "Within 2 notches": np.nan},
+                {"Approach": "Naive: always the most common rating", "Rank correlation": 0.0, "Average error (notches)": v_["naive_mae"],
+                 "Within 1 notch": v_["naive_within1"], "Within 2 notches": np.nan}])
+            st.dataframe(vt.style.format({"Rank correlation": "{:.2f}", "Average error (notches)": "{:.2f}",
+                                          "Within 1 notch": "{:.0%}", "Within 2 notches": "{:.0%}"}, na_rep="–"),
+                         hide_index=True, width="stretch")
+            note("Rank correlation is the key test: can the approach tell stronger companies from weaker ones? The naive guess scores "
+                 "well on *within 1 notch* only because most rated listed companies are AAA or AA - it cannot rank anyone.")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                jit = np.linspace(-0.15, 0.15, len(SM["y"]))
+                lbl = [ALL_CO.get(t, ("", t))[1] for t in SM["y"].index]
+                fig_ = go.Figure()
+                fig_.add_trace(go.Scatter(x=[1, 18], y=[1, 18], mode="lines", line=dict(color="#8b949e", dash="dot"), hoverinfo="skip"))
+                fig_.add_trace(go.Scatter(x=SM["y"].values + jit, y=SM["loo"].values, mode="markers", text=lbl,
+                                          marker=dict(size=10, color=C1),
+                                          hovertemplate="%{text}: agency %{x:.0f}, model %{y:.1f}<extra></extra>"))
+                ticks = dict(tickmode="array", tickvals=list(range(1, 11)), ticktext=shd.NOTCHES[:10])
+                fig_.update_layout(height=380, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+                                   xaxis=dict(title="Agency rating", range=[0.5, 10.5], **ticks),
+                                   yaxis=dict(title="Model (leave-one-out)", range=[10.5, 0.5], **ticks))
+                st.plotly_chart(fig_, width="stretch", key="shd-val")
+            with c2:
+                co = SM["coef"]
+                st.dataframe(pd.DataFrame({"Feature": [shd.FEATURE_LABEL[k] for k in co.index],
+                                           "Effect (notches per 1 s.d.)": (-co).round(2).values,
+                                           "Direction": ["better rating" if c < 0 else "worse rating" for c in co.values]}),
+                             hide_index=True, width="stretch")
+                note("Ridge regression on standardised inputs. Positive effect = higher value means a better rating.")
+            st.markdown("**Companies, agency vs model**")
+            cmp_ = pd.DataFrame({"Company": [ALL_CO.get(t, ("", t))[1] for t in SM["y"].index],
+                                 "Sector": [ALL_CO.get(t, ("", ""))[0] for t in SM["y"].index],
+                                 "Agency": [shd.rating_of(n) for n in SM["y"].values],
+                                 "Model (left out)": [shd.rating_of(n) for n in SM["loo"].values],
+                                 "Gap (notches)": np.round(SM["loo"].values - SM["y"].values).astype(int)})
+            st.dataframe(cmp_.sort_values("Gap (notches)", key=abs, ascending=False), hide_index=True, width="stretch", height=320)
+            st.markdown("**Default probability by rating** - " + shd.CRISIL_SRC)
+            st.dataframe(pd.DataFrame([{"Rating category": k, "1-year default rate": f"{v:.2%}"} for k, v in shd.CRISIL_PD.items()]).T,
+                         width="stretch")
+            with st.expander("Ratings on file (labels) - add more to improve the model"):
+                rt_ = load_ratings()
+                st.caption(f"{len(rt_)} ratings for {rt_['ticker'].nunique()} companies. Sources: India Ratings' published list of "
+                           "outstanding ratings (Oct 2026) and rating-action headlines, each checked for the right entity. "
+                           "Add a row for any company (rating from the agency's website), download, and replace ratings.csv in the "
+                           "repository - the model refits automatically.")
+                ed = st.data_editor(rt_, num_rows="dynamic", width="stretch", key="rt-editor",
+                                    column_config={"url": st.column_config.LinkColumn(display_text="source")})
+                st.download_button("Download ratings.csv", ed.to_csv(index=False).encode(), "ratings.csv", "text/csv", key="dl-ratings")
+            st.markdown(shd.__doc__.replace("\n", "  \n"))
+            st.caption("Limits: 54 labels, most of them AAA/AA, so the model is least reliable below A; features were chosen on the same "
+                       "companies it is validated on, so the leave-one-out figures are slightly optimistic; market cap makes it "
+                       "sensitive to share-price swings.")
