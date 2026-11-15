@@ -74,6 +74,9 @@ st.markdown("""<style>
 .bar{height:8px;border-radius:99px;background:rgba(128,128,128,.25);overflow:hidden;margin:3px 0 6px 0}
 .bar>div{height:100%;border-radius:99px}
 .small{font-size:.82rem;opacity:.78}
+.cvrow{display:flex;flex-wrap:wrap;gap:6px;margin:-.2rem 0 .5rem}
+.cv{border:1px solid rgba(128,128,128,.28);border-radius:999px;padding:2px 10px;font-size:.8rem}
+.cvl{opacity:.7}
 div[data-testid="stMetric"]{background:rgba(128,128,128,.09);padding:8px 12px;border-radius:10px}
 .coname{font-weight:700;font-size:1.05rem;margin:.1rem 0 .3rem 0}
 </style>""", unsafe_allow_html=True)
@@ -536,6 +539,7 @@ hc = st.columns(2)
 with hc[0]:
     with st.container(border=True):
         banner(A.name, vA, flagsA, scoreA, C1)
+        CV_SLOT = {A.ticker: st.empty()}
         if B is not None:
             kpis(A, vA)
         else:
@@ -545,6 +549,7 @@ with hc[1]:
     with st.container(border=True):
         if B is not None:
             banner(B.name, vB, flagsB, scoreB, C2)
+            CV_SLOT[B.ticker] = st.empty()
             kpis(B, vB)
         else:
             banner(f"{cmp_name} ({len(peers)} peers)", vB, [], scoreB, CB)
@@ -563,411 +568,494 @@ dp_for = ew.dp_for
 
 
 def ew_bundle(comp, rf):
-    """Everything the early-warning view needs for one company (prices for the whole sector, cached 6 hours)."""
+    """Everything the early-warning view needs for one company (prices for the whole sector, cached 6 hours).
+    Kept for the session so the header, Monitor and the memo share one calculation."""
+    ck = ("ewb", comp.ticker, rf, comp.fetched_at, tuple(sorted(companies)))
+    memo_ = st.session_state.setdefault("_ew_memo", {})
+    if ck in memo_:
+        return memo_[ck]
     news_ = nw.get_news(comp.name, comp.ticker)
     b_ = ew.bundle(comp, companies, dt.get_prices(list(companies)), dt.get_quarterly(comp.ticker), rf, news_["items"])
     b_["news"] = news_
+    if len(memo_) > 40:
+        memo_.clear()
+    memo_[ck] = b_
     return b_
 
 
-tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
-                "Early warning", "News & ratings", "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
+def textbook_grade(t):
+    """(grade index, score) from the quantitative score on textbook cut-offs - the memo's base grade."""
+    mt.set_basis("Textbook")
+    s_ = mt.overall_score(mt.pillar_scores(latest_all[t], companies[t].gov), W)
+    mt.set_basis(basis_sel, SECTOR_VALS)
+    return rp.grade_index(s_), s_
+
+
+def agency_ratings(comp, items):
+    """Latest agency rating per agency from headlines, with the analyst's manual entry (News & ratings tab) first."""
+    rats_ = nw.latest_ratings(items)
+    m_rt_ = st.session_state.get(f"nw-man-rt-{comp.ticker}", "–")
+    if m_rt_ and m_rt_ != "–":
+        m_ag_ = st.session_state.get(f"nw-man-ag-{comp.ticker}", "CRISIL")
+        rats_ = [dict(agency=m_ag_, rating=m_rt_, outlook=st.session_state.get(f"nw-man-ol-{comp.ticker}"), action="Entered by analyst",
+                      scale="national", date=datetime.now(timezone.utc), title="Entered manually", url="", source="")] + \
+                [r_ for r_ in rats_ if r_["agency"] != m_ag_]
+    return rats_
+
+
+LVL_TXT = {"ELEVATED CONCERN": ("Elevated", RED), "WATCH": ("Watch", AMBER), "COMFORTABLE": ("Comfortable", GREEN)}
+NEWS_TXT = {"R": ("Concern", RED), "A": ("Watch", AMBER), "G": ("Clear", GREEN), None: ("no headlines", "#8b949e")}
+
+
+def credit_view(comp):
+    """One line under the headline banner: grade, early warning, news flow and the latest agency rating."""
+    gi_, _ = textbook_grade(comp.ticker)
+    chip = lambda lbl, val, col: (f"<span class='cv'><span class='cvl'>{lbl}</span> "
+                                  f"<b style='color:{col}'>{esc(val)}</b></span>")
+    parts = [chip("Grade", rp.grade_info(gi_)["label"] if gi_ is not None else "n/a", "inherit")]
+    if EW_LATEST:
+        b_ = ew_bundle(comp, st.session_state.get("ew-rf", 6.5) / 100)
+        if b_["sigs"]:
+            parts.append(chip("Early warning", *LVL_TXT[b_["level"]]))
+        parts.append(chip("News", *NEWS_TXT[nw.news_signal(b_["news"]["items"])["status"]]))
+        nat_ = [r_ for r_ in agency_ratings(comp, b_["news"]["items"]) if r_["scale"] == "national" and r_.get("rating")]
+        if nat_:
+            parts.append(chip(nat_[0]["agency"], nat_[0]["rating"] + (f" {nat_[0]['outlook']}" if nat_[0].get("outlook") else ""), "inherit"))
+    return "<div class='cvrow'>" + "".join(parts) + "</div>"
+
+
+for _t, _slot in CV_SLOT.items():
+    _slot.markdown(credit_view(companies[_t]), unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------------ sections
+# Four sections instead of eleven tabs. Only the chosen section's code runs, so each page is also faster.
+# tabs[k] keeps the original numbering: 0 Overview, 1 Liquidity, 2 Solvency, 3 Earnings quality, 4 Distress & forensic,
+# 5 Early warning, 6 News & ratings, 7 Cash flow & lifecycle, 8 Credit workbench, 9 Insights, 10 Data & method.
+SECTIONS = {
+    "Analyse": [(0, "Overview"), (9, "Insights"), (1, "Liquidity"), (2, "Solvency & debt service"), (3, "Earnings quality"),
+                (4, "Distress & forensic"), (7, "Cash flow & lifecycle")],
+    "Monitor": [(5, "Early warning"), (6, "News & ratings")],
+    "Decide": [(8, None)],          # the workbench's own tabs (facility, covenants, scorecard, watchlist, memo) show directly
+    "Method": [(10, None)],
+}
+SECTION_HELP = {"Analyse": "the company's numbers and what they mean", "Monitor": "what has changed since the last annual report",
+                "Decide": "size the loan, stress it, grade it and write the memo", "Method": "data quality, formulas and cut-offs"}
+sc1, sc2 = st.columns([2, 3], vertical_alignment="center")
+with sc1:
+    SECTION = st.segmented_control("Section", list(SECTIONS), default="Analyse", key="section", label_visibility="collapsed") or "Analyse"
+sc2.caption(f"**{SECTION}** - {SECTION_HELP[SECTION]}.")
+tabs = [None] * 11
+_spec = SECTIONS[SECTION]
+if _spec[0][1] is None:
+    tabs[_spec[0][0]] = st.container()
+else:
+    for (_k, _), _t in zip(_spec, st.tabs([lbl for _, lbl in _spec])):
+        tabs[_k] = _t
+MON_CO = A
+if SECTION == "Monitor" and B is not None:
+    MON_CO = {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="mon-co")]
 
 # ------------------------------------------------------------------ Overview
-with tabs[0]:
-    _hist = sn.history()
-    _chg = sn.changes(_hist, companies) if len(_hist) else pd.DataFrame()
-    if len(_hist) and _hist["date"].nunique() >= 2:
-        _worse = int((_chg["Direction"] == "worse").sum()) if len(_chg) else 0
-        _lbl = (f"What changed in {sector} since {_chg.attrs['since']:%d %b}: " +
-                (f"{len(_chg)} change(s), {_worse} for the worse" if len(_chg) else "nothing"))
-        with st.expander(_lbl, expanded=_worse > 0):
-            if len(_chg):
-                st.dataframe(style_cells(_chg.drop(columns=["ticker"]), lambda v: {"worse": SIG_CSS["✕ Concern"], "better": SIG_CSS["✓ Healthy"]}.get(v, ""),
-                                         ["Direction"]), hide_index=True, width="stretch")
-            st.caption(f"Compares the last two nightly snapshots ({_chg.attrs['since']:%d %b} → {_chg.attrs['until']:%d %b}) on "
+if tabs[0] is not None:
+    with tabs[0]:
+        _hist = sn.history()
+        _chg = sn.changes(_hist, companies) if len(_hist) else pd.DataFrame()
+        if len(_hist) and _hist["date"].nunique() >= 2:
+            _worse = int((_chg["Direction"] == "worse").sum()) if len(_chg) else 0
+            _lbl = (f"What changed in {sector} since {_chg.attrs['since']:%d %b}: " +
+                    (f"{len(_chg)} change(s), {_worse} for the worse" if len(_chg) else "nothing"))
+            with st.expander(_lbl, expanded=_worse > 0):
+                if len(_chg):
+                    st.dataframe(style_cells(_chg.drop(columns=["ticker"]), lambda v: {"worse": SIG_CSS["✕ Concern"], "better": SIG_CSS["✓ Healthy"]}.get(v, ""),
+                                             ["Direction"]), hide_index=True, width="stretch")
+                st.caption(f"Compares the last two nightly snapshots ({_chg.attrs['since']:%d %b} → {_chg.attrs['until']:%d %b}) on "
                        "textbook cut-offs and default weights: grade, headline signal, early-warning level, news flow, and score moves of 5+ points.")
-            _t = _hist[_hist["ticker"] == t1].sort_values("date")
-            if len(_t) >= 2:
-                _f = go.Figure(go.Scatter(x=_t["date"], y=_t["score"], mode="lines+markers", line=dict(color=C1, width=2.4),
-                                          text=_t["grade"], hovertemplate="%{x|%d %b}: score %{y:.0f} · %{text}<extra></extra>"))
-                _f.update_layout(height=200, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
-                                 title=dict(text=f"{names[t1]}: score by night", font=dict(size=13)), yaxis=dict(range=[0, 100]))
-                st.plotly_chart(_f, width="stretch", key="hist-score")
-    st.markdown("##### Scorecard by factor")
-    st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
+                _t = _hist[_hist["ticker"] == t1].sort_values("date")
+                if len(_t) >= 2:
+                    _f = go.Figure(go.Scatter(x=_t["date"], y=_t["score"], mode="lines+markers", line=dict(color=C1, width=2.4),
+                                              text=_t["grade"], hovertemplate="%{x|%d %b}: score %{y:.0f} · %{text}<extra></extra>"))
+                    _f.update_layout(height=200, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                     title=dict(text=f"{names[t1]}: score by night", font=dict(size=13)), yaxis=dict(range=[0, 100]))
+                    st.plotly_chart(_f, width="stretch", key="hist-score")
+        st.markdown("##### Scorecard by factor")
+        st.caption("Each factor scores 0-100 from its metrics (healthy = 100, watch = 50, concern = 0). "
                "Weights and the overall score are an advanced extension (see Credit workbench).")
-    PILLAR_NOTE_GROUPS = {"Liquidity": ["Liquidity"], "Solvency & coverage": ["Solvency"], "Earnings quality": ["Earnings quality"],
-                          "Returns": ["Returns"], "Distress & forensic": ["Scores"]}
+        PILLAR_NOTE_GROUPS = {"Liquidity": ["Liquidity"], "Solvency & coverage": ["Solvency"], "Earnings quality": ["Earnings quality"],
+                              "Returns": ["Returns"], "Distress & forensic": ["Scores"]}
 
-    def worst_note(p):
-        if p == "Governance":
-            return "Yahoo/ISS risk scores (1 low - 10 high)" if not pd.isna(pA.get("Governance")) else "No governance data from Yahoo"
-        groups = PILLAR_NOTE_GROUPS[p]
-        reds = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "R"]
-        ambers = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "A"]
-        if reds:
-            k = reds[0]; return f"Concern: {mt.M[k]['label']} {fmtv(k, vA[k])}"
-        if ambers:
-            k = ambers[0]; return f"Watch: {mt.M[k]['label']} {fmtv(k, vA[k])}"
-        return "All rated metrics healthy"
+        def worst_note(p):
+            if p == "Governance":
+                return "Yahoo/ISS risk scores (1 low - 10 high)" if not pd.isna(pA.get("Governance")) else "No governance data from Yahoo"
+            groups = PILLAR_NOTE_GROUPS[p]
+            reds = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "R"]
+            ambers = [k for k, m in mt.M.items() if m["group"] in groups and mt.rag(k, vA.get(k)) == "A"]
+            if reds:
+                k = reds[0]; return f"Concern: {mt.M[k]['label']} {fmtv(k, vA[k])}"
+            if ambers:
+                k = ambers[0]; return f"Watch: {mt.M[k]['label']} {fmtv(k, vA[k])}"
+            return "All rated metrics healthy"
 
-    def card(p):
-        sa, sb = pA.get(p), pB.get(p)
-        def row(nm, s, col):
-            if s is None or pd.isna(s):
-                return f"<div class='small'>{esc(nm)}: n/a</div>"
-            return (f"<div class='small'>{esc(nm)} <b>{s:.0f}</b></div>"
+        def card(p):
+            sa, sb = pA.get(p), pB.get(p)
+            def row(nm, s, col):
+                if s is None or pd.isna(s):
+                    return f"<div class='small'>{esc(nm)}: n/a</div>"
+                return (f"<div class='small'>{esc(nm)} <b>{s:.0f}</b></div>"
                     f"<div class='bar'><div style='width:{s:.0f}%;background:{score_color(s)}'></div></div>")
-        return (f"<div class='card'><div class='t'>{p}</div>{row(A.name, sa, C1)}{row(cmp_name, sb, CB)}"
+            return (f"<div class='card'><div class='t'>{p}</div>{row(A.name, sa, C1)}{row(cmp_name, sb, CB)}"
                 f"<div class='small'>{esc(worst_note(p))}</div></div>")
 
-    def cutoff(k, which):
-        g, r = mt.thresholds(k)
-        v = g if which == "G" else r
-        if v is None or mt.M[k]["dir"] is None:
-            return "–"
-        if k in ("beneish", "fcf") or (k == "springate" and not mt.is_sector_band(k)):
-            return {"beneish": {"G": "< −2.22", "R": "> −2.22"}, "springate": {"G": "> 0.862", "R": "< 0.862"},
-                    "fcf": {"G": "> 0", "R": "< 0"}}[k][which]
-        hi = mt.M[k]["dir"] == "high"
-        return (("≥ " if hi else "≤ ") if which == "G" else ("< " if hi else "> ")) + fmtv(k, v)
+        def cutoff(k, which):
+            g, r = mt.thresholds(k)
+            v = g if which == "G" else r
+            if v is None or mt.M[k]["dir"] is None:
+                return "–"
+            if k in ("beneish", "fcf") or (k == "springate" and not mt.is_sector_band(k)):
+                return {"beneish": {"G": "< −2.22", "R": "> −2.22"}, "springate": {"G": "> 0.862", "R": "< 0.862"},
+                        "fcf": {"G": "> 0", "R": "< 0"}}[k][which]
+            hi = mt.M[k]["dir"] == "high"
+            return (("≥ " if hi else "≤ ") if which == "G" else ("< " if hi else "> ")) + fmtv(k, v)
 
-    def factor_detail(p):
-        """Contents of a scorecard box's popover: how the factor score is built, metric by metric."""
-        if p == "Governance":
-            gv = {c.name: c.gov for c in (A, B) if c is not None}
-            gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
-            gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
-            st.markdown("**Governance: Yahoo / ISS risk scores** (1 = low risk, 10 = high risk)")
-            st.dataframe(gdf, width="stretch")
-            st.caption("Factor score = 100 × (10 − average risk score) ÷ 9. Not available for every company.")
-            return
-        keys = [k for k, m in mt.M.items() if m["group"] in PILLAR_NOTE_GROUPS[p]]
-        rg = [mt.rag(k, vA.get(k)) for k in keys]
-        nG, nA, nR = rg.count("G"), rg.count("A"), rg.count("R")
-        sc = pA.get(p)
-        st.markdown(f"**{p}: how the score is built**")
-        st.markdown(f"{A.name}: ({nG} healthy × 100 + {nA} watch × 50 + {nR} concern × 0) ÷ {nG + nA + nR} rated metrics = "
+        def factor_detail(p):
+            """Contents of a scorecard box's popover: how the factor score is built, metric by metric."""
+            if p == "Governance":
+                gv = {c.name: c.gov for c in (A, B) if c is not None}
+                gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
+                gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
+                st.markdown("**Governance: Yahoo / ISS risk scores** (1 = low risk, 10 = high risk)")
+                st.dataframe(gdf, width="stretch")
+                st.caption("Factor score = 100 × (10 − average risk score) ÷ 9. Not available for every company.")
+                return
+            keys = [k for k, m in mt.M.items() if m["group"] in PILLAR_NOTE_GROUPS[p]]
+            rg = [mt.rag(k, vA.get(k)) for k in keys]
+            nG, nA, nR = rg.count("G"), rg.count("A"), rg.count("R")
+            sc = pA.get(p)
+            st.markdown(f"**{p}: how the score is built**")
+            st.markdown(f"{A.name}: ({nG} healthy × 100 + {nA} watch × 50 + {nR} concern × 0) ÷ {nG + nA + nR} rated metrics = "
                     f"**{'n/a' if sc is None or pd.isna(sc) else f'{sc:.0f}'}**" + (f" · threshold strictness: *{strict}*" if strict != "Standard" else ""))
-        rows = []
-        for k in keys:
-            a, b = vA.get(k), vB.get(k)
-            size_k = B is None and k in SIZE_KEYS
-            pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
-            tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)] if k in mA.index else []
-            rows.append({"Metric": mt.M[k]["label"], A.name: fmtv(k, a), "Signal": SIG[mt.rag(k, a)],
-                         **({"Textbook signal": SIG[mt.rag(k, a, "Textbook")]} if SECTOR_MODE else {}),
-                         cmp_name: NOT_COMPARABLE if size_k else fmtv(k, b),
-                         "Healthy": cutoff(k, "G"), "Concern": cutoff(k, "R"),
-                         "Sector pct": None if pd.isna(pct) else float(pct), "Trend": tv if len(tv) >= 2 else None,
-                         f"How {A.name}'s value is calculated": calc_text(k, A)})
-        ddf = pd.DataFrame(rows)
-        st.dataframe(style_cells(ddf, lambda v: SIG_CSS.get(v, ""), [c for c in ddf.columns if c.endswith("Signal")]),
-                     hide_index=True, width="stretch",
-                     column_config={"Sector pct": st.column_config.ProgressColumn("Sector pct", min_value=0, max_value=100, format="%.0f"),
-                                    "Trend": st.column_config.LineChartColumn("Trend", width="small"),
-                                    f"How {A.name}'s value is calculated": st.column_config.TextColumn(width="large")})
-        st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score."
-                   + (f" Cut-offs are {sector}'s own percentiles (sector-relative basis)." if SECTOR_MODE else ""))
+            rows = []
+            for k in keys:
+                a, b = vA.get(k), vB.get(k)
+                size_k = B is None and k in SIZE_KEYS
+                pct = mt.percentile(k, a, [lv.get(k) for lv in latest_all.values()])
+                tv = [float(x) for x in mA.loc[k].values if not pd.isna(x)] if k in mA.index else []
+                rows.append({"Metric": mt.M[k]["label"], A.name: fmtv(k, a), "Signal": SIG[mt.rag(k, a)],
+                             **({"Textbook signal": SIG[mt.rag(k, a, "Textbook")]} if SECTOR_MODE else {}),
+                             cmp_name: NOT_COMPARABLE if size_k else fmtv(k, b),
+                             "Healthy": cutoff(k, "G"), "Concern": cutoff(k, "R"),
+                             "Sector pct": None if pd.isna(pct) else float(pct), "Trend": tv if len(tv) >= 2 else None,
+                             f"How {A.name}'s value is calculated": calc_text(k, A)})
+            ddf = pd.DataFrame(rows)
+            st.dataframe(style_cells(ddf, lambda v: SIG_CSS.get(v, ""), [c for c in ddf.columns if c.endswith("Signal")]),
+                         hide_index=True, width="stretch",
+                         column_config={"Sector pct": st.column_config.ProgressColumn("Sector pct", min_value=0, max_value=100, format="%.0f"),
+                                        "Trend": st.column_config.LineChartColumn("Trend", width="small"),
+                                        f"How {A.name}'s value is calculated": st.column_config.TextColumn(width="large")})
+            st.caption("Figures in Rs crore. Metrics shown with '–' cut-offs are informational and do not count towards the score."
+                       + (f" Cut-offs are {sector}'s own percentiles (sector-relative basis)." if SECTOR_MODE else ""))
 
-    pill = list(mt.PILLARS) + ["Governance"]
-    st.caption("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
-    for r0 in (0, 3):
-        cc = st.columns(3)
-        for i, p in enumerate(pill[r0:r0 + 3]):
-            with cc[i]:
-                st.markdown(card(p), unsafe_allow_html=True)
-                with st.popover("See inside", icon=":material/search:", width="stretch", key=f"pop-{p}"):
-                    factor_detail(p)
-    st.markdown("")
-    # ---------- sector position: size is ranked, ratios are shown against the whole spread of peers
-    st.markdown("##### Where it sits in the sector")
-    st.caption(f"All {len(companies)} {sector} companies loaded. Left: size, which is ranked rather than averaged. Right: any size-neutral "
+        pill = list(mt.PILLARS) + ["Governance"]
+        st.caption("Click **See inside** under any box for the metrics, cut-offs and calculations behind its score.")
+        for r0 in (0, 3):
+            cc = st.columns(3)
+            for i, p in enumerate(pill[r0:r0 + 3]):
+                with cc[i]:
+                    st.markdown(card(p), unsafe_allow_html=True)
+                    with st.popover("See inside", icon=":material/search:", width="stretch", key=f"pop-{p}"):
+                        factor_detail(p)
+        st.markdown("")
+        # ---------- sector position: size is ranked, ratios are shown against the whole spread of peers
+        st.markdown("##### Where it sits in the sector")
+        st.caption(f"All {len(companies)} {sector} companies loaded. Left: size, which is ranked rather than averaged. Right: any size-neutral "
                "metric, with the sector's middle 50% shaded and the median dashed, so you see the spread, not just one average.")
-    HL = {A.name: C1, **({B.name: C2} if B is not None else {})}
-    sl, sr = st.columns(2)
-    with sl:
-        sz = st.segmented_control("Size measure", ["Revenue", "Net profit", "Market cap"], default="Revenue", key="sz-measure") or "Revenue"
-        fld = {"Revenue": "rev", "Net profit": "ni", "Market cap": "mcap"}[sz]
-        sv = sorted([(c.name, c.mcap_cr if fld == "mcap" else (c.fin[fld].iloc[-1] if fld in c.fin else np.nan))
-                     for c in companies.values()], key=lambda x: -np.nan_to_num(x[1], nan=-1e18))
-        sv = [x for x in sv if not pd.isna(x[1])]
-        sfig = go.Figure(go.Bar(x=[v for _, v in sv], y=[n for n, _ in sv], orientation="h",
-                                marker_color=[HL.get(n, "rgba(139,148,158,.45)") for n, _ in sv],
-                                text=[f"#{i + 1}" for i in range(len(sv))], textposition="outside",
-                                hovertemplate="%{y}: Rs %{x:,.0f} cr<extra></extra>"))
-        sfig.update_layout(height=max(320, 22 * len(sv)), template="plotly_white", margin=dict(l=10, r=30, t=10, b=10),
-                           yaxis=dict(autorange="reversed"), xaxis_title=f"{sz} (Rs crore)")
-        st.plotly_chart(sfig, width="stretch", key="size-rank")
-    with sr:
-        d_opts = [k for k, m in mt.M.items() if m["dir"] is not None and m["unit"] != "Rs cr"]
-        mk = st.selectbox("Metric", d_opts, index=d_opts.index("ebitda_margin"), format_func=lambda k: mt.M[k]["label"], key="dist-metric")
-        pts = [(companies[t].name, latest_all[t].get(mk)) for t in companies if not pd.isna(latest_all[t].get(mk))]
-        if len(pts) < 3:
-            st.info("Too few companies have this metric.")
-        else:
-            good_first = (lambda v: -v) if mt.M[mk]["dir"] == "high" else (lambda v: v)
-            pts.sort(key=lambda x: good_first(x[1]))
-            vs = np.array([v for _, v in pts], dtype=float)
-            lo, hi = np.percentile(vs, 5), np.percentile(vs, 95)
-            for nm in HL:                                   # always keep the highlighted companies on scale
-                v_ = dict(pts).get(nm)
-                if v_ is not None:
-                    lo, hi = min(lo, v_), max(hi, v_)
-            pad = (hi - lo) * 0.08 or abs(hi) * 0.1 or 1.0
-            lo, hi = lo - pad, hi + pad
-            xs = np.clip(vs, lo, hi)
-            pct_ax = mt.M[mk]["unit"] == "%"
-            dfig = go.Figure()
-            q1, med, q3 = np.percentile(vs, [25, 50, 75])
-            dfig.add_vrect(x0=q1, x1=q3, fillcolor=CB, opacity=0.12, line_width=0)
-            dfig.add_vline(x=med, line_dash="dash", line_color=CB, annotation_text="median", annotation_position="top")
-            for thr, colr in zip(mt.thresholds(mk), (GREEN, RED)):
-                if thr is not None and lo < thr < hi:
-                    dfig.add_vline(x=thr, line_color=colr, line_width=1, opacity=0.6)
-            dfig.add_scatter(x=xs, y=[n for n, _ in pts], mode="markers",
-                             marker=dict(size=[14 if n in HL else 9 for n, _ in pts], color=[HL.get(n, "rgba(139,148,158,.75)") for n, _ in pts],
-                                         symbol=["diamond" if (v < lo or v > hi) else "circle" for v in vs]),
-                             customdata=[fmtv(mk, v) for v in vs], hovertemplate="%{y}: %{customdata}<extra></extra>")
-            dfig.update_layout(height=max(320, 22 * len(pts)), template="plotly_white", margin=dict(l=10, r=10, t=24, b=10),
-                               yaxis=dict(autorange="reversed"), showlegend=False,
-                               xaxis=dict(range=[lo, hi], tickformat=".0%" if pct_ax else None, title=mt.M[mk]["label"]))
-            st.plotly_chart(dfig, width="stretch", key="dist-plot")
-            rk = [n for n, _ in pts].index(A.name) + 1 if A.name in dict(pts) else None
-            st.caption((f"{A.name} ranks **#{rk} of {len(pts)}** (best at the top). " if rk else "")
-                       + "Green / red lines: healthy and concern thresholds. Diamonds are outliers pinned to the edge (hover for the real value).")
+        HL = {A.name: C1, **({B.name: C2} if B is not None else {})}
+        sl, sr = st.columns(2)
+        with sl:
+            sz = st.segmented_control("Size measure", ["Revenue", "Net profit", "Market cap"], default="Revenue", key="sz-measure") or "Revenue"
+            fld = {"Revenue": "rev", "Net profit": "ni", "Market cap": "mcap"}[sz]
+            sv = sorted([(c.name, c.mcap_cr if fld == "mcap" else (c.fin[fld].iloc[-1] if fld in c.fin else np.nan))
+                         for c in companies.values()], key=lambda x: -np.nan_to_num(x[1], nan=-1e18))
+            sv = [x for x in sv if not pd.isna(x[1])]
+            sfig = go.Figure(go.Bar(x=[v for _, v in sv], y=[n for n, _ in sv], orientation="h",
+                                    marker_color=[HL.get(n, "rgba(139,148,158,.45)") for n, _ in sv],
+                                    text=[f"#{i + 1}" for i in range(len(sv))], textposition="outside",
+                                    hovertemplate="%{y}: Rs %{x:,.0f} cr<extra></extra>"))
+            sfig.update_layout(height=max(320, 22 * len(sv)), template="plotly_white", margin=dict(l=10, r=30, t=10, b=10),
+                               yaxis=dict(autorange="reversed"), xaxis_title=f"{sz} (Rs crore)")
+            st.plotly_chart(sfig, width="stretch", key="size-rank")
+        with sr:
+            d_opts = [k for k, m in mt.M.items() if m["dir"] is not None and m["unit"] != "Rs cr"]
+            mk = st.selectbox("Metric", d_opts, index=d_opts.index("ebitda_margin"), format_func=lambda k: mt.M[k]["label"], key="dist-metric")
+            pts = [(companies[t].name, latest_all[t].get(mk)) for t in companies if not pd.isna(latest_all[t].get(mk))]
+            if len(pts) < 3:
+                st.info("Too few companies have this metric.")
+            else:
+                good_first = (lambda v: -v) if mt.M[mk]["dir"] == "high" else (lambda v: v)
+                pts.sort(key=lambda x: good_first(x[1]))
+                vs = np.array([v for _, v in pts], dtype=float)
+                lo, hi = np.percentile(vs, 5), np.percentile(vs, 95)
+                for nm in HL:                                   # always keep the highlighted companies on scale
+                    v_ = dict(pts).get(nm)
+                    if v_ is not None:
+                        lo, hi = min(lo, v_), max(hi, v_)
+                pad = (hi - lo) * 0.08 or abs(hi) * 0.1 or 1.0
+                lo, hi = lo - pad, hi + pad
+                xs = np.clip(vs, lo, hi)
+                pct_ax = mt.M[mk]["unit"] == "%"
+                dfig = go.Figure()
+                q1, med, q3 = np.percentile(vs, [25, 50, 75])
+                dfig.add_vrect(x0=q1, x1=q3, fillcolor=CB, opacity=0.12, line_width=0)
+                dfig.add_vline(x=med, line_dash="dash", line_color=CB, annotation_text="median", annotation_position="top")
+                for thr, colr in zip(mt.thresholds(mk), (GREEN, RED)):
+                    if thr is not None and lo < thr < hi:
+                        dfig.add_vline(x=thr, line_color=colr, line_width=1, opacity=0.6)
+                dfig.add_scatter(x=xs, y=[n for n, _ in pts], mode="markers",
+                                 marker=dict(size=[14 if n in HL else 9 for n, _ in pts], color=[HL.get(n, "rgba(139,148,158,.75)") for n, _ in pts],
+                                             symbol=["diamond" if (v < lo or v > hi) else "circle" for v in vs]),
+                                 customdata=[fmtv(mk, v) for v in vs], hovertemplate="%{y}: %{customdata}<extra></extra>")
+                dfig.update_layout(height=max(320, 22 * len(pts)), template="plotly_white", margin=dict(l=10, r=10, t=24, b=10),
+                                   yaxis=dict(autorange="reversed"), showlegend=False,
+                                   xaxis=dict(range=[lo, hi], tickformat=".0%" if pct_ax else None, title=mt.M[mk]["label"]))
+                st.plotly_chart(dfig, width="stretch", key="dist-plot")
+                rk = [n for n, _ in pts].index(A.name) + 1 if A.name in dict(pts) else None
+                st.caption((f"{A.name} ranks **#{rk} of {len(pts)}** (best at the top). " if rk else "")
+                           + "Green / red lines: healthy and concern thresholds. Diamonds are outliers pinned to the edge (hover for the real value).")
 
-    st.markdown("##### Pick a factor")
-    sub = st.tabs(mt.GROUPS)
-    for gname, t in zip(mt.GROUPS, sub):
-        with t:
-            gA, gB = (counts(v, [k for k, m in mt.M.items() if m["group"] == gname]) for v in (vA, vB))
-            st.markdown(f"**{gname}** - {GROUP_TITLES[gname]}")
-            st.caption(f"{A.name}: {gA[0]} healthy · {gA[1]} watch · {gA[2]} concern   |   "
+        st.markdown("##### Pick a factor")
+        sub = st.tabs(mt.GROUPS)
+        for gname, t in zip(mt.GROUPS, sub):
+            with t:
+                gA, gB = (counts(v, [k for k, m in mt.M.items() if m["group"] == gname]) for v in (vA, vB))
+                st.markdown(f"**{gname}** - {GROUP_TITLES[gname]}")
+                st.caption(f"{A.name}: {gA[0]} healthy · {gA[1]} watch · {gA[2]} concern   |   "
                        f"{cmp_name}: {gB[0]} healthy · {gB[1]} watch · {gB[2]} concern")
-            d = table_df([gname])
-            show_table(d, f"ov-{gname}")
+                d = table_df([gname])
+                show_table(d, f"ov-{gname}")
 
-with tabs[1]:
-    st.subheader("Liquidity")
-    section(["Liquidity"], "liq", GROUP_TITLES["Liquidity"])
+if tabs[1] is not None:
+    with tabs[1]:
+        st.subheader("Liquidity")
+        section(["Liquidity"], "liq", GROUP_TITLES["Liquidity"])
 
-with tabs[2]:
-    st.subheader("Solvency & debt service")
-    section(["Solvency", "Returns", "Growth & margins"], "sol", f"{GROUP_TITLES['Solvency']} {GROUP_TITLES['Returns']}")
-    st.markdown("##### Return drivers (DuPont)")
-    dpA = mt.dupont(A.fin)
-    dpB = mt.dupont(B.fin) if B is not None else None
-    dcols = st.columns(2 if B is not None else 1)
-    for col, comp, dp, color in zip(dcols, (A, B), (dpA, dpB), (C1, C2)):
-        if comp is None:
-            continue
-        with col:
-            st.markdown(f"<div class='coname' style='color:{color}'>● {esc(comp.name)}</div>", unsafe_allow_html=True)
-            r = dp.iloc[-1]
-            f = lambda v, p=False: "n/a" if pd.isna(v) else (f"{v:.1%}" if p else f"{v:.2f}x")
-            m_ = st.columns(4)
-            m_[0].metric("ROE", f(r["ROE"], True)); m_[1].metric("= Net margin", f(r["Net margin"], True))
-            m_[2].metric("× Asset turnover", f(r["Asset turnover"])); m_[3].metric("× Equity multiplier", f(r["Equity multiplier"]))
-            m2 = st.columns(4)
-            m2[0].metric("Net margin", f(r["Net margin"], True)); m2[1].metric("= EBIT margin", f(r["EBIT margin"], True))
-            m2[2].metric("× Interest burden", f(r["Interest burden"])); m2[3].metric("× Tax burden", f(r["Tax burden"]))
-            with st.expander("DuPont by year"):
-                show = dp.copy()
-                show.index = [f"FY{y}" for y in show.index]
-                st.dataframe(show.T.style.format("{:.3f}"), width="stretch")
-    st.caption("Interest burden = pre-tax profit ÷ EBIT (lower means interest eats more of operating profit); tax burden = net profit ÷ pre-tax profit.")
-    cr, dr_ = vA.get("cce", np.nan), vA.get("debt_ratio", np.nan)
-    if not pd.isna(cr) and not pd.isna(dr_):
-        cash_rich, asset_rich = cr >= 0.6, dr_ <= 0.5
-        approach = {(True, True): "debt sculpting", (True, False): "debt avalanche", (False, True): "debt sizing (DSCR-based)",
-                    (False, False): "debt snowball"}[(cash_rich, asset_rich)]
-        st.markdown("##### Debt structuring view")
-        st.write(f"{A.name} screens as **{'cash-rich' if cash_rich else 'cash-poor'} + {'asset-rich' if asset_rich else 'asset-poor'}** "
+if tabs[2] is not None:
+    with tabs[2]:
+        st.subheader("Solvency & debt service")
+        section(["Solvency", "Returns", "Growth & margins"], "sol", f"{GROUP_TITLES['Solvency']} {GROUP_TITLES['Returns']}")
+        st.markdown("##### Return drivers (DuPont)")
+        dpA = mt.dupont(A.fin)
+        dpB = mt.dupont(B.fin) if B is not None else None
+        dcols = st.columns(2 if B is not None else 1)
+        for col, comp, dp, color in zip(dcols, (A, B), (dpA, dpB), (C1, C2)):
+            if comp is None:
+                continue
+            with col:
+                st.markdown(f"<div class='coname' style='color:{color}'>● {esc(comp.name)}</div>", unsafe_allow_html=True)
+                r = dp.iloc[-1]
+                f = lambda v, p=False: "n/a" if pd.isna(v) else (f"{v:.1%}" if p else f"{v:.2f}x")
+                m_ = st.columns(4)
+                m_[0].metric("ROE", f(r["ROE"], True)); m_[1].metric("= Net margin", f(r["Net margin"], True))
+                m_[2].metric("× Asset turnover", f(r["Asset turnover"])); m_[3].metric("× Equity multiplier", f(r["Equity multiplier"]))
+                m2 = st.columns(4)
+                m2[0].metric("Net margin", f(r["Net margin"], True)); m2[1].metric("= EBIT margin", f(r["EBIT margin"], True))
+                m2[2].metric("× Interest burden", f(r["Interest burden"])); m2[3].metric("× Tax burden", f(r["Tax burden"]))
+                with st.expander("DuPont by year"):
+                    show = dp.copy()
+                    show.index = [f"FY{y}" for y in show.index]
+                    st.dataframe(show.T.style.format("{:.3f}"), width="stretch")
+        st.caption("Interest burden = pre-tax profit ÷ EBIT (lower means interest eats more of operating profit); tax burden = net profit ÷ pre-tax profit.")
+        cr, dr_ = vA.get("cce", np.nan), vA.get("debt_ratio", np.nan)
+        if not pd.isna(cr) and not pd.isna(dr_):
+            cash_rich, asset_rich = cr >= 0.6, dr_ <= 0.5
+            approach = {(True, True): "debt sculpting", (True, False): "debt avalanche", (False, True): "debt sizing (DSCR-based)",
+                        (False, False): "debt snowball"}[(cash_rich, asset_rich)]
+            st.markdown("##### Debt structuring view")
+            st.write(f"{A.name} screens as **{'cash-rich' if cash_rich else 'cash-poor'} + {'asset-rich' if asset_rich else 'asset-poor'}** "
                  f"(proxy: CFO/EBITDA ≥ 60% and Debt/Assets ≤ 50%) → suggested approach: **{approach}**.")
 
-with tabs[3]:
-    st.subheader("Earnings quality")
-    section(["Earnings quality", "Market"], "eq", f"{GROUP_TITLES['Earnings quality']} P/OCF above P/E means profits are not converting to cash.")
-    st.markdown("**Reading the accrual ratios:** low balance-sheet accrual + low cash-flow accrual = excellent quality; both high = serious concern; "
+if tabs[3] is not None:
+    with tabs[3]:
+        st.subheader("Earnings quality")
+        section(["Earnings quality", "Market"], "eq", f"{GROUP_TITLES['Earnings quality']} P/OCF above P/E means profits are not converting to cash.")
+        st.markdown("**Reading the accrual ratios:** low balance-sheet accrual + low cash-flow accrual = excellent quality; both high = serious concern; "
                 "if only one is high, investigate that side.")
 
-with tabs[4]:
-    st.subheader("Distress & forensic scores")
-    section(["Scores"], "sc", GROUP_TITLES["Scores"])
+if tabs[4] is not None:
+    with tabs[4]:
+        st.subheader("Distress & forensic scores")
+        section(["Scores"], "sc", GROUP_TITLES["Scores"])
 
-    # ---------- how the forensic scores are calculated
-    st.markdown(f"##### How the forensic scores are calculated {ADV}", unsafe_allow_html=True)
-    st.caption("Every number below is traced back to the statement lines it comes from, so each score can be checked by hand.")
-    fc1, fc2 = st.columns([2, 3])
-    with fc1:
-        fcomp = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="fx-co")]
-    f_years = list(fcomp.fin.index[1:])
-    with fc2:
-        if len(f_years) > 1:
-            fy = st.select_slider("Fiscal year", options=f_years, value=f_years[-1], format_func=lambda y: f"FY{y}", key="fx-yr")
+        # ---------- how the forensic scores are calculated
+        st.markdown(f"##### How the forensic scores are calculated {ADV}", unsafe_allow_html=True)
+        st.caption("Every number below is traced back to the statement lines it comes from, so each score can be checked by hand.")
+        fc1, fc2 = st.columns([2, 3])
+        with fc1:
+            fcomp = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="fx-co")]
+        f_years = list(fcomp.fin.index[1:])
+        with fc2:
+            if len(f_years) > 1:
+                fy = st.select_slider("Fiscal year", options=f_years, value=f_years[-1], format_func=lambda y: f"FY{y}", key="fx-yr")
+            else:
+                fy = f_years[0] if f_years else None
+        fm = all_m[fcomp.ticker]
+        fbf = bfA if fcomp is A else bfB
+        if fy is None:
+            st.info("These breakdowns need at least two years of statements.")
         else:
-            fy = f_years[0] if f_years else None
-    fm = all_m[fcomp.ticker]
-    fbf = bfA if fcomp is A else bfB
-    if fy is None:
-        st.info("These breakdowns need at least two years of statements.")
-    else:
-        ft = st.tabs(["Forensic summary", "Beneish M-score", "Piotroski F-score", "Ohlson O-score"])
-        RES_TXT = {True: "✕ Flagged", False: "✓ Clear"}
+            ft = st.tabs(["Forensic summary", "Beneish M-score", "Piotroski F-score", "Ohlson O-score"])
+            RES_TXT = {True: "✕ Flagged", False: "✓ Clear"}
 
-        with ft[0]:
-            fs = mt.forensic_summary(fm[fy], fbf)
-            n, tot = fs["flagged"], fs["tested"]
-            col = RED if n >= 2 else (AMBER if n == 1 or fs["watch"] else GREEN)
-            head = (f"{n} of {tot} forensic tests point to aggressive accounting" if tot else "No forensic test could be run")
-            meaning = ("Several independent tests agree: treat reported earnings with caution and verify them before relying on them."
-                       if n >= 2 else "One isolated signal: look into that test specifically; on its own it is not conclusive."
-                       if n == 1 else "No test raises a concern on the available data.")
-            st.markdown(f"<div class='banner' style='--c:{col}'><div class='sig' style='font-size:1.15rem'>{esc(head)}</div>"
+            with ft[0]:
+                fs = mt.forensic_summary(fm[fy], fbf)
+                n, tot = fs["flagged"], fs["tested"]
+                col = RED if n >= 2 else (AMBER if n == 1 or fs["watch"] else GREEN)
+                head = (f"{n} of {tot} forensic tests point to aggressive accounting" if tot else "No forensic test could be run")
+                meaning = ("Several independent tests agree: treat reported earnings with caution and verify them before relying on them."
+                           if n >= 2 else "One isolated signal: look into that test specifically; on its own it is not conclusive."
+                           if n == 1 else "No test raises a concern on the available data.")
+                st.markdown(f"<div class='banner' style='--c:{col}'><div class='sig' style='font-size:1.15rem'>{esc(head)}</div>"
                         f"<div class='small'>{esc(fcomp.name)} · FY{fy} · {esc(meaning)}</div></div>", unsafe_allow_html=True)
-            rows = []
-            for r in fs["rows"]:
-                if r["key"] == "benford":
-                    val = "n/a" if r["value"] is None or pd.isna(r["value"]) else f"KS {r['value']:.3f} (cut-off {fbf['cutoff']:.3f})"
-                else:
-                    val = fmtv(r["key"], r["value"])
-                res = "– n/a" if r["flagged"] is None else ("! Watch" if r["watch"] else RES_TXT[r["flagged"]])
-                rows.append({"Test": r["test"], "Value": val, "Rule": r["rule"], "Result": res})
-            fdf = pd.DataFrame(rows)
-            st.dataframe(style_cells(fdf, lambda v: {"✕ Flagged": SIG_CSS["✕ Concern"], "✓ Clear": SIG_CSS["✓ Healthy"],
-                                                     "! Watch": SIG_CSS["! Watch"]}.get(v, ""), ["Result"]),
-                         hide_index=True, width="stretch")
-            st.caption("Beneish, Sloan and the accrual ratios all lean on the gap between profit and operating cash, so they are not fully "
+                rows = []
+                for r in fs["rows"]:
+                    if r["key"] == "benford":
+                        val = "n/a" if r["value"] is None or pd.isna(r["value"]) else f"KS {r['value']:.3f} (cut-off {fbf['cutoff']:.3f})"
+                    else:
+                        val = fmtv(r["key"], r["value"])
+                    res = "– n/a" if r["flagged"] is None else ("! Watch" if r["watch"] else RES_TXT[r["flagged"]])
+                    rows.append({"Test": r["test"], "Value": val, "Rule": r["rule"], "Result": res})
+                fdf = pd.DataFrame(rows)
+                st.dataframe(style_cells(fdf, lambda v: {"✕ Flagged": SIG_CSS["✕ Concern"], "✓ Clear": SIG_CSS["✓ Healthy"],
+                                                         "! Watch": SIG_CSS["! Watch"]}.get(v, ""), ["Result"]),
+                             hide_index=True, width="stretch")
+                st.caption("Beneish, Sloan and the accrual ratios all lean on the gap between profit and operating cash, so they are not fully "
                        "independent. Benford uses every reported figure across all years. None of these proves fraud; they show where to dig.")
 
-        with ft[1]:
-            bd = mt.beneish_detail(fcomp.fin, fy)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("M-score", "n/a" if pd.isna(bd["m"]) else f"{bd['m']:.2f}")
-            k2.metric("Cut-off", f"{bd['cutoff']:.2f}", help="Above −2.22 the model classes the company as a likely manipulator.")
-            k3.metric("Verdict", "n/a" if pd.isna(bd["m"]) else ("Likely manipulator" if bd["m"] > bd["cutoff"] else "Unlikely manipulator"))
-            st.caption(f"M = −4.84 + Σ (weight × index). Each index compares FY{fy} with FY{bd['prev_year']}; 1.0 means no change.")
-            fr = lambda k, v: "n/a" if v is None or pd.isna(v) else (f"Rs {v:,.0f} cr" if k == "SGI" else f"{v:.3f}")
-            brows = [{"Index": f"{r['key']} · {r['name']}", f"FY{fy}": fr(r["key"], r["cur"]),
-                      f"FY{bd['prev_year']}": "–" if r["prev"] is None else fr(r["key"], r["prev"]),
-                      "Index value": "n/a" if pd.isna(r["index"]) else f"{r['index']:.3f}" + (" (neutral 1.0 used)" if r["imputed"] else ""),
-                      "Typical: honest": r["ok_mean"], "Typical: manipulator": r["bad_mean"], "Weight": r["coef"],
-                      "Adds to M": r["contribution"],
-                      "Signal": "⚠ Like manipulators" if r["suspicious"] else "–"} for r in bd["rows"]]
-            bdf = pd.DataFrame(brows)
-            st.dataframe(bdf.style.format({"Typical: honest": "{:.3f}", "Typical: manipulator": "{:.3f}", "Weight": "{:+.3f}",
-                                           "Adds to M": "{:+.3f}"}, na_rep="n/a")
-                         .map(lambda v: SIG_CSS["✕ Concern"] if v == "⚠ Like manipulators" else "", subset=["Signal"]),
-                         hide_index=True, width="stretch")
-            if not pd.isna(bd["m"]):
-                wf = go.Figure(go.Waterfall(
-                    x=["Constant"] + [r["key"] for r in bd["rows"]] + ["M-score"],
-                    measure=["absolute"] + ["relative"] * len(bd["rows"]) + ["total"],
-                    y=[bd["const"]] + [r["contribution"] for r in bd["rows"]] + [0],
-                    text=[f"{bd['const']:.2f}"] + [f"{r['contribution']:+.2f}" for r in bd["rows"]] + [f"{bd['m']:.2f}"],
-                    textposition="outside", increasing=dict(marker_color=RED), decreasing=dict(marker_color=GREEN),
-                    totals=dict(marker_color=RED if bd["m"] > bd["cutoff"] else GREEN), connector=dict(line=dict(color=CB))))
-                wf.add_hline(y=bd["cutoff"], line_dash="dash", line_color=AMBER, annotation_text="−2.22 cut-off",
-                             annotation_position="top left")
-                wf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
-                                 yaxis_title="Running M-score", showlegend=False)
-                st.plotly_chart(wf, width="stretch", key="beneish-wf")
-                st.caption("Red bars push the score towards 'manipulator', green bars pull it back. The final bar is the M-score.")
-            with st.expander("What each index is looking for"):
-                for r in bd["rows"]:
-                    st.markdown(f"**{r['key']} - {r['name']}** `{r['formula']}`  \n{r['meaning']}"
-                                + (" **This company looks like the manipulator sample on this index.**" if r["suspicious"] else ""))
-                st.caption("Typical values are the sample means in Beneish (1999). An index is marked when it is closer to the manipulator "
+            with ft[1]:
+                bd = mt.beneish_detail(fcomp.fin, fy)
+                k1, k2, k3 = st.columns(3)
+                k1.metric("M-score", "n/a" if pd.isna(bd["m"]) else f"{bd['m']:.2f}")
+                k2.metric("Cut-off", f"{bd['cutoff']:.2f}", help="Above −2.22 the model classes the company as a likely manipulator.")
+                k3.metric("Verdict", "n/a" if pd.isna(bd["m"]) else ("Likely manipulator" if bd["m"] > bd["cutoff"] else "Unlikely manipulator"))
+                st.caption(f"M = −4.84 + Σ (weight × index). Each index compares FY{fy} with FY{bd['prev_year']}; 1.0 means no change.")
+                fr = lambda k, v: "n/a" if v is None or pd.isna(v) else (f"Rs {v:,.0f} cr" if k == "SGI" else f"{v:.3f}")
+                brows = [{"Index": f"{r['key']} · {r['name']}", f"FY{fy}": fr(r["key"], r["cur"]),
+                          f"FY{bd['prev_year']}": "–" if r["prev"] is None else fr(r["key"], r["prev"]),
+                          "Index value": "n/a" if pd.isna(r["index"]) else f"{r['index']:.3f}" + (" (neutral 1.0 used)" if r["imputed"] else ""),
+                          "Typical: honest": r["ok_mean"], "Typical: manipulator": r["bad_mean"], "Weight": r["coef"],
+                          "Adds to M": r["contribution"],
+                          "Signal": "⚠ Like manipulators" if r["suspicious"] else "–"} for r in bd["rows"]]
+                bdf = pd.DataFrame(brows)
+                st.dataframe(bdf.style.format({"Typical: honest": "{:.3f}", "Typical: manipulator": "{:.3f}", "Weight": "{:+.3f}",
+                                               "Adds to M": "{:+.3f}"}, na_rep="n/a")
+                             .map(lambda v: SIG_CSS["✕ Concern"] if v == "⚠ Like manipulators" else "", subset=["Signal"]),
+                             hide_index=True, width="stretch")
+                if not pd.isna(bd["m"]):
+                    wf = go.Figure(go.Waterfall(
+                        x=["Constant"] + [r["key"] for r in bd["rows"]] + ["M-score"],
+                        measure=["absolute"] + ["relative"] * len(bd["rows"]) + ["total"],
+                        y=[bd["const"]] + [r["contribution"] for r in bd["rows"]] + [0],
+                        text=[f"{bd['const']:.2f}"] + [f"{r['contribution']:+.2f}" for r in bd["rows"]] + [f"{bd['m']:.2f}"],
+                        textposition="outside", increasing=dict(marker_color=RED), decreasing=dict(marker_color=GREEN),
+                        totals=dict(marker_color=RED if bd["m"] > bd["cutoff"] else GREEN), connector=dict(line=dict(color=CB))))
+                    wf.add_hline(y=bd["cutoff"], line_dash="dash", line_color=AMBER, annotation_text="−2.22 cut-off",
+                                 annotation_position="top left")
+                    wf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                     yaxis_title="Running M-score", showlegend=False)
+                    st.plotly_chart(wf, width="stretch", key="beneish-wf")
+                    st.caption("Red bars push the score towards 'manipulator', green bars pull it back. The final bar is the M-score.")
+                with st.expander("What each index is looking for"):
+                    for r in bd["rows"]:
+                        st.markdown(f"**{r['key']} - {r['name']}** `{r['formula']}`  \n{r['meaning']}"
+                                    + (" **This company looks like the manipulator sample on this index.**" if r["suspicious"] else ""))
+                    st.caption("Typical values are the sample means in Beneish (1999). An index is marked when it is closer to the manipulator "
                            "mean than to the honest mean, for indices whose weight is positive.")
 
-        with ft[2]:
-            pdt = mt.piotroski_detail(fcomp.fin, fy)
-            k1, k2 = st.columns(2)
-            k1.metric("F-score", "n/a" if pd.isna(pdt["score"]) else f"{pdt['score']:.0f} / 9",
-                      help="7 or more is strong, 3 or less is weak.")
-            k2.metric("Tests with data", f"{pdt['tested']} of 9")
-            if pdt["tested"] < 9:
-                st.caption("Tests without data are left out, so the score is out of fewer than 9 points.")
-            prow = [{"Area": r["area"], "Test": r["test"],
-                     "Result": "– no data" if r["passed"] is None else ("✓ Pass (+1)" if r["passed"] else "✕ Fail (0)"),
-                     "Numbers used": r["evidence"]} for r in pdt["rows"]]
-            pdf_ = pd.DataFrame(prow)
-            st.dataframe(style_cells(pdf_, lambda v: SIG_CSS["✓ Healthy"] if str(v).startswith("✓") else
-                                     (SIG_CSS["✕ Concern"] if str(v).startswith("✕") else ""), ["Result"]),
-                         hide_index=True, width="stretch")
-            st.caption(f"Comparisons are FY{fy} vs FY{pdt['prev_year']}. ROA and asset turnover use average total assets.")
-
-        with ft[3]:
-            od = mt.ohlson_detail(fcomp.fin, fy, gnp)
-            if od is None:
-                st.info("Ohlson inputs are missing for this year.")
-            else:
-                k1, k2, k3 = st.columns(3)
-                k1.metric("T (log-odds)", f"{od['T']:.2f}")
-                k2.metric("Probability of distress", f"{od['p']:.1%}", help="e^T / (1 + e^T). Above 50% signals default within two years.")
-                k3.metric("Zone", {"G": "Low", "A": "Moderate", "R": "High"}.get(mt.rag("ohlson_p", od["p"]), "n/a"))
-                orows = [{"Term": r["term"], "Input value": r["value"], "Weight": r["coef"], "Adds to T": r["contribution"]}
-                         for r in od["rows"]]
-                st.dataframe(pd.DataFrame(orows).style.format({"Input value": "{:.3f}", "Weight": "{:+.3f}", "Adds to T": "{:+.3f}"}),
+            with ft[2]:
+                pdt = mt.piotroski_detail(fcomp.fin, fy)
+                k1, k2 = st.columns(2)
+                k1.metric("F-score", "n/a" if pd.isna(pdt["score"]) else f"{pdt['score']:.0f} / 9",
+                          help="7 or more is strong, 3 or less is weak.")
+                k2.metric("Tests with data", f"{pdt['tested']} of 9")
+                if pdt["tested"] < 9:
+                    st.caption("Tests without data are left out, so the score is out of fewer than 9 points.")
+                prow = [{"Area": r["area"], "Test": r["test"],
+                         "Result": "– no data" if r["passed"] is None else ("✓ Pass (+1)" if r["passed"] else "✕ Fail (0)"),
+                         "Numbers used": r["evidence"]} for r in pdt["rows"]]
+                pdf_ = pd.DataFrame(prow)
+                st.dataframe(style_cells(pdf_, lambda v: SIG_CSS["✓ Healthy"] if str(v).startswith("✓") else
+                                         (SIG_CSS["✕ Concern"] if str(v).startswith("✕") else ""), ["Result"]),
                              hide_index=True, width="stretch")
-                srt = sorted(od["rows"], key=lambda r: r["contribution"])
-                of = go.Figure(go.Bar(x=[r["contribution"] for r in srt], y=[r["term"] for r in srt], orientation="h",
-                                      marker_color=[RED if r["contribution"] > 0 else GREEN for r in srt]))
-                of.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                                 xaxis_title="Contribution to T (right = more risk)")
-                st.plotly_chart(of, width="stretch", key="ohlson-bars")
-                st.markdown(f"T = −1.32 + Σ contributions = **{od['T']:.2f}** → P = e^T ÷ (1 + e^T) = **{od['p']:.1%}**")
-                st.caption(f"The size term divides total assets (Rs crore) by the price index set in the sidebar ({gnp:g}), so large Indian "
-                           "companies get a large negative size term."
-                           + (" This is the first year of data, so the change-in-income term uses the same year (0)." if od["first_year"] else ""))
+                st.caption(f"Comparisons are FY{fy} vs FY{pdt['prev_year']}. ROA and asset turnover use average total assets.")
 
-    st.markdown("##### What drives the Altman Z″ score")
-    st.caption("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
-    fig = go.Figure()
-    for comp, color in ((A, C1), (B, C2)):
-        if comp is None:
-            continue
-        try:
-            comps = mt.altman_components(comp.fin)
-            fig.add_bar(x=[c[0] for c in comps], y=[c[1] for c in comps], name=comp.name, marker_color=color)
-        except Exception:
-            pass
-    if fig.data:
-        fig.update_layout(barmode="group", height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                          legend=dict(orientation="h", y=-0.3), yaxis_title="Contribution to Z″")
-        st.plotly_chart(fig, width="stretch", key="altman-comp")
-    else:
-        st.info("Altman components are not available (Yahoo is missing inputs).")
-    st.markdown("##### Benford's-law screen")
-    cols = st.columns(2 if B is not None else 1)
-    for col, comp, r, colr in zip(cols, (A, B), (bfA, bfB), (C1, C2)):
-        if comp is None:
-            continue
-        with col:
-            st.markdown(f"**{comp.name}**")
-            if not r or r["actual"] is None:
-                st.info("Too few reported figures for a Benford test (needs ≥ 30).")
+            with ft[3]:
+                od = mt.ohlson_detail(fcomp.fin, fy, gnp)
+                if od is None:
+                    st.info("Ohlson inputs are missing for this year.")
+                else:
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("T (log-odds)", f"{od['T']:.2f}")
+                    k2.metric("Probability of distress", f"{od['p']:.1%}", help="e^T / (1 + e^T). Above 50% signals default within two years.")
+                    k3.metric("Zone", {"G": "Low", "A": "Moderate", "R": "High"}.get(mt.rag("ohlson_p", od["p"]), "n/a"))
+                    orows = [{"Term": r["term"], "Input value": r["value"], "Weight": r["coef"], "Adds to T": r["contribution"]}
+                             for r in od["rows"]]
+                    st.dataframe(pd.DataFrame(orows).style.format({"Input value": "{:.3f}", "Weight": "{:+.3f}", "Adds to T": "{:+.3f}"}),
+                                 hide_index=True, width="stretch")
+                    srt = sorted(od["rows"], key=lambda r: r["contribution"])
+                    of = go.Figure(go.Bar(x=[r["contribution"] for r in srt], y=[r["term"] for r in srt], orientation="h",
+                                          marker_color=[RED if r["contribution"] > 0 else GREEN for r in srt]))
+                    of.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                     xaxis_title="Contribution to T (right = more risk)")
+                    st.plotly_chart(of, width="stretch", key="ohlson-bars")
+                    st.markdown(f"T = −1.32 + Σ contributions = **{od['T']:.2f}** → P = e^T ÷ (1 + e^T) = **{od['p']:.1%}**")
+                    st.caption(f"The size term divides total assets (Rs crore) by the price index set in the sidebar ({gnp:g}), so large Indian "
+                           "companies get a large negative size term."
+                               + (" This is the first year of data, so the change-in-income term uses the same year (0)." if od["first_year"] else ""))
+
+        st.markdown("##### What drives the Altman Z″ score")
+        st.caption("Weighted contribution of each term, latest year. Above 2.60 is safe, below 1.10 is distress.")
+        fig = go.Figure()
+        for comp, color in ((A, C1), (B, C2)):
+            if comp is None:
                 continue
-            fig = go.Figure()
-            fig.add_bar(x=list(range(1, 10)), y=r["actual"], name="Actual", marker_color=colr)
-            fig.add_scatter(x=list(range(1, 10)), y=r["expected"], name="Expected (Benford)", mode="lines+markers",
-                            line=dict(color=CB, dash="dash"))
-            fig.update_layout(height=280, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                              yaxis=dict(tickformat=".0%"), xaxis=dict(title="Leading digit", dtick=1),
-                              legend=dict(orientation="h", y=-0.3))
-            st.plotly_chart(fig, width="stretch", key=f"bf-{comp.ticker}")
-            st.write(f"KS = **{r['ks']:.3f}** vs cut-off 1.36/√N = **{r['cutoff']:.3f}** (N = {r['n']}) → "
-                     + ("**above cut-off: unusual pattern, investigate**" if r["flag"] else "within cut-off"))
-    st.caption("Benford's law is an anomaly detector, not a fraud detector: it shows where to look.")
-    st.markdown("##### Governance (Yahoo/ISS risk scores, 1 = low risk, 10 = high risk)")
-    gv = {c.name: c.gov for c in (A, B) if c is not None}
-    gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
-    gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
-    st.dataframe(gdf, width="stretch")
-    with st.expander("Manual governance & related-party checklist (not available through any free API)"):
-        st.markdown("""
+            try:
+                comps = mt.altman_components(comp.fin)
+                fig.add_bar(x=[c[0] for c in comps], y=[c[1] for c in comps], name=comp.name, marker_color=color)
+            except Exception:
+                pass
+        if fig.data:
+            fig.update_layout(barmode="group", height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                              legend=dict(orientation="h", y=-0.3), yaxis_title="Contribution to Z″")
+            st.plotly_chart(fig, width="stretch", key="altman-comp")
+        else:
+            st.info("Altman components are not available (Yahoo is missing inputs).")
+        st.markdown("##### Benford's-law screen")
+        cols = st.columns(2 if B is not None else 1)
+        for col, comp, r, colr in zip(cols, (A, B), (bfA, bfB), (C1, C2)):
+            if comp is None:
+                continue
+            with col:
+                st.markdown(f"**{comp.name}**")
+                if not r or r["actual"] is None:
+                    st.info("Too few reported figures for a Benford test (needs ≥ 30).")
+                    continue
+                fig = go.Figure()
+                fig.add_bar(x=list(range(1, 10)), y=r["actual"], name="Actual", marker_color=colr)
+                fig.add_scatter(x=list(range(1, 10)), y=r["expected"], name="Expected (Benford)", mode="lines+markers",
+                                line=dict(color=CB, dash="dash"))
+                fig.update_layout(height=280, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                  yaxis=dict(tickformat=".0%"), xaxis=dict(title="Leading digit", dtick=1),
+                                  legend=dict(orientation="h", y=-0.3))
+                st.plotly_chart(fig, width="stretch", key=f"bf-{comp.ticker}")
+                st.write(f"KS = **{r['ks']:.3f}** vs cut-off 1.36/√N = **{r['cutoff']:.3f}** (N = {r['n']}) → "
+                         + ("**above cut-off: unusual pattern, investigate**" if r["flag"] else "within cut-off"))
+        st.caption("Benford's law is an anomaly detector, not a fraud detector: it shows where to look.")
+        st.markdown("##### Governance (Yahoo/ISS risk scores, 1 = low risk, 10 = high risk)")
+        gv = {c.name: c.gov for c in (A, B) if c is not None}
+        gdf = pd.DataFrame(gv).reindex(["auditRisk", "boardRisk", "compensationRisk", "shareHolderRightsRisk", "overallRisk"])
+        gdf.index = ["Audit risk", "Board risk", "Compensation risk", "Shareholder-rights risk", "Overall risk"]
+        st.dataframe(gdf, width="stretch")
+        with st.expander("Manual governance & related-party checklist (not available through any free API)"):
+            st.markdown("""
 - **Related-party advances ÷ revenue** - normally 2-10%; above 50% is a red flag.
 - **Purchases booked ÷ increase in inventory** - a very high multiple means money is not turning into goods.
 - **Promoter pledging; company assets pledged for group-company loans.**
@@ -977,90 +1065,91 @@ with tabs[4]:
 - **Board**: CEO duality, independent-director share, CEO tenure/turnover.""")
 
 # ------------------------------------------------------------------ ADVANCED: early warning
-with tabs[5]:
-    st.markdown(f"### Early warning {ADV}", unsafe_allow_html=True)
-    st.caption("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
+if tabs[5] is not None:
+    with tabs[5]:
+        st.markdown(f"### Early warning {ADV}", unsafe_allow_html=True)
+        st.caption("What has changed since the last annual report: quarterly results, the half-year balance sheet, the share price, "
                "and the market-implied Merton distance-to-default. These move months before annual ratios do.")
-    if not EW_LATEST:
-        st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
+        if not EW_LATEST:
+            st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
                 "latest year in View options to see them.")
-    else:
-        e1, e2 = st.columns([3, 1])
-        with e1:
-            ec = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="ew-co")]
-        with e2:
-            rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 6.5, 0.25, key="ew-rf",
-                                 help="Used by the Merton model; roughly the 1-year Indian T-bill yield.") / 100
-        with st.spinner("Loading quarterly results and share prices…"):
-            ewb = ew_bundle(ec, rf)
-        px_all, q_ec, mkt_all, mk_ec = ewb["px_all"], ewb["q"], ewb["mkt_all"], ewb["mk"]
-        D_ec, D_src, mert, hist, sigs, n_, lvl = ewb["D"], ewb["D_src"], ewb["mert"], ewb["hist"], ewb["sigs"], ewb["n"], ewb["level"]
-        st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[lvl]}'><div class='who' style='color:{C1 if ec is A else C2}'>● {esc(ec.name)}</div>"
+        else:
+            e1, e2 = st.columns([3, 1])
+            with e1:
+                ec = MON_CO
+            with e2:
+                rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 6.5, 0.25, key="ew-rf",
+                                     help="Used by the Merton model; roughly the 1-year Indian T-bill yield.") / 100
+            with st.spinner("Loading quarterly results and share prices…"):
+                ewb = ew_bundle(ec, rf)
+            px_all, q_ec, mkt_all, mk_ec = ewb["px_all"], ewb["q"], ewb["mkt_all"], ewb["mk"]
+            D_ec, D_src, mert, hist, sigs, n_, lvl = ewb["D"], ewb["D_src"], ewb["mert"], ewb["hist"], ewb["sigs"], ewb["n"], ewb["level"]
+            st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[lvl]}'><div class='who' style='color:{C1 if ec is A else C2}'>● {esc(ec.name)}</div>"
                     f"<div class='sig'>{lvl}</div><div>{n_['R']} concern · {n_['A']} watch · {n_['G']} clear, across "
                     f"{len(sigs)} early-warning signals</div></div>", unsafe_allow_html=True)
-        if not sigs:
-            st.warning("Yahoo returned no quarterly or market data for this company.")
-        else:
-            EW_TXT = {"R": "✕ Concern", "A": "! Watch", "G": "✓ Clear", None: "–"}
-            sdf = pd.DataFrame([{"Area": s_["area"], "Signal": s_["signal"], "Value": s_["value"], "Status": EW_TXT[s_["status"]],
-                                 "Rule": s_["rule"], "Why it matters": s_["why"]} for s_ in sigs])
-            st.dataframe(style_cells(sdf, lambda v: {"✕ Concern": SIG_CSS["✕ Concern"], "! Watch": SIG_CSS["! Watch"],
-                                                     "✓ Clear": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Status"]),
-                         hide_index=True, width="stretch",
-                         column_config={"Rule": st.column_config.TextColumn(width="medium"),
-                                        "Why it matters": st.column_config.TextColumn(width="large")})
-
-        et = st.tabs(["Quarterly results", "Merton distance-to-default", "Share price vs sector", "Sector ranking"])
-        with et[0]:
-            qt = ew.quarterly_table(q_ec.get("is"))
-            if qt.empty:
-                st.info("Yahoo has no quarterly results for this company.")
+            if not sigs:
+                st.warning("Yahoo returned no quarterly or market data for this company.")
             else:
-                xq = [f"{d:%b-%y}" for d in qt.index]
-                qf = go.Figure()
-                qf.add_bar(x=xq, y=qt["Revenue"], name="Revenue (Rs cr)", marker_color=C1 if ec is A else C2,
-                           text=["" if pd.isna(v) else f"{v:+.0%} YoY" for v in qt["Revenue YoY"]], textposition="outside")
-                qf.add_scatter(x=xq, y=qt["EBITDA margin"], name="EBITDA margin", yaxis="y2", mode="lines+markers",
-                               line=dict(color=AMBER, width=2.5))
-                qf.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
-                                 yaxis=dict(title="Revenue (Rs cr)"), legend=dict(orientation="h", y=-0.2),
-                                 yaxis2=dict(title="EBITDA margin", overlaying="y", side="right", tickformat=".0%", showgrid=False))
-                st.plotly_chart(qf, width="stretch", key="ew-q")
-                show_q = qt.copy()
-                show_q.index = xq
-                st.dataframe(show_q.T.style.format(lambda v: "n/a" if pd.isna(v) else f"{v:,.2f}"), width="stretch")
-                st.caption("Year-on-year compares each quarter with the same quarter a year earlier, so seasonality cancels out. "
+                EW_TXT = {"R": "✕ Concern", "A": "! Watch", "G": "✓ Clear", None: "–"}
+                sdf = pd.DataFrame([{"Area": s_["area"], "Signal": s_["signal"], "Value": s_["value"], "Status": EW_TXT[s_["status"]],
+                                     "Rule": s_["rule"], "Why it matters": s_["why"]} for s_ in sigs])
+                st.dataframe(style_cells(sdf, lambda v: {"✕ Concern": SIG_CSS["✕ Concern"], "! Watch": SIG_CSS["! Watch"],
+                                                         "✓ Clear": SIG_CSS["✓ Healthy"]}.get(v, ""), ["Status"]),
+                             hide_index=True, width="stretch",
+                             column_config={"Rule": st.column_config.TextColumn(width="medium"),
+                                            "Why it matters": st.column_config.TextColumn(width="large")})
+
+            et = st.tabs(["Quarterly results", "Merton distance-to-default", "Share price vs sector", "Sector ranking"])
+            with et[0]:
+                qt = ew.quarterly_table(q_ec.get("is"))
+                if qt.empty:
+                    st.info("Yahoo has no quarterly results for this company.")
+                else:
+                    xq = [f"{d:%b-%y}" for d in qt.index]
+                    qf = go.Figure()
+                    qf.add_bar(x=xq, y=qt["Revenue"], name="Revenue (Rs cr)", marker_color=C1 if ec is A else C2,
+                               text=["" if pd.isna(v) else f"{v:+.0%} YoY" for v in qt["Revenue YoY"]], textposition="outside")
+                    qf.add_scatter(x=xq, y=qt["EBITDA margin"], name="EBITDA margin", yaxis="y2", mode="lines+markers",
+                                   line=dict(color=AMBER, width=2.5))
+                    qf.update_layout(height=340, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10),
+                                     yaxis=dict(title="Revenue (Rs cr)"), legend=dict(orientation="h", y=-0.2),
+                                     yaxis2=dict(title="EBITDA margin", overlaying="y", side="right", tickformat=".0%", showgrid=False))
+                    st.plotly_chart(qf, width="stretch", key="ew-q")
+                    show_q = qt.copy()
+                    show_q.index = xq
+                    st.dataframe(show_q.T.style.format(lambda v: "n/a" if pd.isna(v) else f"{v:,.2f}"), width="stretch")
+                    st.caption("Year-on-year compares each quarter with the same quarter a year earlier, so seasonality cancels out. "
                            "Yahoo gives about five to seven quarters; gaps mean Yahoo did not publish that quarter.")
 
-        with et[1]:
-            if mert is None:
-                st.info("Not enough market data (market cap or share-price history) for the Merton model.")
-            elif mert["no_debt"]:
-                st.success(f"{ec.name} has no debt, so there is no default point: distance-to-default is effectively infinite.")
-            else:
-                m1 = st.columns(5)
-                m1[0].metric("Equity value (market cap)", f"Rs {money(mert['E'])} cr")
-                m1[1].metric("Equity volatility", f"{mert['sigma_E']:.0%}", help="Annualised from one year of daily share-price moves.")
-                m1[2].metric("Default point", f"Rs {money(mert['D'])} cr", help=f"Short-term debt + half of long-term debt, from the {D_src}.")
-                m1[3].metric("Distance-to-default", f"{mert['DD']:.2f}", help="Standard deviations of asset value between today and the default point.")
-                m1[4].metric("Probability of default (1y)", fpd(mert["PD"]), help="N(−DD)")
-                st.markdown(f"Solved: asset value **Rs {money(mert['V'])} cr**, asset volatility **{mert['sigma_V']:.1%}**. "
+            with et[1]:
+                if mert is None:
+                    st.info("Not enough market data (market cap or share-price history) for the Merton model.")
+                elif mert["no_debt"]:
+                    st.success(f"{ec.name} has no debt, so there is no default point: distance-to-default is effectively infinite.")
+                else:
+                    m1 = st.columns(5)
+                    m1[0].metric("Equity value (market cap)", f"Rs {money(mert['E'])} cr")
+                    m1[1].metric("Equity volatility", f"{mert['sigma_E']:.0%}", help="Annualised from one year of daily share-price moves.")
+                    m1[2].metric("Default point", f"Rs {money(mert['D'])} cr", help=f"Short-term debt + half of long-term debt, from the {D_src}.")
+                    m1[3].metric("Distance-to-default", f"{mert['DD']:.2f}", help="Standard deviations of asset value between today and the default point.")
+                    m1[4].metric("Probability of default (1y)", fpd(mert["PD"]), help="N(−DD)")
+                    st.markdown(f"Solved: asset value **Rs {money(mert['V'])} cr**, asset volatility **{mert['sigma_V']:.1%}**. "
                             f"DD = [ln(V ÷ D) + (r − ½σ²ᵥ)] ÷ σᵥ = [ln({mert['V']:,.0f} ÷ {mert['D']:,.0f}) + ({rf:.3f} − ½ × {mert['sigma_V']:.3f}²)] "
                             f"÷ {mert['sigma_V']:.3f} = **{mert['DD']:.2f}**")
-                if len(hist):
-                    hf = go.Figure()
-                    top = max(float(hist["DD"].max()) * 1.1, 4)
-                    hf.add_hrect(y0=0, y1=1.645, fillcolor=RED, opacity=0.10, line_width=0)
-                    hf.add_hrect(y0=1.645, y1=2.326, fillcolor=AMBER, opacity=0.10, line_width=0)
-                    hf.add_scatter(x=hist.index, y=hist["DD"], mode="lines+markers", line=dict(color=C1 if ec is A else C2, width=2.6),
-                                   customdata=[fpd(v) for v in hist["PD"]], hovertemplate="%{x|%b-%y}: DD %{y:.2f}, PD %{customdata}<extra></extra>")
-                    hf.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                                     yaxis=dict(title="Distance-to-default", range=[0, top]))
-                    st.plotly_chart(hf, width="stretch", key="ew-dd")
-                    st.caption("Monthly over the last year (debt held at today's level). Red zone: DD below 1.645 = PD above 5%; "
+                    if len(hist):
+                        hf = go.Figure()
+                        top = max(float(hist["DD"].max()) * 1.1, 4)
+                        hf.add_hrect(y0=0, y1=1.645, fillcolor=RED, opacity=0.10, line_width=0)
+                        hf.add_hrect(y0=1.645, y1=2.326, fillcolor=AMBER, opacity=0.10, line_width=0)
+                        hf.add_scatter(x=hist.index, y=hist["DD"], mode="lines+markers", line=dict(color=C1 if ec is A else C2, width=2.6),
+                                       customdata=[fpd(v) for v in hist["PD"]], hovertemplate="%{x|%b-%y}: DD %{y:.2f}, PD %{customdata}<extra></extra>")
+                        hf.update_layout(height=300, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                         yaxis=dict(title="Distance-to-default", range=[0, top]))
+                        st.plotly_chart(hf, width="stretch", key="ew-dd")
+                        st.caption("Monthly over the last year (debt held at today's level). Red zone: DD below 1.645 = PD above 5%; "
                                "amber: DD below 2.326 = PD above 1%.")
-                with st.expander("How the Merton model works"):
-                    st.markdown("""
+                    with st.expander("How the Merton model works"):
+                        st.markdown("""
 Equity holders own the firm's assets but must repay debt **D** at the horizon, so equity is a **call option** on the assets
 **V**: E = V·N(d₁) − D·e^(−rT)·N(d₂). Together with σₑ·E = N(d₁)·σᵥ·V, the two observable numbers (market cap E and its volatility σₑ)
 pin down the two unobservable ones (V and σᵥ). **Distance-to-default** is how many standard deviations V sits above the default
@@ -1068,802 +1157,792 @@ point; the model's probability of default is N(−DD). Following KMV, the defaul
 debt. The model reacts to share-price moves within days, which is why it is an early-warning tool - but it is risk-neutral and
 assumes log-normal assets, so read the level loosely and the **trend** carefully.""")
 
-        with et[2]:
-            if px_all.empty or ec.ticker not in px_all.columns:
-                st.info("No share-price history from Yahoo.")
-            else:
-                rb = px_all.ffill().iloc[-ew.TRADING_DAYS * 2:]
-                rb = rb / rb.bfill().iloc[0]
-                pf = go.Figure()
-                lo_, hi_ = rb.quantile(0.25, axis=1), rb.quantile(0.75, axis=1)
-                pf.add_scatter(x=rb.index, y=hi_, line=dict(width=0), showlegend=False, hoverinfo="skip")
-                pf.add_scatter(x=rb.index, y=lo_, fill="tonexty", fillcolor="rgba(139,148,158,.18)", line=dict(width=0),
-                               name="Sector middle 50%", hoverinfo="skip")
-                pf.add_scatter(x=rb.index, y=rb.median(axis=1), name="Sector median", line=dict(color=CB, dash="dash"))
-                for comp_, col_ in ((A, C1), (B, C2)):
-                    if comp_ is not None and comp_.ticker in rb:
-                        pf.add_scatter(x=rb.index, y=rb[comp_.ticker], name=comp_.name, line=dict(color=col_, width=2.6))
-                pf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                                 yaxis=dict(title="Growth of Rs 1 (2 years)", tickformat=".2f"), legend=dict(orientation="h", y=-0.2))
-                st.plotly_chart(pf, width="stretch", key="ew-px")
-                if mk_ec:
-                    mm = st.columns(4)
-                    mm[0].metric("1-year return", f"{mk_ec['ret_1y']:+.1%}")
-                    mm[1].metric("From 52-week high", f"{mk_ec['off_high']:+.1%}")
-                    mm[2].metric("Volatility (annual)", f"{mk_ec['vol']:.0%}")
-                    mm[3].metric("Worst fall in the year", f"{mk_ec['max_dd']:.1%}")
+            with et[2]:
+                if px_all.empty or ec.ticker not in px_all.columns:
+                    st.info("No share-price history from Yahoo.")
+                else:
+                    rb = px_all.ffill().iloc[-ew.TRADING_DAYS * 2:]
+                    rb = rb / rb.bfill().iloc[0]
+                    pf = go.Figure()
+                    lo_, hi_ = rb.quantile(0.25, axis=1), rb.quantile(0.75, axis=1)
+                    pf.add_scatter(x=rb.index, y=hi_, line=dict(width=0), showlegend=False, hoverinfo="skip")
+                    pf.add_scatter(x=rb.index, y=lo_, fill="tonexty", fillcolor="rgba(139,148,158,.18)", line=dict(width=0),
+                                   name="Sector middle 50%", hoverinfo="skip")
+                    pf.add_scatter(x=rb.index, y=rb.median(axis=1), name="Sector median", line=dict(color=CB, dash="dash"))
+                    for comp_, col_ in ((A, C1), (B, C2)):
+                        if comp_ is not None and comp_.ticker in rb:
+                            pf.add_scatter(x=rb.index, y=rb[comp_.ticker], name=comp_.name, line=dict(color=col_, width=2.6))
+                    pf.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                     yaxis=dict(title="Growth of Rs 1 (2 years)", tickformat=".2f"), legend=dict(orientation="h", y=-0.2))
+                    st.plotly_chart(pf, width="stretch", key="ew-px")
+                    if mk_ec:
+                        mm = st.columns(4)
+                        mm[0].metric("1-year return", f"{mk_ec['ret_1y']:+.1%}")
+                        mm[1].metric("From 52-week high", f"{mk_ec['off_high']:+.1%}")
+                        mm[2].metric("Volatility (annual)", f"{mk_ec['vol']:.0%}")
+                        mm[3].metric("Worst fall in the year", f"{mk_ec['max_dd']:.1%}")
 
-        with et[3]:
-            rows_ = []
-            for t, comp_ in companies.items():
-                mk_ = mkt_all.get(t)
-                if not mk_:
-                    continue
-                d_, _ = dp_for(comp_)
-                r_ = ew.merton(comp_.mcap_cr, mk_["vol"], d_, rf)
-                if r_:
-                    rows_.append((comp_.name, r_["DD"], r_["PD"], r_["no_debt"]))
-            if len(rows_) < 3:
-                st.info("Too few companies have market data for a sector comparison.")
-            else:
-                debt_rows = sorted([r for r in rows_ if not r[3]], key=lambda r: r[1])
-                cap = 15.0
-                HLc = {A.name: C1, **({B.name: C2} if B is not None else {})}
-                rf_ = go.Figure(go.Bar(x=[min(r[1], cap) for r in debt_rows], y=[r[0] for r in debt_rows], orientation="h",
-                                       marker_color=[HLc.get(r[0], RED if r[1] < 1.645 else AMBER if r[1] < 2.326 else "rgba(139,148,158,.5)")
-                                                     for r in debt_rows],
-                                       customdata=[[f"{r[1]:.2f}", fpd(r[2])] for r in debt_rows],
-                                       hovertemplate="%{y}: DD %{customdata[0]}, PD %{customdata[1]}<extra></extra>"))
-                rf_.add_vline(x=1.645, line_color=RED, line_dash="dot")
-                rf_.add_vline(x=2.326, line_color=AMBER, line_dash="dot")
-                rf_.update_layout(height=max(320, 22 * len(debt_rows)), template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                                  xaxis=dict(title=f"Distance-to-default (capped at {cap:g} for display)"), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(rf_, width="stretch", key="ew-rank")
-                nd_ = [r[0] for r in rows_ if r[3]]
-                st.caption("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
-                           + (f" No debt (not shown): {', '.join(nd_)}." if nd_ else ""))
+            with et[3]:
+                rows_ = []
+                for t, comp_ in companies.items():
+                    mk_ = mkt_all.get(t)
+                    if not mk_:
+                        continue
+                    d_, _ = dp_for(comp_)
+                    r_ = ew.merton(comp_.mcap_cr, mk_["vol"], d_, rf)
+                    if r_:
+                        rows_.append((comp_.name, r_["DD"], r_["PD"], r_["no_debt"]))
+                if len(rows_) < 3:
+                    st.info("Too few companies have market data for a sector comparison.")
+                else:
+                    debt_rows = sorted([r for r in rows_ if not r[3]], key=lambda r: r[1])
+                    cap = 15.0
+                    HLc = {A.name: C1, **({B.name: C2} if B is not None else {})}
+                    rf_ = go.Figure(go.Bar(x=[min(r[1], cap) for r in debt_rows], y=[r[0] for r in debt_rows], orientation="h",
+                                           marker_color=[HLc.get(r[0], RED if r[1] < 1.645 else AMBER if r[1] < 2.326 else "rgba(139,148,158,.5)")
+                                                         for r in debt_rows],
+                                           customdata=[[f"{r[1]:.2f}", fpd(r[2])] for r in debt_rows],
+                                           hovertemplate="%{y}: DD %{customdata[0]}, PD %{customdata[1]}<extra></extra>"))
+                    rf_.add_vline(x=1.645, line_color=RED, line_dash="dot")
+                    rf_.add_vline(x=2.326, line_color=AMBER, line_dash="dot")
+                    rf_.update_layout(height=max(320, 22 * len(debt_rows)), template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                      xaxis=dict(title=f"Distance-to-default (capped at {cap:g} for display)"), yaxis=dict(autorange="reversed"))
+                    st.plotly_chart(rf_, width="stretch", key="ew-rank")
+                    nd_ = [r[0] for r in rows_ if r[3]]
+                    st.caption("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
+                               + (f" No debt (not shown): {', '.join(nd_)}." if nd_ else ""))
 
 # ------------------------------------------------------------------ News & ratings
-with tabs[6]:
-    st.markdown(f"### News & credit ratings {ADV}", unsafe_allow_html=True)
-    st.caption("Headlines from the last 12 months (Google News and Yahoo Finance) that name the company, screened for credit events, "
+if tabs[6] is not None:
+    with tabs[6]:
+        st.markdown(f"### News & credit ratings {ADV}", unsafe_allow_html=True)
+        st.caption("Headlines from the last 12 months (Google News and Yahoo Finance) that name the company, screened for credit events, "
                "plus the latest rating-agency actions set against this dashboard's grade. Headlines only - full articles are often paywalled.")
-    nc = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="nw-co")]
-    with st.spinner("Fetching headlines…"):
-        nres = nw.get_news(nc.name, nc.ticker)
-    items = nres["items"]
-    if nres["errors"]:
-        st.caption("Some news sources did not respond: " + ", ".join(nres["errors"]) + ". Use *Reload data* to try again.")
-    ns = nw.news_signal(items)
-    NS_TXT = {"R": ("CONCERN", RED), "A": ("WATCH", AMBER), "G": ("CLEAR", GREEN), None: ("NO HEADLINES", "#8b949e")}[ns["status"]]
-    st.markdown(f"<div class='banner' style='--c:{NS_TXT[1]}'><div class='who' style='color:{C1 if nc is A else C2}'>● {esc(nc.name)}</div>"
+        nc = MON_CO
+        with st.spinner("Fetching headlines…"):
+            nres = nw.get_news(nc.name, nc.ticker)
+        items = nres["items"]
+        if nres["errors"]:
+            st.caption("Some news sources did not respond: " + ", ".join(nres["errors"]) + ". Use *Reload data* to try again.")
+        ns = nw.news_signal(items)
+        NS_TXT = {"R": ("CONCERN", RED), "A": ("WATCH", AMBER), "G": ("CLEAR", GREEN), None: ("NO HEADLINES", "#8b949e")}[ns["status"]]
+        st.markdown(f"<div class='banner' style='--c:{NS_TXT[1]}'><div class='who' style='color:{C1 if nc is A else C2}'>● {esc(nc.name)}</div>"
                 f"<div class='sig'>{NS_TXT[0]}</div><div>News flow (keyword screen) · {len(items)} headlines in 12 months · "
                 f"{ns['value']}</div></div>", unsafe_allow_html=True)
-    if ns["trigger"]:
-        st.caption(f"Driven by: “{ns['trigger']}”. This is the *News flow* signal in the Early warning tab.")
+        if ns["trigger"]:
+            st.caption(f"Driven by: “{ns['trigger']}”. This is the *News flow* signal in the Early warning tab.")
 
-    # ---- ratings
-    st.markdown("#### Credit ratings: agencies vs this model")
+        # ---- ratings
+        st.markdown("#### Credit ratings: agencies vs this model")
 
-    def model_grade(t):
-        """Grade from the quantitative score on textbook cut-offs (no early-warning or analyst notches)."""
-        mt.set_basis("Textbook")
-        s_ = mt.overall_score(mt.pillar_scores(latest_all[t], companies[t].gov), W)
-        mt.set_basis(basis_sel, SECTOR_VALS)
-        return rp.grade_index(s_), s_
+        model_grade = textbook_grade
 
-    def gap_words(gap):
-        if gap is None:
-            return "–"
-        return "same grade" if gap == 0 else f"model {abs(gap)} grade{'s' * (abs(gap) > 1)} {'lower' if gap > 0 else 'higher'}"
+        def gap_words(gap):
+            if gap is None:
+                return "–"
+            return "same grade" if gap == 0 else f"model {abs(gap)} grade{'s' * (abs(gap) > 1)} {'lower' if gap > 0 else 'higher'}"
 
-    gi, gsc = model_grade(nc.ticker)
-    r1, r2 = st.columns([1, 3])
-    with r1:
-        if gi is None:
-            st.metric("Model grade", "n/a")
-        else:
-            st.metric("Model grade (score only)", rp.grade_info(gi)["label"], f"score {gsc:.0f}/100", delta_color="off",
-                      help="Quantitative score on textbook cut-offs mapped to CR1-CR9, before early-warning and analyst notches - "
+        gi, gsc = model_grade(nc.ticker)
+        r1, r2 = st.columns([1, 3])
+        with r1:
+            if gi is None:
+                st.metric("Model grade", "n/a")
+            else:
+                st.metric("Model grade (score only)", rp.grade_info(gi)["label"], f"score {gsc:.0f}/100", delta_color="off",
+                          help="Quantitative score on textbook cut-offs mapped to CR1-CR9, before early-warning and analyst notches - "
                            "the same base grade as the Credit memo.")
-        with st.popover("Enter a rating you looked up", width="stretch"):
-            st.caption("From the agency's website or the company's annual report. Kept for this session only.")
-            m_ag = st.selectbox("Agency", ["CRISIL", "ICRA", "CARE", "India Ratings", "Acuite", "Brickwork"], key=f"nw-man-ag-{nc.ticker}")
-            m_rt = st.selectbox("Long-term rating", ["–", "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB",
-                                                     "BB-", "B+", "B", "B-", "C", "D"], key=f"nw-man-rt-{nc.ticker}")
-            m_ol = st.selectbox("Outlook", ["Stable", "Positive", "Negative", "Developing", "Watch"], key=f"nw-man-ol-{nc.ticker}")
-    rats = nw.latest_ratings(items)
-    if m_rt != "–":
-        rats = [dict(agency=m_ag, rating=m_rt, outlook=m_ol, action="Entered by analyst", scale="national",
-                     date=datetime.now(timezone.utc), title="Entered manually", url="", source="")] + \
-               [r_ for r_ in rats if r_["agency"] != m_ag]
-    with r2:
-        if not rats:
-            st.info("No rating action named this company in the last 12 months of headlines. Agencies publish every rating on their "
+            with st.popover("Enter a rating you looked up", width="stretch"):
+                st.caption("From the agency's website or the company's annual report. Kept for this session only.")
+                m_ag = st.selectbox("Agency", ["CRISIL", "ICRA", "CARE", "India Ratings", "Acuite", "Brickwork"], key=f"nw-man-ag-{nc.ticker}")
+                m_rt = st.selectbox("Long-term rating", ["–", "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB",
+                                                         "BB-", "B+", "B", "B-", "C", "D"], key=f"nw-man-rt-{nc.ticker}")
+                m_ol = st.selectbox("Outlook", ["Stable", "Positive", "Negative", "Developing", "Watch"], key=f"nw-man-ol-{nc.ticker}")
+        rats = agency_ratings(nc, items)
+        with r2:
+            if not rats:
+                st.info("No rating action named this company in the last 12 months of headlines. Agencies publish every rating on their "
                     "own sites (CRISIL, ICRA, CARE, India Ratings) - check there before relying on the model grade alone.")
-        else:
-            rrows = []
-            for r_ in rats:
-                ai_ = nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None
-                gap = (gi - ai_) if (gi is not None and ai_ is not None) else None
-                rrows.append({"Agency": r_["agency"], "Scale": r_["scale"].title(), "Rating": r_["rating"] or "–",
-                              "Outlook": r_["outlook"] or "–", "Action": r_["action"] or "–", "Date": f"{r_['date']:%d %b %Y}",
-                              "≈ CR grade": rp.GRADES[ai_][1] if ai_ is not None else "–", "Gap": gap_words(gap),
-                              "Headline": r_["title"], "Link": r_["url"] or None})
-            st.dataframe(pd.DataFrame(rrows), hide_index=True, width="stretch",
-                         column_config={"Link": st.column_config.LinkColumn(display_text="open"),
-                                        "Headline": st.column_config.TextColumn(width="large")})
-    nat = [r_ for r_ in rats if r_["scale"] == "national" and nw.grade_index_of(r_["rating"]) is not None]
-    if nat and gi is not None:
-        r_ = nat[0]
-        gap = gi - nw.grade_index_of(r_["rating"])
-        if abs(gap) <= 1:
-            st.success(f"The model broadly agrees with {r_['agency']} ({r_['rating']}): {gap_words(gap)}.")
-        elif gap > 0:
-            st.warning(f"The model is {gap} grades below {r_['agency']} ({r_['rating']}). Agencies also weigh what the statements do not show: "
+            else:
+                rrows = []
+                for r_ in rats:
+                    ai_ = nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None
+                    gap = (gi - ai_) if (gi is not None and ai_ is not None) else None
+                    rrows.append({"Agency": r_["agency"], "Scale": r_["scale"].title(), "Rating": r_["rating"] or "–",
+                                  "Outlook": r_["outlook"] or "–", "Action": r_["action"] or "–", "Date": f"{r_['date']:%d %b %Y}",
+                                  "≈ CR grade": rp.GRADES[ai_][1] if ai_ is not None else "–", "Gap": gap_words(gap),
+                                  "Headline": r_["title"], "Link": r_["url"] or None})
+                st.dataframe(pd.DataFrame(rrows), hide_index=True, width="stretch",
+                             column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                            "Headline": st.column_config.TextColumn(width="large")})
+        nat = [r_ for r_ in rats if r_["scale"] == "national" and nw.grade_index_of(r_["rating"]) is not None]
+        if nat and gi is not None:
+            r_ = nat[0]
+            gap = gi - nw.grade_index_of(r_["rating"])
+            if abs(gap) <= 1:
+                st.success(f"The model broadly agrees with {r_['agency']} ({r_['rating']}): {gap_words(gap)}.")
+            elif gap > 0:
+                st.warning(f"The model is {gap} grades below {r_['agency']} ({r_['rating']}). Agencies also weigh what the statements do not show: "
                        "market position, parent or state support, regulated returns and access to funding. Textbook cut-offs are also harsh "
                        "on capital-heavy sectors. Read the agency's rationale before treating the gap as a red flag.")
-        else:
-            st.error(f"The model is {-gap} grades above {r_['agency']} ({r_['rating']}). The agency may be seeing risks the ratios miss - "
+            else:
+                st.error(f"The model is {-gap} grades above {r_['agency']} ({r_['rating']}). The agency may be seeing risks the ratios miss - "
                      "contingent liabilities, group exposure, refinancing walls or governance. Read its rationale before relying on the model.")
-    if rats:
-        st.caption("Ratings are read from headlines, so check the entity named (group companies share names) and the date. "
+        if rats:
+            st.caption("Ratings are read from headlines, so check the entity named (group companies share names) and the date. "
                    "Moody's, Fitch and S&P use a global scale capped near India's sovereign rating (BBB- / Baa3), so they are shown but "
                    "not compared with the national-scale CR grade.")
-    if not EW_LATEST:
-        st.caption("The model grade above uses the as-of year chosen in View options; ratings and headlines are always current.")
+        if not EW_LATEST:
+            st.caption("The model grade above uses the as-of year chosen in View options; ratings and headlines are always current.")
 
-    with st.expander(f"Model vs agencies across the {sector} sector"):
-        st.caption("Searches rating-agency headlines for every company in the sector (one search each, cached 6 hours) and lines up the "
+        with st.expander(f"Model vs agencies across the {sector} sector"):
+            st.caption("Searches rating-agency headlines for every company in the sector (one search each, cached 6 hours) and lines up the "
                    "latest national-scale rating against the model grade. A real-world check on how far the model can be trusted.")
-        skey = f"nw-sector-{sector}-{asof_y}"
-        if st.button("Run the sector check", key="nw-sector-btn"):
-            def one(t):
-                r_ = nw.get_news(companies[t].name, t, sources=("Rating agencies",))
-                return t, [x for x in nw.latest_ratings(r_["items"]) if x["scale"] == "national" and nw.grade_index_of(x["rating"]) is not None]
-            from concurrent.futures import ThreadPoolExecutor
-            with st.spinner(f"Searching rating news for {len(companies)} companies…"), ThreadPoolExecutor(8) as ex_:
-                st.session_state[skey] = dict(ex_.map(one, list(companies)))
-        found = st.session_state.get(skey)
-        if found is not None:
-            srows = []
-            for t, lst in found.items():
-                g_, s_ = model_grade(t)
-                if not lst or g_ is None:
-                    continue
-                r_ = lst[0]
-                ag_i = nw.grade_index_of(r_["rating"])
-                srows.append({"Company": companies[t].name, "Model": rp.GRADES[g_][1], "Score": round(s_),
-                              "Agency": f"{r_['agency']} {r_['rating']}", "≈ CR grade": rp.GRADES[ag_i][1], "gap": g_ - ag_i,
-                              "Gap": gap_words(g_ - ag_i), "Date": f"{r_['date']:%b %Y}", "_m": g_, "_a": ag_i})
-            if not srows:
-                st.info("No national-scale ratings found in headlines for this sector.")
-            else:
-                sdf_ = pd.DataFrame(srows).sort_values("gap", key=abs, ascending=False)
-                within = (sdf_["gap"].abs() <= 1).mean()
-                k1, k2, k3 = st.columns(3)
-                k1.metric("Companies with a rating found", f"{len(sdf_)} of {len(companies)}")
-                k2.metric("Within one grade", f"{within:.0%}")
-                k3.metric("Average gap", f"{sdf_['gap'].mean():+.1f} grades",
-                          help="Positive = the model is harsher than the agencies on average.")
-                jit = np.linspace(-0.18, 0.18, len(sdf_))
-                fig_ = go.Figure()
-                fig_.add_trace(go.Scatter(x=[0, 8], y=[0, 8], mode="lines", line=dict(color="#8b949e", dash="dot"), hoverinfo="skip",
-                                          name="agreement"))
-                fig_.add_trace(go.Scatter(x=sdf_["_a"] + jit, y=sdf_["_m"] - jit, mode="markers", name="company",
-                                          marker=dict(size=11, color=[C1 if n_ == A.name else (C2 if B is not None and n_ == B.name else "#57606a")
-                                                                      for n_ in sdf_["Company"]]),
-                                          text=sdf_["Company"] + " · " + sdf_["Agency"] + " · model " + sdf_["Model"],
-                                          hovertemplate="%{text}<extra></extra>"))
-                ticks = dict(tickmode="array", tickvals=list(range(9)), ticktext=[f"{g[1]}<br>≈{g[2]}" for g in rp.GRADES])
-                fig_.update_layout(height=420, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
-                                   xaxis=dict(title="Agency rating (mapped)", range=[-0.5, 8.5], **ticks),
-                                   yaxis=dict(title="Model grade", range=[8.5, -0.5], **ticks))
-                st.plotly_chart(fig_, width="stretch", key="nw-sector-fig")
-                st.caption("Dots on the dotted line agree; below it the model is harsher than the agency, above it more lenient.")
-                st.dataframe(sdf_.drop(columns=["gap", "_m", "_a"]), hide_index=True, width="stretch")
+            skey = f"nw-sector-{sector}-{asof_y}"
+            if st.button("Run the sector check", key="nw-sector-btn"):
+                def one(t):
+                    r_ = nw.get_news(companies[t].name, t, sources=("Rating agencies",))
+                    return t, [x for x in nw.latest_ratings(r_["items"]) if x["scale"] == "national" and nw.grade_index_of(x["rating"]) is not None]
+                from concurrent.futures import ThreadPoolExecutor
+                with st.spinner(f"Searching rating news for {len(companies)} companies…"), ThreadPoolExecutor(8) as ex_:
+                    st.session_state[skey] = dict(ex_.map(one, list(companies)))
+            found = st.session_state.get(skey)
+            if found is not None:
+                srows = []
+                for t, lst in found.items():
+                    g_, s_ = model_grade(t)
+                    if not lst or g_ is None:
+                        continue
+                    r_ = lst[0]
+                    ag_i = nw.grade_index_of(r_["rating"])
+                    srows.append({"Company": companies[t].name, "Model": rp.GRADES[g_][1], "Score": round(s_),
+                                  "Agency": f"{r_['agency']} {r_['rating']}", "≈ CR grade": rp.GRADES[ag_i][1], "gap": g_ - ag_i,
+                                  "Gap": gap_words(g_ - ag_i), "Date": f"{r_['date']:%b %Y}", "_m": g_, "_a": ag_i})
+                if not srows:
+                    st.info("No national-scale ratings found in headlines for this sector.")
+                else:
+                    sdf_ = pd.DataFrame(srows).sort_values("gap", key=abs, ascending=False)
+                    within = (sdf_["gap"].abs() <= 1).mean()
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("Companies with a rating found", f"{len(sdf_)} of {len(companies)}")
+                    k2.metric("Within one grade", f"{within:.0%}")
+                    k3.metric("Average gap", f"{sdf_['gap'].mean():+.1f} grades",
+                              help="Positive = the model is harsher than the agencies on average.")
+                    jit = np.linspace(-0.18, 0.18, len(sdf_))
+                    fig_ = go.Figure()
+                    fig_.add_trace(go.Scatter(x=[0, 8], y=[0, 8], mode="lines", line=dict(color="#8b949e", dash="dot"), hoverinfo="skip",
+                                              name="agreement"))
+                    fig_.add_trace(go.Scatter(x=sdf_["_a"] + jit, y=sdf_["_m"] - jit, mode="markers", name="company",
+                                              marker=dict(size=11, color=[C1 if n_ == A.name else (C2 if B is not None and n_ == B.name else "#57606a")
+                                                                          for n_ in sdf_["Company"]]),
+                                              text=sdf_["Company"] + " · " + sdf_["Agency"] + " · model " + sdf_["Model"],
+                                              hovertemplate="%{text}<extra></extra>"))
+                    ticks = dict(tickmode="array", tickvals=list(range(9)), ticktext=[f"{g[1]}<br>≈{g[2]}" for g in rp.GRADES])
+                    fig_.update_layout(height=420, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
+                                       xaxis=dict(title="Agency rating (mapped)", range=[-0.5, 8.5], **ticks),
+                                       yaxis=dict(title="Model grade", range=[8.5, -0.5], **ticks))
+                    st.plotly_chart(fig_, width="stretch", key="nw-sector-fig")
+                    st.caption("Dots on the dotted line agree; below it the model is harsher than the agency, above it more lenient.")
+                    st.dataframe(sdf_.drop(columns=["gap", "_m", "_a"]), hide_index=True, width="stretch")
 
-    # ---- AI
-    st.markdown("#### AI read of the headlines")
-    ai_key = f"nw-ai-{nc.ticker}"
-    sent = nw.ai_input(items)
-    if not nw.api_key():
-        st.info("Optional: add an Anthropic API key to have Claude read these headlines, judge each one for lenders, pick out rating "
+        # ---- AI
+        st.markdown("#### AI read of the headlines")
+        ai_key = f"nw-ai-{nc.ticker}"
+        sent = nw.ai_input(items)
+        if not nw.api_key():
+            st.info("Optional: add an Anthropic API key to have Claude read these headlines, judge each one for lenders, pick out rating "
                 "actions and write a short digest with follow-up questions.  \n"
                 "**Streamlit Cloud:** app menu → Settings → Secrets → `ANTHROPIC_API_KEY = \"sk-ant-...\"`.  \n"
                 "**Locally:** `.streamlit/secrets.toml` with the same line (that file is git-ignored). "
                 "Everything else on this tab works without it.")
-    elif not sent:
-        st.caption("No credit-relevant headlines to analyse.")
-    else:
-        a1, a2 = st.columns([1, 3])
-        if a1.button(f"Analyse {len(sent)} headlines with AI", key=f"nw-ai-btn-{nc.ticker}", type="primary"):
-            with st.spinner(f"{nw.AI_MODEL} is reading the headlines…"):
-                try:
-                    st.session_state[ai_key] = (nw.ai_analyse(nc.name, sector, sent), [it["title"] for it in sent])
-                except RuntimeError as e:
-                    st.error(str(e))
-        a2.caption("One request per click, cached 6 hours. Share-price chatter is left out. The AI sees only headlines and short snippets, "
+        elif not sent:
+            st.caption("No credit-relevant headlines to analyse.")
+        else:
+            a1, a2 = st.columns([1, 3])
+            if a1.button(f"Analyse {len(sent)} headlines with AI", key=f"nw-ai-btn-{nc.ticker}", type="primary"):
+                with st.spinner(f"{nw.AI_MODEL} is reading the headlines…"):
+                    try:
+                        st.session_state[ai_key] = (nw.ai_analyse(nc.name, sector, sent), [it["title"] for it in sent])
+                    except RuntimeError as e:
+                        st.error(str(e))
+            a2.caption("One request per click, cached 6 hours. Share-price chatter is left out. The AI sees only headlines and short snippets, "
                    "can misread them, and does not change the grade or the early-warning signal - treat it as a reading aid.")
-    ai_res = st.session_state.get(ai_key)
-    ai_map = {}
-    if ai_res:
-        ai, sent_titles = ai_res
-        sent_items = [next((it for it in items if it["title"] == t_), {"title": t_, "url": ""}) for t_ in sent_titles]
-        ai_map = nw.ai_by_title(sent_items, ai)
-        RISK_COL = {"Low": GREEN, "Moderate": AMBER, "High": RED}
-        st.markdown(f"<div class='banner' style='--c:{RISK_COL.get(ai['news_risk'], '#8b949e')}'><div class='who'>AI view</div>"
+        ai_res = st.session_state.get(ai_key)
+        ai_map = {}
+        if ai_res:
+            ai, sent_titles = ai_res
+            sent_items = [next((it for it in items if it["title"] == t_), {"title": t_, "url": ""}) for t_ in sent_titles]
+            ai_map = nw.ai_by_title(sent_items, ai)
+            RISK_COL = {"Low": GREEN, "Moderate": AMBER, "High": RED}
+            st.markdown(f"<div class='banner' style='--c:{RISK_COL.get(ai['news_risk'], '#8b949e')}'><div class='who'>AI view</div>"
                     f"<div class='sig'>{ai['news_risk'].upper()} NEWS RISK</div><div>{len(ai_map)} headlines read</div></div>",
-                    unsafe_allow_html=True)
-        st.markdown(ai["digest"])
-        if ai.get("watch_points"):
-            st.markdown("**Questions for management**  \n" + "\n".join(f"- {w}" for w in ai["watch_points"]))
-        if ai.get("ratings"):
-            st.markdown("**Rating actions the AI found**")
-            st.dataframe(pd.DataFrame([{"Agency": r_["agency"], "Rating": r_["rating"] or "–", "Outlook": r_["outlook"] or "–",
-                                        "Action": r_["action"] or "–",
-                                        "Headline": sent_items[r_["id"]]["title"] if 0 <= r_["id"] < len(sent_items) else ""}
-                                       for r_ in ai["ratings"]]), hide_index=True, width="stretch")
-        dis = sum(1 for it in items if it["title"] in ai_map and ai_map[it["title"]]["relevant"] and ai_map[it["title"]]["tone"] != it["tone"])
-        irr = sum(1 for x in ai_map.values() if not x["relevant"])
-        with st.expander("Headlines the digest cites"):
-            for i_, it in enumerate(sent_items):
-                st.markdown(f"[{i_}] [{esc(it['title'])}]({it.get('url', '')})")
-        st.caption(f"The AI disagrees with the keyword screen on the tone of {dis} headline(s) and judged {irr} not really about "
+                        unsafe_allow_html=True)
+            st.markdown(ai["digest"])
+            if ai.get("watch_points"):
+                st.markdown("**Questions for management**  \n" + "\n".join(f"- {w}" for w in ai["watch_points"]))
+            if ai.get("ratings"):
+                st.markdown("**Rating actions the AI found**")
+                st.dataframe(pd.DataFrame([{"Agency": r_["agency"], "Rating": r_["rating"] or "–", "Outlook": r_["outlook"] or "–",
+                                            "Action": r_["action"] or "–",
+                                            "Headline": sent_items[r_["id"]]["title"] if 0 <= r_["id"] < len(sent_items) else ""}
+                                           for r_ in ai["ratings"]]), hide_index=True, width="stretch")
+            dis = sum(1 for it in items if it["title"] in ai_map and ai_map[it["title"]]["relevant"] and ai_map[it["title"]]["tone"] != it["tone"])
+            irr = sum(1 for x in ai_map.values() if not x["relevant"])
+            with st.expander("Headlines the digest cites"):
+                for i_, it in enumerate(sent_items):
+                    st.markdown(f"[{i_}] [{esc(it['title'])}]({it.get('url', '')})")
+            st.caption(f"The AI disagrees with the keyword screen on the tone of {dis} headline(s) and judged {irr} not really about "
                    f"{nc.name}. Model {ai.get('model')}, {ai['usage']['in']:,} input / {ai['usage']['out']:,} output tokens.")
 
-    # ---- headlines
-    st.markdown("#### Headlines")
-    if not items:
-        st.info("No headlines naming this company in the last 12 months.")
-    else:
-        f1, f2, f3 = st.columns([1, 2, 2])
-        hide_mkt = f1.toggle("Hide share-price chatter", True, key="nw-hide-mkt")
-        tones = f2.segmented_control("Tone", ["negative", "neutral", "positive"], selection_mode="multi",
-                                     default=["negative", "neutral", "positive"], key="nw-tone") or []
-        cats = f3.multiselect("Category", nw.CATEGORIES, key="nw-cat", placeholder="All categories")
-        view = [it for it in items if (not hide_mkt or it["category"] != "Market commentary") and it["tone"] in tones
-                and (not cats or it["category"] in cats)]
-        TONE_COL = {"negative": RED, "neutral": "#8b949e", "positive": GREEN}
-        mdf = pd.DataFrame([{"m": it["date"].strftime("%Y-%m"), "tone": it["tone"]} for it in view])
-        if not mdf.empty:
-            fig_ = go.Figure()
-            for tn in ("negative", "neutral", "positive"):
-                cnt = mdf[mdf["tone"] == tn].groupby("m").size()
-                fig_.add_trace(go.Bar(x=cnt.index, y=cnt.values, name=tn, marker_color=TONE_COL[tn]))
-            fig_.update_layout(barmode="stack", height=230, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                               legend=dict(orientation="h", y=-0.3), xaxis=dict(type="category"), yaxis_title="headlines")
-            st.plotly_chart(fig_, width="stretch", key="nw-timeline")
-        TONE_TXT = {"negative": "✕ negative", "neutral": "· neutral", "positive": "✓ positive"}
-        hrows = []
-        for it in view:
-            row = {"Date": it["date"].strftime("%d %b %Y"), "Headline": it["title"], "Source": it["source"] or it["via"],
-                   "Category": it["category"], "Tone": TONE_TXT[it["tone"]], "Severity": it["severity"]}
-            x = ai_map.get(it["title"])
-            if ai_map:
-                row["AI tone"] = ("not about company" if not x["relevant"] else TONE_TXT[x["tone"]]) if x else "–"
-                row["AI note"] = x["note"] if x else ""
-            row["Link"] = it["url"]
-            hrows.append(row)
-        hdf = pd.DataFrame(hrows)
-        tcss = lambda v: {"✕ negative": SIG_CSS["✕ Concern"], "✓ positive": SIG_CSS["✓ Healthy"]}.get(v, "")
-        st.dataframe(style_cells(hdf, tcss, [c for c in ("Tone", "AI tone") if c in hdf.columns]) if len(hdf) else hdf,
-                     hide_index=True, width="stretch", height=min(600, 38 + 35 * len(hdf)),
-                     column_config={"Link": st.column_config.LinkColumn(display_text="open"),
-                                    "Headline": st.column_config.TextColumn(width="large"),
-                                    "AI note": st.column_config.TextColumn(width="large")})
-        st.caption(f"{len(view)} of {len(items)} headlines shown. Tone and severity come from a transparent keyword screen "
+        # ---- headlines
+        st.markdown("#### Headlines")
+        if not items:
+            st.info("No headlines naming this company in the last 12 months.")
+        else:
+            f1, f2, f3 = st.columns([1, 2, 2])
+            hide_mkt = f1.toggle("Hide share-price chatter", True, key="nw-hide-mkt")
+            tones = f2.segmented_control("Tone", ["negative", "neutral", "positive"], selection_mode="multi",
+                                         default=["negative", "neutral", "positive"], key="nw-tone") or []
+            cats = f3.multiselect("Category", nw.CATEGORIES, key="nw-cat", placeholder="All categories")
+            view = [it for it in items if (not hide_mkt or it["category"] != "Market commentary") and it["tone"] in tones
+                    and (not cats or it["category"] in cats)]
+            TONE_COL = {"negative": RED, "neutral": "#8b949e", "positive": GREEN}
+            mdf = pd.DataFrame([{"m": it["date"].strftime("%Y-%m"), "tone": it["tone"]} for it in view])
+            if not mdf.empty:
+                fig_ = go.Figure()
+                for tn in ("negative", "neutral", "positive"):
+                    cnt = mdf[mdf["tone"] == tn].groupby("m").size()
+                    fig_.add_trace(go.Bar(x=cnt.index, y=cnt.values, name=tn, marker_color=TONE_COL[tn]))
+                fig_.update_layout(barmode="stack", height=230, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                                   legend=dict(orientation="h", y=-0.3), xaxis=dict(type="category"), yaxis_title="headlines")
+                st.plotly_chart(fig_, width="stretch", key="nw-timeline")
+            TONE_TXT = {"negative": "✕ negative", "neutral": "· neutral", "positive": "✓ positive"}
+            hrows = []
+            for it in view:
+                row = {"Date": it["date"].strftime("%d %b %Y"), "Headline": it["title"], "Source": it["source"] or it["via"],
+                       "Category": it["category"], "Tone": TONE_TXT[it["tone"]], "Severity": it["severity"]}
+                x = ai_map.get(it["title"])
+                if ai_map:
+                    row["AI tone"] = ("not about company" if not x["relevant"] else TONE_TXT[x["tone"]]) if x else "–"
+                    row["AI note"] = x["note"] if x else ""
+                row["Link"] = it["url"]
+                hrows.append(row)
+            hdf = pd.DataFrame(hrows)
+            tcss = lambda v: {"✕ negative": SIG_CSS["✕ Concern"], "✓ positive": SIG_CSS["✓ Healthy"]}.get(v, "")
+            st.dataframe(style_cells(hdf, tcss, [c for c in ("Tone", "AI tone") if c in hdf.columns]) if len(hdf) else hdf,
+                         hide_index=True, width="stretch", height=min(600, 38 + 35 * len(hdf)),
+                         column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                        "Headline": st.column_config.TextColumn(width="large"),
+                                        "AI note": st.column_config.TextColumn(width="large")})
+            st.caption(f"{len(view)} of {len(items)} headlines shown. Tone and severity come from a transparent keyword screen "
                    "(see Data & method); it can misread unusual wording.")
 
 
 # ------------------------------------------------------------------ Cash flow & lifecycle
-with tabs[7]:
-    st.subheader("Cash flow & lifecycle")
-    st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
-    yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
-    yr = st.select_slider("Fiscal year", options=yrs, value=yrs[-1], format_func=lambda y: f"FY{y}")
-    wcols = st.columns(2 if B is not None else 1)
-    for col, comp, color in zip(wcols, (A, B), (C1, C2)):
-        if comp is None:
-            continue
-        with col:
-            y_ = yr if yr in comp.fin.index else comp.fin.index[-1]
-            steps, net, approx = mt.waterfall_steps(comp.fin.loc[y_])
-            fig = go.Figure(go.Waterfall(
-                x=[s[0] for s in steps] + ["Net change in cash"], y=[s[1] for s in steps] + [0],
-                measure=["relative"] * len(steps) + ["total"], connector=dict(line=dict(color=CB, width=1)),
-                increasing=dict(marker=dict(color=GREEN)), decreasing=dict(marker=dict(color=RED)),
-                totals=dict(marker=dict(color=color)), text=[f"{s[1]:,.0f}" for s in steps] + [f"{net:,.0f}"], textposition="outside"))
-            fig.update_layout(title=dict(text=f"{comp.name} - FY{y_} (Rs cr)", font=dict(size=14)), height=380,
-                              template="plotly_white", margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
-            st.plotly_chart(fig, width="stretch", key=f"wf-{comp.ticker}")
-            if approx:
-                st.caption("Yahoo does not split every cash-flow line for this company, so 'other' items are approximate.")
-    st.markdown("##### Lifecycle stage by year")
-    st.caption("Stage from the signs of operating (CFO), investing (CFI) and financing (CFF) cash flow.")
-    for comp in (A, B):
-        if comp is None:
-            continue
-        rows = []
-        for y_, r in comp.fin.iterrows():
-            stage, why = mt.lifecycle(r.get("cfo", np.nan), r.get("cfi", np.nan), r.get("cff", np.nan))
-            rows.append({"Year": f"FY{y_}", "CFO": r.get("cfo", np.nan), "CFI": r.get("cfi", np.nan), "CFF": r.get("cff", np.nan),
-                         "Stage": stage or "n/a", "Credit reading": why or "Yahoo is missing a cash-flow total"})
-        st.markdown(f"**{comp.name}**")
-        st.dataframe(pd.DataFrame(rows).style.format({"CFO": "{:,.0f}", "CFI": "{:,.0f}", "CFF": "{:,.0f}"}, na_rep="n/a"),
-                     width="stretch", hide_index=True)
+if tabs[7] is not None:
+    with tabs[7]:
+        st.subheader("Cash flow & lifecycle")
+        st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
+        yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
+        yr = st.select_slider("Fiscal year", options=yrs, value=yrs[-1], format_func=lambda y: f"FY{y}")
+        wcols = st.columns(2 if B is not None else 1)
+        for col, comp, color in zip(wcols, (A, B), (C1, C2)):
+            if comp is None:
+                continue
+            with col:
+                y_ = yr if yr in comp.fin.index else comp.fin.index[-1]
+                steps, net, approx = mt.waterfall_steps(comp.fin.loc[y_])
+                fig = go.Figure(go.Waterfall(
+                    x=[s[0] for s in steps] + ["Net change in cash"], y=[s[1] for s in steps] + [0],
+                    measure=["relative"] * len(steps) + ["total"], connector=dict(line=dict(color=CB, width=1)),
+                    increasing=dict(marker=dict(color=GREEN)), decreasing=dict(marker=dict(color=RED)),
+                    totals=dict(marker=dict(color=color)), text=[f"{s[1]:,.0f}" for s in steps] + [f"{net:,.0f}"], textposition="outside"))
+                fig.update_layout(title=dict(text=f"{comp.name} - FY{y_} (Rs cr)", font=dict(size=14)), height=380,
+                                  template="plotly_white", margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+                st.plotly_chart(fig, width="stretch", key=f"wf-{comp.ticker}")
+                if approx:
+                    st.caption("Yahoo does not split every cash-flow line for this company, so 'other' items are approximate.")
+        st.markdown("##### Lifecycle stage by year")
+        st.caption("Stage from the signs of operating (CFO), investing (CFI) and financing (CFF) cash flow.")
+        for comp in (A, B):
+            if comp is None:
+                continue
+            rows = []
+            for y_, r in comp.fin.iterrows():
+                stage, why = mt.lifecycle(r.get("cfo", np.nan), r.get("cfi", np.nan), r.get("cff", np.nan))
+                rows.append({"Year": f"FY{y_}", "CFO": r.get("cfo", np.nan), "CFI": r.get("cfi", np.nan), "CFF": r.get("cff", np.nan),
+                             "Stage": stage or "n/a", "Credit reading": why or "Yahoo is missing a cash-flow total"})
+            st.markdown(f"**{comp.name}**")
+            st.dataframe(pd.DataFrame(rows).style.format({"CFO": "{:,.0f}", "CFI": "{:,.0f}", "CFF": "{:,.0f}"}, na_rep="n/a"),
+                         width="stretch", hide_index=True)
 
 # ------------------------------------------------------------------ ADVANCED: credit workbench
-with tabs[8]:
-    st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
-    st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
-    bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
-    BC = A if bor_name == A.name else B
-    bm = all_m[BC.ticker]; bvals = latest_all[BC.ticker]
-    bflags = flagsA if BC is A else flagsB
-    brow = BC.fin.iloc[-1]
-    g_ = lambda k: brow[k] if k in brow.index else np.nan
-    base = dict(rev=g_("rev"), ebitda=g_("ebitda"), ebit=g_("ebit"), da=g_("da"), interest=g_("interest"), debt=g_("debt"),
-                cur_debt=g_("cur_debt"), cash=g_("cash"), recv=g_("recv"), inv=g_("inv"), pay=g_("pay"), cfo=g_("cfo"),
-                eq=g_("equity"), ni=g_("ni"))
-    taxr = float(np.clip(g_("tax") / g_("pbt"), 0, 0.4)) if (not pd.isna(g_("tax")) and not pd.isna(g_("pbt")) and g_("pbt") > 0) else 0.25
-    wb = st.tabs(["Facility & stress", "Covenants", "Rating scorecard", "Sector watchlist", "Credit memo"])
-    fac = {}
+if tabs[8] is not None:
+    with tabs[8]:
+        st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
+        st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
+        bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
+        BC = A if bor_name == A.name else B
+        bm = all_m[BC.ticker]; bvals = latest_all[BC.ticker]
+        bflags = flagsA if BC is A else flagsB
+        brow = BC.fin.iloc[-1]
+        g_ = lambda k: brow[k] if k in brow.index else np.nan
+        base = dict(rev=g_("rev"), ebitda=g_("ebitda"), ebit=g_("ebit"), da=g_("da"), interest=g_("interest"), debt=g_("debt"),
+                    cur_debt=g_("cur_debt"), cash=g_("cash"), recv=g_("recv"), inv=g_("inv"), pay=g_("pay"), cfo=g_("cfo"),
+                    eq=g_("equity"), ni=g_("ni"))
+        taxr = float(np.clip(g_("tax") / g_("pbt"), 0, 0.4)) if (not pd.isna(g_("tax")) and not pd.isna(g_("pbt")) and g_("pbt") > 0) else 0.25
+        wb = st.tabs(["Facility & stress", "Covenants", "Rating scorecard", "Sector watchlist", "Credit memo"])
+        fac = {}
 
-    # ---- facility & stress
-    with wb[0]:
-        st.markdown(f"##### Facility request and stress test {ADV}", unsafe_allow_html=True)
-        implied = base["interest"] / base["debt"] if base["debt"] and base["debt"] > 0 and not pd.isna(base["interest"]) else 0.095
-        k_ = BC.ticker
-        c = st.columns(5)
-        ftype = c[0].selectbox("Facility type", ["Term loan (amortising)", "Working-capital limit (revolving)"], key=f"ft_{k_}")
-        revolving = ftype.startswith("Working")
-        default_amt = float(max(round(0.25 * (base["ebitda"] if not pd.isna(base["ebitda"]) else 100), -1), 10.0))
-        amount = c[1].number_input("Amount (Rs cr)", 0.0, 1e7, default_amt, 10.0, key=f"fa_{k_}")
-        rate = c[2].number_input("Interest rate (%)", 0.0, 30.0, float(round(min(max(implied * 100, 7.0), 14.0), 2)), 0.25, key=f"fr_{k_}") / 100
-        tenor = c[3].number_input("Tenor (years)", 1.0, 30.0, 5.0, 1.0, key=f"fn_{k_}", disabled=revolving)
-        target = c[4].number_input("Target DSCR (x)", 0.5, 3.0, 1.25, 0.05, key=f"fd_{k_}")
-        st.markdown("**Stress scenario**")
-        s_ = st.columns(4)
-        sg = s_[0].slider("Revenue change (%)", -40, 30, -10, key=f"sg_{k_}") / 100
-        sdm = s_[1].slider("EBITDA margin change (pp)", -10.0, 5.0, -2.0, 0.5, key=f"sdm_{k_}") / 100
-        sdr = s_[2].slider("Interest-rate change (pp)", -2.0, 5.0, 1.0, 0.25, key=f"sdr_{k_}") / 100
-        sdd = s_[3].slider("Receivable days change", -20, 90, 10, key=f"sdd_{k_}")
-        kw = dict(new_rate=rate, tenor=tenor, revolving=revolving, tax_rate=taxr)
-        r_base = mt.stress(base, tax_rate=taxr)
-        r_pro = mt.stress(base, new_debt=amount, **kw)
-        r_str = mt.stress(base, g=sg, dm=sdm, dr=sdr, d_recv_days=sdd, new_debt=amount, **kw)
-        capacity = mt.debt_capacity(base, target, rate, tenor, revolving)
-        covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
-        rows = [("Revenue (Rs cr)", "rev", "{:,.0f}"), ("EBITDA (Rs cr)", "ebitda", "{:,.0f}"), ("Interest (Rs cr)", "interest", "{:,.1f}"),
-                ("Operating cash flow (Rs cr)", "cfo", "{:,.0f}"), ("Interest cover", "icr", "{:.2f}x"), ("DSCR", "dscr", "{:.2f}x"),
-                ("Debt / Equity", "de", "{:.2f}x"), ("Net debt / EBITDA", "nd_ebitda", "{:.2f}x"),
-                ("Cash conversion (CFO/EBITDA)", "cce", "{:.0%}"), ("Cash runway (months)", "runway_m", "{:.0f}")]
-        tbl, css = [], []
-        for label, k, f in rows:
-            vals_ = [r_base[k], r_pro[k], r_str[k]]
-            tbl.append([label] + [("–" if pd.isna(v) else f.format(v)) for v in vals_])
-            cs = [""]
-            for v in vals_:
-                st_ = ""
-                if k in mt.COVENANT_SPECS and not pd.isna(v):
-                    status, _ = mt.covenant_status(v, covs[k], mt.COVENANT_SPECS[k][1])
-                    st_ = {"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)"}.get(status, "")
-                cs.append(st_)
-            css.append(cs)
-        tdf = pd.DataFrame(tbl, columns=["", "Current", "With facility", "Stressed (facility + shocks)"])
-        cdf = pd.DataFrame(css, columns=tdf.columns)
-        st.dataframe(tdf.style.apply(lambda _: cdf, axis=None), width="stretch", hide_index=True)
-        st.caption("Amber = within 15% of a covenant limit, red = breach (limits are set on the Covenants tab).")
-        m3 = st.columns(3)
-        m3[0].metric("Largest facility at target DSCR", money(capacity))
-        m3[1].metric("Requested vs capacity", "No room" if capacity == 0 and amount > 0 else ("Within capacity" if amount <= capacity else "Exceeds capacity"))
-        m3[2].metric("Pro-forma DSCR → stressed", f"{r_pro['dscr']:.2f}x → {r_str['dscr']:.2f}x" if not (pd.isna(r_pro['dscr']) or pd.isna(r_str['dscr'])) else "n/a")
-        st.markdown("**DSCR sensitivity: EBITDA margin vs interest rate** (with the facility and the revenue / receivable shocks above)")
-        dm_list, dr_list = [-0.06, -0.04, -0.02, 0.0, 0.02], [0.0, 0.01, 0.02, 0.03, 0.04]
-        grid = mt.sens_grid(base, dm_list, dr_list, "dscr", g=sg, d_recv_days=sdd, new_debt=amount, **kw)
-        z = grid.values.astype(float)
-        cls = np.where(np.isnan(z), np.nan, np.where(z < 1.0, 0, np.where(z < target, 1, 2)))
-        hm = go.Figure(go.Heatmap(z=cls, x=[f"{d*100:+.0f}pp" for d in dm_list], y=[f"+{d*100:.0f}pp" for d in dr_list],
-                                  colorscale=[[0, RED], [0.5, AMBER], [1, GREEN]], zmin=0, zmax=2, showscale=False,
-                                  text=[[("n/a" if pd.isna(v) else f"{v:.2f}x") for v in row] for row in z], texttemplate="%{text}",
-                                  hovertemplate="margin %{x}, rates %{y}: %{text}<extra></extra>"))
-        hm.update_layout(height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                         xaxis_title="Change in EBITDA margin", yaxis_title="Change in interest rate")
-        st.plotly_chart(hm, width="stretch", key="sens-heat")
-        st.caption(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
-        fac.update(dict(req=dict(type=ftype, amount=amount, rate=rate, tenor=tenor, target=target, capacity=capacity),
-                        scen=dict(base=r_base, pro=r_pro, stress=r_str,
-                                  desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}"),
-                        grid=grid, dm_list=dm_list, dr_list=dr_list))
+        # ---- facility & stress
+        with wb[0]:
+            st.markdown(f"##### Facility request and stress test {ADV}", unsafe_allow_html=True)
+            implied = base["interest"] / base["debt"] if base["debt"] and base["debt"] > 0 and not pd.isna(base["interest"]) else 0.095
+            k_ = BC.ticker
+            c = st.columns(5)
+            ftype = c[0].selectbox("Facility type", ["Term loan (amortising)", "Working-capital limit (revolving)"], key=f"ft_{k_}")
+            revolving = ftype.startswith("Working")
+            default_amt = float(max(round(0.25 * (base["ebitda"] if not pd.isna(base["ebitda"]) else 100), -1), 10.0))
+            amount = c[1].number_input("Amount (Rs cr)", 0.0, 1e7, default_amt, 10.0, key=f"fa_{k_}")
+            rate = c[2].number_input("Interest rate (%)", 0.0, 30.0, float(round(min(max(implied * 100, 7.0), 14.0), 2)), 0.25, key=f"fr_{k_}") / 100
+            tenor = c[3].number_input("Tenor (years)", 1.0, 30.0, 5.0, 1.0, key=f"fn_{k_}", disabled=revolving)
+            target = c[4].number_input("Target DSCR (x)", 0.5, 3.0, 1.25, 0.05, key=f"fd_{k_}")
+            st.markdown("**Stress scenario**")
+            s_ = st.columns(4)
+            sg = s_[0].slider("Revenue change (%)", -40, 30, -10, key=f"sg_{k_}") / 100
+            sdm = s_[1].slider("EBITDA margin change (pp)", -10.0, 5.0, -2.0, 0.5, key=f"sdm_{k_}") / 100
+            sdr = s_[2].slider("Interest-rate change (pp)", -2.0, 5.0, 1.0, 0.25, key=f"sdr_{k_}") / 100
+            sdd = s_[3].slider("Receivable days change", -20, 90, 10, key=f"sdd_{k_}")
+            kw = dict(new_rate=rate, tenor=tenor, revolving=revolving, tax_rate=taxr)
+            r_base = mt.stress(base, tax_rate=taxr)
+            r_pro = mt.stress(base, new_debt=amount, **kw)
+            r_str = mt.stress(base, g=sg, dm=sdm, dr=sdr, d_recv_days=sdd, new_debt=amount, **kw)
+            capacity = mt.debt_capacity(base, target, rate, tenor, revolving)
+            covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
+            rows = [("Revenue (Rs cr)", "rev", "{:,.0f}"), ("EBITDA (Rs cr)", "ebitda", "{:,.0f}"), ("Interest (Rs cr)", "interest", "{:,.1f}"),
+                    ("Operating cash flow (Rs cr)", "cfo", "{:,.0f}"), ("Interest cover", "icr", "{:.2f}x"), ("DSCR", "dscr", "{:.2f}x"),
+                    ("Debt / Equity", "de", "{:.2f}x"), ("Net debt / EBITDA", "nd_ebitda", "{:.2f}x"),
+                    ("Cash conversion (CFO/EBITDA)", "cce", "{:.0%}"), ("Cash runway (months)", "runway_m", "{:.0f}")]
+            tbl, css = [], []
+            for label, k, f in rows:
+                vals_ = [r_base[k], r_pro[k], r_str[k]]
+                tbl.append([label] + [("–" if pd.isna(v) else f.format(v)) for v in vals_])
+                cs = [""]
+                for v in vals_:
+                    st_ = ""
+                    if k in mt.COVENANT_SPECS and not pd.isna(v):
+                        status, _ = mt.covenant_status(v, covs[k], mt.COVENANT_SPECS[k][1])
+                        st_ = {"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)"}.get(status, "")
+                    cs.append(st_)
+                css.append(cs)
+            tdf = pd.DataFrame(tbl, columns=["", "Current", "With facility", "Stressed (facility + shocks)"])
+            cdf = pd.DataFrame(css, columns=tdf.columns)
+            st.dataframe(tdf.style.apply(lambda _: cdf, axis=None), width="stretch", hide_index=True)
+            st.caption("Amber = within 15% of a covenant limit, red = breach (limits are set on the Covenants tab).")
+            m3 = st.columns(3)
+            m3[0].metric("Largest facility at target DSCR", money(capacity))
+            m3[1].metric("Requested vs capacity", "No room" if capacity == 0 and amount > 0 else ("Within capacity" if amount <= capacity else "Exceeds capacity"))
+            m3[2].metric("Pro-forma DSCR → stressed", f"{r_pro['dscr']:.2f}x → {r_str['dscr']:.2f}x" if not (pd.isna(r_pro['dscr']) or pd.isna(r_str['dscr'])) else "n/a")
+            st.markdown("**DSCR sensitivity: EBITDA margin vs interest rate** (with the facility and the revenue / receivable shocks above)")
+            dm_list, dr_list = [-0.06, -0.04, -0.02, 0.0, 0.02], [0.0, 0.01, 0.02, 0.03, 0.04]
+            grid = mt.sens_grid(base, dm_list, dr_list, "dscr", g=sg, d_recv_days=sdd, new_debt=amount, **kw)
+            z = grid.values.astype(float)
+            cls = np.where(np.isnan(z), np.nan, np.where(z < 1.0, 0, np.where(z < target, 1, 2)))
+            hm = go.Figure(go.Heatmap(z=cls, x=[f"{d*100:+.0f}pp" for d in dm_list], y=[f"+{d*100:.0f}pp" for d in dr_list],
+                                      colorscale=[[0, RED], [0.5, AMBER], [1, GREEN]], zmin=0, zmax=2, showscale=False,
+                                      text=[[("n/a" if pd.isna(v) else f"{v:.2f}x") for v in row] for row in z], texttemplate="%{text}",
+                                      hovertemplate="margin %{x}, rates %{y}: %{text}<extra></extra>"))
+            hm.update_layout(height=320, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                             xaxis_title="Change in EBITDA margin", yaxis_title="Change in interest rate")
+            st.plotly_chart(hm, width="stretch", key="sens-heat")
+            st.caption(f"Red: DSCR below 1.0 · amber: below the {target:.2f}x target · green: at or above target.")
+            fac.update(dict(req=dict(type=ftype, amount=amount, rate=rate, tenor=tenor, target=target, capacity=capacity),
+                            scen=dict(base=r_base, pro=r_pro, stress=r_str,
+                                      desc=f"revenue {sg:+.0%}, EBITDA margin {sdm*100:+.1f}pp, rates {sdr*100:+.2f}pp, receivable days {sdd:+d}"),
+                            grid=grid, dm_list=dm_list, dr_list=dr_list))
 
-    # ---- covenants
-    with wb[1]:
-        st.markdown(f"##### Covenant monitor {ADV}", unsafe_allow_html=True)
-        st.caption("Set the limits a lender might impose; the table shows actual value and status for each year.")
-        cc = st.columns(len(mt.COVENANT_SPECS))
-        for col, (k, (label, kind, dflt)) in zip(cc, mt.COVENANT_SPECS.items()):
-            col.number_input(label, 0.0, 50.0, float(dflt), 0.05, key=f"cov_{k}")
-        covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
-        yrs_c = list(bm.columns)[-4:]
-        rows, css = [], []
-        latest_rows = []
-        for k, (label, kind, _) in mt.COVENANT_SPECS.items():
-            r_, c_ = [f"{label.split(' (')[0]} ({'≥' if kind == 'min' else '≤'} {covs[k]:g})"], [""]
-            for y in yrs_c:
-                v = bm.loc[k, y] if k in bm.index else np.nan
-                status, head = mt.covenant_status(v, covs[k], kind)
-                r_.append("n/a" if pd.isna(v) else f"{fmtv(k, v)} · {status}")
-                c_.append({"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)",
-                           "OK": "background-color: rgba(46,160,67,.25)"}.get(status, ""))
-            v_last = bvals.get(k)
-            latest_rows.append((label.split(" (")[0], fmtv(k, v_last), f"{'≥' if kind == 'min' else '≤'} {covs[k]:g}",
-                                mt.covenant_status(v_last, covs[k], kind)[0]))
-            rows.append(r_); css.append(c_)
-        cdf = pd.DataFrame(rows, columns=["Covenant"] + [f"FY{y}" for y in yrs_c])
-        cdf_css = pd.DataFrame(css, columns=cdf.columns)
-        st.dataframe(cdf.style.apply(lambda _: cdf_css, axis=None), width="stretch", hide_index=True)
-        n_b = sum(1 for r in latest_rows if r[3] == "Breach"); n_t = sum(1 for r in latest_rows if r[3] == "Tight")
-        k3 = st.columns(3)
-        k3[0].metric("Breaches (latest year)", n_b); k3[1].metric("Tight (<15% headroom)", n_t)
-        k3[2].metric("Passing", sum(1 for r in latest_rows if r[3] == "OK"))
-        e_, i_ = base["ebit"], base["interest"]
-        if not pd.isna(e_) and not pd.isna(i_) and e_ > 0 and i_ > 0:
-            cushion = 1 - covs["icr"] * i_ / e_
-            st.write(f"**EBIT cushion:** operating profit could fall by **{max(cushion, 0):.0%}** before the interest-cover covenant "
+        # ---- covenants
+        with wb[1]:
+            st.markdown(f"##### Covenant monitor {ADV}", unsafe_allow_html=True)
+            st.caption("Set the limits a lender might impose; the table shows actual value and status for each year.")
+            cc = st.columns(len(mt.COVENANT_SPECS))
+            for col, (k, (label, kind, dflt)) in zip(cc, mt.COVENANT_SPECS.items()):
+                col.number_input(label, 0.0, 50.0, float(dflt), 0.05, key=f"cov_{k}")
+            covs = {k: st.session_state.get(f"cov_{k}", spec[2]) for k, spec in mt.COVENANT_SPECS.items()}
+            yrs_c = list(bm.columns)[-4:]
+            rows, css = [], []
+            latest_rows = []
+            for k, (label, kind, _) in mt.COVENANT_SPECS.items():
+                r_, c_ = [f"{label.split(' (')[0]} ({'≥' if kind == 'min' else '≤'} {covs[k]:g})"], [""]
+                for y in yrs_c:
+                    v = bm.loc[k, y] if k in bm.index else np.nan
+                    status, head = mt.covenant_status(v, covs[k], kind)
+                    r_.append("n/a" if pd.isna(v) else f"{fmtv(k, v)} · {status}")
+                    c_.append({"Breach": "background-color: rgba(248,81,73,.32)", "Tight": "background-color: rgba(210,153,34,.32)",
+                               "OK": "background-color: rgba(46,160,67,.25)"}.get(status, ""))
+                v_last = bvals.get(k)
+                latest_rows.append((label.split(" (")[0], fmtv(k, v_last), f"{'≥' if kind == 'min' else '≤'} {covs[k]:g}",
+                                    mt.covenant_status(v_last, covs[k], kind)[0]))
+                rows.append(r_); css.append(c_)
+            cdf = pd.DataFrame(rows, columns=["Covenant"] + [f"FY{y}" for y in yrs_c])
+            cdf_css = pd.DataFrame(css, columns=cdf.columns)
+            st.dataframe(cdf.style.apply(lambda _: cdf_css, axis=None), width="stretch", hide_index=True)
+            n_b = sum(1 for r in latest_rows if r[3] == "Breach"); n_t = sum(1 for r in latest_rows if r[3] == "Tight")
+            k3 = st.columns(3)
+            k3[0].metric("Breaches (latest year)", n_b); k3[1].metric("Tight (<15% headroom)", n_t)
+            k3[2].metric("Passing", sum(1 for r in latest_rows if r[3] == "OK"))
+            e_, i_ = base["ebit"], base["interest"]
+            if not pd.isna(e_) and not pd.isna(i_) and e_ > 0 and i_ > 0:
+                cushion = 1 - covs["icr"] * i_ / e_
+                st.write(f"**EBIT cushion:** operating profit could fall by **{max(cushion, 0):.0%}** before the interest-cover covenant "
                      f"({covs['icr']:g}x) is breached.")
-        fac["cov_rows"] = latest_rows
+            fac["cov_rows"] = latest_rows
 
-    # ---- rating scorecard
-    with wb[2]:
-        st.markdown(f"##### Indicative risk scorecard {ADV}", unsafe_allow_html=True)
-        st.caption("Weighted blend of the factor scores. It is an internal-style indication, not an agency rating. "
+        # ---- rating scorecard
+        with wb[2]:
+            st.markdown(f"##### Indicative risk scorecard {ADV}", unsafe_allow_html=True)
+            st.caption("Weighted blend of the factor scores. It is an internal-style indication, not an agency rating. "
                    "Change the weights to reflect your view; the banner and Overview update.")
-        with st.expander("Adjust weights", expanded=False):
-            wc = st.columns(6)
-            for col, (p, d) in zip(wc, mt.DEFAULT_WEIGHTS.items()):
-                col.slider(p, 0, 50, d, key=f"w_{p}")
-        W = {p: st.session_state.get(f"w_{p}", d) for p, d in mt.DEFAULT_WEIGHTS.items()}
-        pb = mt.pillar_scores(bvals, BC.gov)
-        pcmp = pB if BC is A else pA
-        cmp_nm = cmp_name if BC is A else A.name
-        sc_b, sc_c = mt.overall_score(pb, W), mt.overall_score(pcmp, W)
-        k2 = st.columns(3)
-        k2[0].metric(f"{BC.name} overall", "n/a" if pd.isna(sc_b) else f"{sc_b:.0f} / 100")
-        k2[1].metric("Indicative band", mt.band(sc_b))
-        k2[2].metric(f"{cmp_nm}", "n/a" if pd.isna(sc_c) else f"{sc_c:.0f} / 100 · {mt.band(sc_c)}")
-        fig = go.Figure()
-        fig.add_bar(y=list(pb), x=[0 if pd.isna(v) else v for v in pb.values()], orientation="h", name=BC.name,
-                    marker_color=C1 if BC is A else C2)
-        fig.add_bar(y=list(pcmp), x=[0 if pd.isna(v) else v for v in pcmp.values()], orientation="h", name=cmp_nm, marker_color=CB)
-        fig.update_layout(barmode="group", height=380, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
-                          xaxis=dict(range=[0, 100], title="Factor score (0-100)"), yaxis=dict(autorange="reversed"),
-                          legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig, width="stretch", key="pillar-bars")
-        st.caption("Bands: 80+ low risk · 65-80 moderate · 50-65 elevated · 35-50 high · below 35 very high. "
+            with st.expander("Adjust weights", expanded=False):
+                wc = st.columns(6)
+                for col, (p, d) in zip(wc, mt.DEFAULT_WEIGHTS.items()):
+                    col.slider(p, 0, 50, d, key=f"w_{p}")
+            W = {p: st.session_state.get(f"w_{p}", d) for p, d in mt.DEFAULT_WEIGHTS.items()}
+            pb = mt.pillar_scores(bvals, BC.gov)
+            pcmp = pB if BC is A else pA
+            cmp_nm = cmp_name if BC is A else A.name
+            sc_b, sc_c = mt.overall_score(pb, W), mt.overall_score(pcmp, W)
+            k2 = st.columns(3)
+            k2[0].metric(f"{BC.name} overall", "n/a" if pd.isna(sc_b) else f"{sc_b:.0f} / 100")
+            k2[1].metric("Indicative band", mt.band(sc_b))
+            k2[2].metric(f"{cmp_nm}", "n/a" if pd.isna(sc_c) else f"{sc_c:.0f} / 100 · {mt.band(sc_c)}")
+            fig = go.Figure()
+            fig.add_bar(y=list(pb), x=[0 if pd.isna(v) else v for v in pb.values()], orientation="h", name=BC.name,
+                        marker_color=C1 if BC is A else C2)
+            fig.add_bar(y=list(pcmp), x=[0 if pd.isna(v) else v for v in pcmp.values()], orientation="h", name=cmp_nm, marker_color=CB)
+            fig.update_layout(barmode="group", height=380, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                              xaxis=dict(range=[0, 100], title="Factor score (0-100)"), yaxis=dict(autorange="reversed"),
+                              legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig, width="stretch", key="pillar-bars")
+            st.caption("Bands: 80+ low risk · 65-80 moderate · 50-65 elevated · 35-50 high · below 35 very high. "
                    "Governance uses Yahoo/ISS risk scores and is left out (weights re-normalised) when unavailable.")
-        fac["score"] = (sc_b, mt.band(sc_b), pb)
+            fac["score"] = (sc_b, mt.band(sc_b), pb)
 
-    # ---- sector watchlist
-    with wb[3]:
-        st.markdown(f"##### Sector watchlist - {sector} {ADV}", unsafe_allow_html=True)
-        st.caption("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
-        rows = []
-        for t, c in companies.items():
-            m_ = all_m[t]
-            ys = mt.score_by_year(m_, W)
-            now, prev = ys.iloc[-1], (ys.iloc[-2] if len(ys) > 1 else np.nan)
-            v_ = latest_all[t]
-            vd = ins.verdict(v_, mt.red_flags(c.fin, m_))
-            d_ = now - prev if not pd.isna(now) and not pd.isna(prev) else np.nan
-            rows.append({"": "◀" if t in (t1, t2) else "", "Company": c.name, "Score": now, "Band": mt.band(now),
-                         "Δ vs prior yr": ("n/a" if pd.isna(d_) else f"{'▲' if d_ > 0 else '▼' if d_ < 0 else '■'} {abs(d_):.0f}"),
-                         "Signal": vd["signal"].title(), "Concerns": vd["r"],
-                         "Interest cover": fmtv("icr", v_.get("icr")), "DSCR": fmtv("dscr", v_.get("dscr")),
-                         "Net debt/EBITDA": fmtv("nd_ebitda", v_.get("nd_ebitda")), "Cash conv.": fmtv("cce", v_.get("cce")),
-                         "Altman Z″": fmtv("altman_z2", v_.get("altman_z2")), "Ohlson P(distress)": fmtv("ohlson_p", v_.get("ohlson_p"))})
-        wdf = pd.DataFrame(rows).sort_values("Score", na_position="first")
-        st.dataframe(wdf, column_config={"Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f")},
-                     width="stretch", hide_index=True)
-        st.download_button("Download watchlist (CSV)", wdf.to_csv(index=False), file_name=f"watchlist_{sector}.csv", mime="text/csv", key="dl-watch")
+        # ---- sector watchlist
+        with wb[3]:
+            st.markdown(f"##### Sector watchlist - {sector} {ADV}", unsafe_allow_html=True)
+            st.caption("Every loaded company ranked riskiest first by indicative score. Δ is the change in the score versus the prior fiscal year.")
+            rows = []
+            for t, c in companies.items():
+                m_ = all_m[t]
+                ys = mt.score_by_year(m_, W)
+                now, prev = ys.iloc[-1], (ys.iloc[-2] if len(ys) > 1 else np.nan)
+                v_ = latest_all[t]
+                vd = ins.verdict(v_, mt.red_flags(c.fin, m_))
+                d_ = now - prev if not pd.isna(now) and not pd.isna(prev) else np.nan
+                rows.append({"": "◀" if t in (t1, t2) else "", "Company": c.name, "Score": now, "Band": mt.band(now),
+                             "Δ vs prior yr": ("n/a" if pd.isna(d_) else f"{'▲' if d_ > 0 else '▼' if d_ < 0 else '■'} {abs(d_):.0f}"),
+                             "Signal": vd["signal"].title(), "Concerns": vd["r"],
+                             "Interest cover": fmtv("icr", v_.get("icr")), "DSCR": fmtv("dscr", v_.get("dscr")),
+                             "Net debt/EBITDA": fmtv("nd_ebitda", v_.get("nd_ebitda")), "Cash conv.": fmtv("cce", v_.get("cce")),
+                             "Altman Z″": fmtv("altman_z2", v_.get("altman_z2")), "Ohlson P(distress)": fmtv("ohlson_p", v_.get("ohlson_p"))})
+            wdf = pd.DataFrame(rows).sort_values("Score", na_position="first")
+            st.dataframe(wdf, column_config={"Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f")},
+                         width="stretch", hide_index=True)
+            st.download_button("Download watchlist (CSV)", wdf.to_csv(index=False), file_name=f"watchlist_{sector}.csv", mime="text/csv", key="dl-watch")
 
-    # ---- credit memo
-    with wb[4]:
-        st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
-        st.caption("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
+        # ---- credit memo
+        with wb[4]:
+            st.markdown(f"##### Credit appraisal note {ADV}", unsafe_allow_html=True)
+            st.caption("Assembled from every other tab (facility, stress, covenants, scorecard, early warning) plus your own judgement "
                    "below. Download it as PDF or Word with the charts included. A draft for analyst review, not a credit decision.")
-        k_ = BC.ticker
-        req_amt = (fac.get("req") or {}).get("amount", 0.0) or 0.0
-        with st.container(border=True):
-            st.markdown("**Analyst inputs**")
-            a1, a2, a3 = st.columns(3)
-            an_name = a1.text_input("Analyst", key=f"m_name_{k_}", placeholder="Your name")
-            purpose = a2.text_input("Purpose of the facility", key=f"m_purpose_{k_}", placeholder="e.g. capex for a new plant")
-            mgmt = a3.selectbox("Management quality", ["Adequate", "Strong", "Weak"], key=f"m_mgmt_{k_}",
-                                help="Strong +1 notch, Weak −1 notch on the issuer grade.")
-            b1, b2, b3 = st.columns(3)
-            ctype = b1.selectbox("Security", ["Unsecured", "Fixed assets (property, plant)", "Receivables & inventory",
-                                              "Financial securities / deposits", "Corporate or promoter guarantee"], key=f"m_ctype_{k_}")
-            cval = b2.number_input("Security value (Rs cr)", 0.0, 1e8, 0.0, 10.0, key=f"m_cval_{k_}", disabled=ctype == "Unsecured",
-                                   help="Realisable value after haircut. Cover = value ÷ facility amount; 1.5x or more lifts the facility grade a notch.")
-            outlook = b3.selectbox("Industry outlook", ["Stable", "Positive", "Negative"], key=f"m_outlook_{k_}",
-                                   help="Negative −1 notch on the issuer grade.")
-            notes = st.text_area("Analyst notes (go into the memo)", key=f"m_notes_{k_}", height=80,
-                                 placeholder="Business model, customer concentration, promoter track record, site visit…")
-            o1, o2 = st.columns([1, 2])
-            override = o1.selectbox("Recommendation", ["Use system stance", "Supportable", "Supportable with conditions",
-                                                       "Not supportable on current numbers"], key=f"m_ovr_{k_}")
-            ov_reason = o2.text_input("Reason for overriding the system stance", key=f"m_ovr_why_{k_}",
-                                      disabled=override == "Use system stance",
-                                      placeholder="Required when overriding - it is printed in the memo")
-        if override != "Use system stance" and not ov_reason.strip():
-            st.warning("Add a reason for the override - the memo will use the system stance until you do.")
-            override = "Use system stance"
-        cover = (cval / req_amt) if (ctype != "Unsecured" and req_amt > 0) else np.nan
+            k_ = BC.ticker
+            req_amt = (fac.get("req") or {}).get("amount", 0.0) or 0.0
+            with st.container(border=True):
+                st.markdown("**Analyst inputs**")
+                a1, a2, a3 = st.columns(3)
+                an_name = a1.text_input("Analyst", key=f"m_name_{k_}", placeholder="Your name")
+                purpose = a2.text_input("Purpose of the facility", key=f"m_purpose_{k_}", placeholder="e.g. capex for a new plant")
+                mgmt = a3.selectbox("Management quality", ["Adequate", "Strong", "Weak"], key=f"m_mgmt_{k_}",
+                                    help="Strong +1 notch, Weak −1 notch on the issuer grade.")
+                b1, b2, b3 = st.columns(3)
+                ctype = b1.selectbox("Security", ["Unsecured", "Fixed assets (property, plant)", "Receivables & inventory",
+                                                  "Financial securities / deposits", "Corporate or promoter guarantee"], key=f"m_ctype_{k_}")
+                cval = b2.number_input("Security value (Rs cr)", 0.0, 1e8, 0.0, 10.0, key=f"m_cval_{k_}", disabled=ctype == "Unsecured",
+                                       help="Realisable value after haircut. Cover = value ÷ facility amount; 1.5x or more lifts the facility grade a notch.")
+                outlook = b3.selectbox("Industry outlook", ["Stable", "Positive", "Negative"], key=f"m_outlook_{k_}",
+                                       help="Negative −1 notch on the issuer grade.")
+                notes = st.text_area("Analyst notes (go into the memo)", key=f"m_notes_{k_}", height=80,
+                                     placeholder="Business model, customer concentration, promoter track record, site visit…")
+                o1, o2 = st.columns([1, 2])
+                override = o1.selectbox("Recommendation", ["Use system stance", "Supportable", "Supportable with conditions",
+                                                           "Not supportable on current numbers"], key=f"m_ovr_{k_}")
+                ov_reason = o2.text_input("Reason for overriding the system stance", key=f"m_ovr_why_{k_}",
+                                          disabled=override == "Use system stance",
+                                          placeholder="Required when overriding - it is printed in the memo")
+            if override != "Use system stance" and not ov_reason.strip():
+                st.warning("Add a reason for the override - the memo will use the system stance until you do.")
+                override = "Use system stance"
+            cover = (cval / req_amt) if (ctype != "Unsecured" and req_amt > 0) else np.nan
 
-        sc_b, band_b, pb_ = fac.get("score", (np.nan, "n/a", {}))
-        # A grade is an absolute statement, so it always comes from textbook-basis inputs (score and early-warning statuses),
-        # whatever basis the screen shows; the sector-relative score is reported alongside as relative standing.
-        mt.set_basis("Textbook")
-        tb_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
-        ew_b = ew_bundle(BC, st.session_state.get("ew-rf", 6.5) / 100) if EW_LATEST else None
-        ew_ctx = dict(level=ew_b["level"], n=ew_b["n"], sigs=ew_b["sigs"], mert=ew_b["mert"]) if ew_b and ew_b["sigs"] else None
-        mt.set_basis("Sector-relative", SECTOR_VALS)
-        sr_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
-        mt.set_basis(basis_sel, SECTOR_VALS)                    # restore the session's basis
-        rating = rp.rate(tb_score, ew_ctx["level"] if ew_ctx else None, mgmt, outlook, cover)
-        if rating:
-            rating["relative"] = rp.relative_standing(sr_score, tb_score, sector)
+            sc_b, band_b, pb_ = fac.get("score", (np.nan, "n/a", {}))
+            # A grade is an absolute statement, so it always comes from textbook-basis inputs (score and early-warning statuses),
+            # whatever basis the screen shows; the sector-relative score is reported alongside as relative standing.
+            mt.set_basis("Textbook")
+            tb_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
+            ew_b = ew_bundle(BC, st.session_state.get("ew-rf", 6.5) / 100) if EW_LATEST else None
+            ew_ctx = dict(level=ew_b["level"], n=ew_b["n"], sigs=ew_b["sigs"], mert=ew_b["mert"]) if ew_b and ew_b["sigs"] else None
+            mt.set_basis("Sector-relative", SECTOR_VALS)
+            sr_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
+            mt.set_basis(basis_sel, SECTOR_VALS)                    # restore the session's basis
+            rating = rp.rate(tb_score, ew_ctx["level"] if ew_ctx else None, mgmt, outlook, cover)
+            if rating:
+                rating["relative"] = rp.relative_standing(sr_score, tb_score, sector)
 
-        if rating:
-            g1, g2, g3, g4 = st.columns(4)
-            g1.metric("Issuer grade", rating["issuer"]["label"], help=rating["issuer"]["meaning"])
-            g2.metric("Facility grade", rating["facility"]["label"], help="Issuer grade, lifted one notch by security cover of 1.5x or more.")
-            g3.metric("Indicative 1-year PD", f"{rating['facility']['pd']:.2%}",
-                      help="Rounded long-run average default rate for the equivalent agency grade - not a model estimate.")
-            g4.metric("Security cover", "n/a" if pd.isna(cover) else f"{cover:.2f}x")
-            rel = rating["relative"]
-            (st.warning if rel["bias"] else st.caption)(rel["text"])
-            with st.expander("How the grade is built"):
-                st.dataframe(pd.DataFrame(rating["steps"], columns=["Step", "Effect", "Grade"]).fillna(""), hide_index=True, width="stretch")
-                st.dataframe(pd.DataFrame([{"Grade": g, "≈ Agency": e, "Score from": lo, "Indicative 1-yr PD": f"{p_:.2%}", "Meaning": mn}
-                                           for lo, g, e, p_, mn in rp.GRADES]), hide_index=True, width="stretch")
+            if rating:
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("Issuer grade", rating["issuer"]["label"], help=rating["issuer"]["meaning"])
+                g2.metric("Facility grade", rating["facility"]["label"], help="Issuer grade, lifted one notch by security cover of 1.5x or more.")
+                g3.metric("Indicative 1-year PD", f"{rating['facility']['pd']:.2%}",
+                          help="Rounded long-run average default rate for the equivalent agency grade - not a model estimate.")
+                g4.metric("Security cover", "n/a" if pd.isna(cover) else f"{cover:.2f}x")
+                rel = rating["relative"]
+                (st.warning if rel["bias"] else st.caption)(rel["text"])
+                with st.expander("How the grade is built"):
+                    st.dataframe(pd.DataFrame(rating["steps"], columns=["Step", "Effect", "Grade"]).fillna(""), hide_index=True, width="stretch")
+                    st.dataframe(pd.DataFrame([{"Grade": g, "≈ Agency": e, "Score from": lo, "Indicative 1-yr PD": f"{p_:.2%}", "Meaning": mn}
+                                               for lo, g, e, p_, mn in rp.GRADES]), hide_index=True, width="stretch")
 
-        ycols = list(bm.columns)[-3:]
-        snap_items = [("Revenue (Rs cr)", None, "rev"), ("EBITDA (Rs cr)", None, "ebitda"), ("Net profit (Rs cr)", None, "ni"),
-                      ("Operating cash flow (Rs cr)", None, "cfo"), ("Current ratio", "current_ratio", None), ("Interest cover", "icr", None),
-                      ("DSCR (proxy)", "dscr", None), ("Debt / Equity", "de", None), ("Net debt / EBITDA", "nd_ebitda", None),
-                      ("Cash conversion", "cce", None)]
-        srows = []
-        for label, mk, fk in snap_items:
-            vals_ = []
-            for y in ycols:
-                if mk:
-                    vals_.append(fmtv(mk, bm.loc[mk, y]))
-                else:
-                    v = BC.fin.loc[y, fk] if (fk in BC.fin.columns and y in BC.fin.index) else np.nan
-                    vals_.append("n/a" if pd.isna(v) else f"{v:,.0f}")
-            srows.append((label, vals_))
+            ycols = list(bm.columns)[-3:]
+            snap_items = [("Revenue (Rs cr)", None, "rev"), ("EBITDA (Rs cr)", None, "ebitda"), ("Net profit (Rs cr)", None, "ni"),
+                          ("Operating cash flow (Rs cr)", None, "cfo"), ("Current ratio", "current_ratio", None), ("Interest cover", "icr", None),
+                          ("DSCR (proxy)", "dscr", None), ("Debt / Equity", "de", None), ("Net debt / EBITDA", "nd_ebitda", None),
+                          ("Cash conversion", "cce", None)]
+            srows = []
+            for label, mk, fk in snap_items:
+                vals_ = []
+                for y in ycols:
+                    if mk:
+                        vals_.append(fmtv(mk, bm.loc[mk, y]))
+                    else:
+                        v = BC.fin.loc[y, fk] if (fk in BC.fin.columns and y in BC.fin.index) else np.nan
+                        vals_.append("n/a" if pd.isna(v) else f"{v:,.0f}")
+                srows.append((label, vals_))
 
-        cmp_m = cmp_df if BC is A else mA
-        cmp_lbl = cmp_name if BC is A else A.name
-        pcmp_ = pB if BC is A else pA
-        hist_b = ew_b["hist"] if ew_b else None
-        news_ctx = None
-        if ew_b and ew_b.get("news"):
-            n_items = ew_b["news"]["items"]
-            n_rats = nw.latest_ratings(n_items)
-            m_rt_ = st.session_state.get(f"nw-man-rt-{BC.ticker}", "–")
-            if m_rt_ and m_rt_ != "–":                      # a rating the analyst entered on the News & ratings tab wins
-                m_ag_ = st.session_state.get(f"nw-man-ag-{BC.ticker}", "CRISIL")
-                n_rats = [dict(agency=m_ag_, rating=m_rt_, outlook=st.session_state.get(f"nw-man-ol-{BC.ticker}"),
-                               action="Entered by analyst", scale="national", date=datetime.now(timezone.utc))] + \
-                         [r_ for r_ in n_rats if r_["agency"] != m_ag_]
+            cmp_m = cmp_df if BC is A else mA
+            cmp_lbl = cmp_name if BC is A else A.name
+            pcmp_ = pB if BC is A else pA
+            hist_b = ew_b["hist"] if ew_b else None
+            news_ctx = None
+            if ew_b and ew_b.get("news"):
+                n_items = ew_b["news"]["items"]
+                n_rats = agency_ratings(BC, n_items)
             news_ctx = dict(signal=nw.news_signal(n_items),
-                            ratings=[dict(r_, cr=nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None)
-                                     for r_ in n_rats][:4],
-                            top=[it for it in n_items if it["tone"] == "negative" and it["severity"] in ("high", "medium")][:5])
-        ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
-                   vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
-                   req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
-                   cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, security_cover=cover, override=override,
-                   override_reason=ov_reason.strip(),
-                   analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
-                                management=mgmt, outlook=outlook, notes=notes.strip()))
-        fac_now = dict(fac)
+                                ratings=[dict(r_, cr=nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None)
+                                         for r_ in n_rats][:4],
+                                top=[it for it in n_items if it["tone"] == "negative" and it["severity"] in ("high", "medium")][:5])
+            ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
+                       vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
+                       req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
+                       cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, security_cover=cover, override=override,
+                       override_reason=ov_reason.strip(),
+                       analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
+                                    management=mgmt, outlook=outlook, notes=notes.strip()))
+            fac_now = dict(fac)
 
-        def memo_with_charts():
-            """Runs only when a download button is clicked (on its own thread), so drawing charts never slows the page."""
-            charts = dict(pillars=rp.chart_pillars(pb_ or {}, BC.name, pcmp_, cmp_lbl),
-                          trends=rp.chart_trends(bm, BC.name, cmp_m, cmp_lbl),
-                          heatmap=rp.chart_heatmap(fac_now.get("grid"), (fac_now.get("req") or {}).get("target", 1.25),
-                                                   fac_now.get("dm_list", []), fac_now.get("dr_list", [])),
-                          dd=rp.chart_dd(hist_b))
-            return rp.build_memo({**ctx, "charts": charts})
+            def memo_with_charts():
+                """Runs only when a download button is clicked (on its own thread), so drawing charts never slows the page."""
+                charts = dict(pillars=rp.chart_pillars(pb_ or {}, BC.name, pcmp_, cmp_lbl),
+                              trends=rp.chart_trends(bm, BC.name, cmp_m, cmp_lbl),
+                              heatmap=rp.chart_heatmap(fac_now.get("grid"), (fac_now.get("req") or {}).get("target", 1.25),
+                                                       fac_now.get("dm_list", []), fac_now.get("dr_list", [])),
+                              dd=rp.chart_dd(hist_b))
+                return rp.build_memo({**ctx, "charts": charts})
 
-        blocks = rp.build_memo(ctx)                      # on-screen preview: text only
-        md_text = rp.to_markdown(blocks)
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("Download PDF", lambda: rp.to_pdf(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.pdf",
-                           mime="application/pdf", key="dl-memo-pdf", type="primary", width="stretch")
-        d2.download_button("Download Word", lambda: rp.to_docx(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.docx",
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl-memo-docx", width="stretch")
-        d3.download_button("Download Markdown", md_text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown",
-                           key="dl-memo", width="stretch")
-        st.caption("The PDF and Word versions add four charts: factor scores, key-ratio trends, the DSCR stress heatmap and the "
+            blocks = rp.build_memo(ctx)                      # on-screen preview: text only
+            md_text = rp.to_markdown(blocks)
+            d1, d2, d3 = st.columns(3)
+            d1.download_button("Download PDF", lambda: rp.to_pdf(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.pdf",
+                               mime="application/pdf", key="dl-memo-pdf", type="primary", width="stretch")
+            d2.download_button("Download Word", lambda: rp.to_docx(memo_with_charts()), file_name=f"credit_note_{BC.ticker}.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl-memo-docx", width="stretch")
+            d3.download_button("Download Markdown", md_text, file_name=f"credit_note_{BC.ticker}.md", mime="text/markdown",
+                               key="dl-memo", width="stretch")
+            st.caption("The PDF and Word versions add four charts: factor scores, key-ratio trends, the DSCR stress heatmap and the "
                    "distance-to-default trend.")
-        with st.container(border=True):
-            st.markdown(md_text)
+            with st.container(border=True):
+                st.markdown(md_text)
 
 # ------------------------------------------------------------------ Insights
-with tabs[9]:
-    st.subheader("Insights & analysis")
+if tabs[9] is not None:
+    with tabs[9]:
+        st.subheader("Insights & analysis")
 
-    def render(secs):
-        for head, bullets in secs:
-            st.markdown(f"#### {head}")
-            for b in bullets:
-                st.markdown(f"- {b}")
+        def render(secs):
+            for head, bullets in secs:
+                st.markdown(f"#### {head}")
+                for b in bullets:
+                    st.markdown(f"- {b}")
 
-    ic = A if B is None else {A.name: A, B.name: B}[st.radio("Analyse", [A.name, B.name], horizontal=True, key="ins-co")]
-    is_A = ic is A
-    i_vals, i_m, i_flags, i_bf, i_col = (vA, mA, flagsA, bfA, C1) if is_A else (vB, cmp_df, flagsB, bfB, C2)
-    i_bench, i_bench_lbl, i_bench_m = (vB, cmp_name, cmp_df) if is_A else (vA, A.name, mA)
-    i_tr = ins.trends(i_m, {t: m for t, m in all_m.items() if t != ic.ticker})
-    i_rc = ins.root_causes(ic.fin, i_m)
-    i_fix, i_cush = ins.fix_targets(ic.fin)
-    i_cards = ins.cards(ic.name, i_vals, i_m, ic.fin, i_flags, i_tr, i_rc, i_bench, i_bench_lbl, latest_all)
-    n_sev = {s: sum(1 for c in i_cards if c["severity"] == s) for s in ins.SEV_ORDER}
-    v_ = ins.verdict(i_vals, i_flags)
-    st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[v_['signal']]}'><div class='who' style='color:{i_col}'>● {esc(ic.name)}</div>"
+        ic = A if B is None else {A.name: A, B.name: B}[st.radio("Analyse", [A.name, B.name], horizontal=True, key="ins-co")]
+        is_A = ic is A
+        i_vals, i_m, i_flags, i_bf, i_col = (vA, mA, flagsA, bfA, C1) if is_A else (vB, cmp_df, flagsB, bfB, C2)
+        i_bench, i_bench_lbl, i_bench_m = (vB, cmp_name, cmp_df) if is_A else (vA, A.name, mA)
+        i_tr = ins.trends(i_m, {t: m for t, m in all_m.items() if t != ic.ticker})
+        i_rc = ins.root_causes(ic.fin, i_m)
+        i_fix, i_cush = ins.fix_targets(ic.fin)
+        i_cards = ins.cards(ic.name, i_vals, i_m, ic.fin, i_flags, i_tr, i_rc, i_bench, i_bench_lbl, latest_all)
+        n_sev = {s: sum(1 for c in i_cards if c["severity"] == s) for s in ins.SEV_ORDER}
+        v_ = ins.verdict(i_vals, i_flags)
+        st.markdown(f"<div class='banner' style='--c:{SIGNAL_COL[v_['signal']]}'><div class='who' style='color:{i_col}'>● {esc(ic.name)}</div>"
                 f"<div class='sig'>{v_['signal']}</div><div>{n_sev['High']} high-priority issues · {n_sev['Medium']} medium · "
                 f"{n_sev['Strength']} strengths · compared with {esc(i_bench_lbl)}</div></div>", unsafe_allow_html=True)
 
-    it = st.tabs(["Key insights", "Trends", "Root causes", "Peer position", "What it would take", "Summary"])
-    SEV_COL = {"High": RED, "Medium": AMBER, "Low": CB, "Strength": GREEN}
+        it = st.tabs(["Key insights", "Trends", "Root causes", "Peer position", "What it would take", "Summary"])
+        SEV_COL = {"High": RED, "Medium": AMBER, "Low": CB, "Strength": GREEN}
 
-    with it[0]:
-        st.caption("Ranked by priority. Each card shows the evidence, why a lender should care, what to ask, and where to look in the dashboard.")
-        show = st.segmented_control("Show", ["Risks", "Strengths", "All"], default="Risks", key="ins-filter") or "Risks"
-        sel = [c for c in i_cards if show == "All" or (show == "Strengths") == (c["severity"] == "Strength")]
-        if not sel:
-            st.info("Nothing to show for this filter.")
-        for c in sel:
-            with st.container(border=True):
-                st.markdown(f"<span style='background:{SEV_COL[c['severity']]};color:#fff;font-size:.7rem;font-weight:700;"
+        with it[0]:
+            st.caption("Ranked by priority. Each card shows the evidence, why a lender should care, what to ask, and where to look in the dashboard.")
+            show = st.segmented_control("Show", ["Risks", "Strengths", "All"], default="Risks", key="ins-filter") or "Risks"
+            sel = [c for c in i_cards if show == "All" or (show == "Strengths") == (c["severity"] == "Strength")]
+            if not sel:
+                st.info("Nothing to show for this filter.")
+            for c in sel:
+                with st.container(border=True):
+                    st.markdown(f"<span style='background:{SEV_COL[c['severity']]};color:#fff;font-size:.7rem;font-weight:700;"
                             f"padding:2px 8px;border-radius:999px'>{c['severity'].upper()}</span> "
                             f"<b style='font-size:1.02rem'>{esc(c['title'])}</b>", unsafe_allow_html=True)
-                st.markdown(c["body"])
-                if c["evidence"]:
-                    st.caption(" · ".join(c["evidence"]))
-                extra = []
-                if c["why"] and c["why"] not in c["body"]:
-                    extra.append(f"**Why it matters:** {c['why']}")
-                if c["ask"]:
-                    extra.append(f"**What to ask:** {c['ask']}")
-                extra.append(f"*See the {c['tab']} tab.*")
-                st.markdown("  \n".join(extra))
+                    st.markdown(c["body"])
+                    if c["evidence"]:
+                        st.caption(" · ".join(c["evidence"]))
+                    extra = []
+                    if c["why"] and c["why"] not in c["body"]:
+                        extra.append(f"**Why it matters:** {c['why']}")
+                    if c["ask"]:
+                        extra.append(f"**What to ask:** {c['ask']}")
+                    extra.append(f"*See the {c['tab']} tab.*")
+                    st.markdown("  \n".join(extra))
 
-    with it[1]:
-        worse = [t for t in i_tr if not t["improving"]]
-        better_ = [t for t in i_tr if t["improving"]]
-        st.caption(f"Change over the full history available ({len(i_m.columns)} fiscal years). Moves that change zone come first, "
+        with it[1]:
+            worse = [t for t in i_tr if not t["improving"]]
+            better_ = [t for t in i_tr if t["improving"]]
+            st.caption(f"Change over the full history available ({len(i_m.columns)} fiscal years). Moves that change zone come first, "
                    "then moves that are the largest in the sector.")
-        l, r = st.columns(2)
-        with l:
-            st.markdown("**Getting worse**")
-            for t in worse[:8]:
-                st.markdown(f"- {t['text']}")
-            if not worse:
-                st.write("No rated metric has deteriorated.")
-        with r:
-            st.markdown("**Getting better**")
-            for t in better_[:8]:
-                st.markdown(f"- {t['text']}")
-            if not better_:
-                st.write("No rated metric has improved.")
-        movers = [t for t in i_tr if t["zone"] != 0][:4] or i_tr[:4]
-        if movers:
-            st.markdown("##### Biggest moves")
-            mc = st.columns(2)
-            for j, t in enumerate(movers):
-                with mc[j % 2]:
-                    sers = {ic.name: i_m.loc[t["key"]]}
-                    if t["key"] in i_bench_m.index:
-                        sers[i_bench_lbl] = i_bench_m.loc[t["key"]]
-                    st.plotly_chart(trend(t["key"], sers, h=250), width="stretch", key=f"ins-tr-{t['key']}")
+            l, r = st.columns(2)
+            with l:
+                st.markdown("**Getting worse**")
+                for t in worse[:8]:
+                    st.markdown(f"- {t['text']}")
+                if not worse:
+                    st.write("No rated metric has deteriorated.")
+            with r:
+                st.markdown("**Getting better**")
+                for t in better_[:8]:
+                    st.markdown(f"- {t['text']}")
+                if not better_:
+                    st.write("No rated metric has improved.")
+            movers = [t for t in i_tr if t["zone"] != 0][:4] or i_tr[:4]
+            if movers:
+                st.markdown("##### Biggest moves")
+                mc = st.columns(2)
+                for j, t in enumerate(movers):
+                    with mc[j % 2]:
+                        sers = {ic.name: i_m.loc[t["key"]]}
+                        if t["key"] in i_bench_m.index:
+                            sers[i_bench_lbl] = i_bench_m.loc[t["key"]]
+                        st.plotly_chart(trend(t["key"], sers, h=250), width="stretch", key=f"ins-tr-{t['key']}")
 
-    with it[2]:
-        st.caption("Why the key numbers moved, traced back to the statement lines (latest year vs the year before).")
-        if not i_rc:
-            st.success("No major deterioration that needs explaining in the latest year.")
-        for c in sorted(i_rc, key=lambda c: ins.SEV_ORDER[c["severity"]]):
-            with st.container(border=True):
-                st.markdown(f"<span style='color:{SEV_COL[c['severity']]};font-weight:700'>●</span> <b>{esc(c['title'])}</b>",
-                            unsafe_allow_html=True)
-                st.markdown(c["text"])
-                if c["evidence"]:
-                    st.caption(" · ".join(c["evidence"]))
+        with it[2]:
+            st.caption("Why the key numbers moved, traced back to the statement lines (latest year vs the year before).")
+            if not i_rc:
+                st.success("No major deterioration that needs explaining in the latest year.")
+            for c in sorted(i_rc, key=lambda c: ins.SEV_ORDER[c["severity"]]):
+                with st.container(border=True):
+                    st.markdown(f"<span style='color:{SEV_COL[c['severity']]};font-weight:700'>●</span> <b>{esc(c['title'])}</b>",
+                                unsafe_allow_html=True)
+                    st.markdown(c["text"])
+                    if c["evidence"]:
+                        st.caption(" · ".join(c["evidence"]))
 
-    with it[3]:
-        top, bottom = ins.peer_position(i_vals, latest_all)
-        st.caption(f"Percentile = share of the {len(latest_all)} companies loaded in {sector} that {ic.name} beats on each metric "
+        with it[3]:
+            top, bottom = ins.peer_position(i_vals, latest_all)
+            st.caption(f"Percentile = share of the {len(latest_all)} companies loaded in {sector} that {ic.name} beats on each metric "
                    "(higher is always better).")
 
-        def pp_table(rows):
-            return pd.DataFrame([{"Metric": mt.M[k]["label"], "Value": fmtv(k, i_vals.get(k)), "Percentile": p} for k, p in rows])
-        cfg = {"Percentile": st.column_config.ProgressColumn("Percentile", min_value=0, max_value=100, format="%.0f")}
-        l, r = st.columns(2)
-        for col_, rows_, head_ in ((l, top, "Top quartile (sector leader)"), (r, bottom, "Bottom quartile (sector laggard)")):
-            with col_:
-                st.markdown(f"**{head_}**")
-                if rows_:
-                    st.dataframe(pp_table(rows_), column_config=cfg, hide_index=True, width="stretch")
-                else:
-                    st.write("None.")
-        if len(latest_all) < 5:
-            st.caption("Few companies are loaded for this sector, so percentiles are coarse.")
+            def pp_table(rows):
+                return pd.DataFrame([{"Metric": mt.M[k]["label"], "Value": fmtv(k, i_vals.get(k)), "Percentile": p} for k, p in rows])
+            cfg = {"Percentile": st.column_config.ProgressColumn("Percentile", min_value=0, max_value=100, format="%.0f")}
+            l, r = st.columns(2)
+            for col_, rows_, head_ in ((l, top, "Top quartile (sector leader)"), (r, bottom, "Bottom quartile (sector laggard)")):
+                with col_:
+                    st.markdown(f"**{head_}**")
+                    if rows_:
+                        st.dataframe(pp_table(rows_), column_config=cfg, hide_index=True, width="stretch")
+                    else:
+                        st.write("None.")
+            if len(latest_all) < 5:
+                st.caption("Few companies are loaded for this sector, so percentiles are coarse.")
 
-    with it[4]:
-        st.caption(f"Based on FY{ic.fin.index[-1]} statements. Targets are the healthy thresholds used across the dashboard; "
+        with it[4]:
+            st.caption(f"Based on FY{ic.fin.index[-1]} statements. Targets are the healthy thresholds used across the dashboard; "
                    "each fix assumes everything else stays the same.")
-        l, r = st.columns(2)
-        with l:
-            st.markdown("**To reach the healthy zone**")
-            if not i_fix:
-                st.success("All the tested metrics are already in the healthy zone.")
-            for f_ in i_fix:
-                with st.container(border=True):
-                    st.markdown(f"**{mt.M[f_['key']]['label']}**: {fmtv(f_['key'], f_['now'])} → target {fmtv(f_['key'], f_['target'])}")
-                    st.markdown(f_["text"])
-        with r:
-            st.markdown("**Cushion before the concern zone**")
-            if not i_cush:
-                st.write("No healthy metric to stress.")
-            for c in i_cush:
-                with st.container(border=True):
-                    st.markdown(f"**{mt.M[c['key']]['label']}**: {fmtv(c['key'], i_vals.get(c['key']))}")
-                    st.markdown(c["text"])
-        st.caption("Use the Credit workbench tab to test combined shocks and a new facility.")
+            l, r = st.columns(2)
+            with l:
+                st.markdown("**To reach the healthy zone**")
+                if not i_fix:
+                    st.success("All the tested metrics are already in the healthy zone.")
+                for f_ in i_fix:
+                    with st.container(border=True):
+                        st.markdown(f"**{mt.M[f_['key']]['label']}**: {fmtv(f_['key'], f_['now'])} → target {fmtv(f_['key'], f_['target'])}")
+                        st.markdown(f_["text"])
+            with r:
+                st.markdown("**Cushion before the concern zone**")
+                if not i_cush:
+                    st.write("No healthy metric to stress.")
+                for c in i_cush:
+                    with st.container(border=True):
+                        st.markdown(f"**{mt.M[c['key']]['label']}**: {fmtv(c['key'], i_vals.get(c['key']))}")
+                        st.markdown(c["text"])
+            st.caption("Use the Credit workbench tab to test combined shocks and a new facility.")
 
-    with it[5]:
-        st.caption("The original rule-based summary.")
-        render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
+        with it[5]:
+            st.caption("The original rule-based summary.")
+            render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
 
 # ------------------------------------------------------------------ Data & method
-with tabs[10]:
-    st.subheader("Data quality")
-    dq = []
-    for comp in ([A] + ([B] if B else [])):
-        fin = comp.fin
-        ok = int(all_m[comp.ticker].iloc[:, -1].notna().sum())
-        gap = np.nan
-        if {"ta", "tl", "equity"} <= set(fin.columns):
-            r = fin.iloc[-1]
-            gap = abs(r["ta"] - (r["tl"] + r["equity"])) / r["ta"] if r["ta"] else np.nan
-        dq.append({"Company": comp.name, "Latest period": comp.period_end or "n/a", "Fetched": comp.fetched_at or "n/a",
-                   "Years of data": len(fin), "Metrics computable": f"{ok} of {len(mt.M)}",
-                   "Balance check": "n/a" if pd.isna(gap) else (f"OK ({gap:.1%} gap)" if gap < 0.05 else f"Check ({gap:.1%} gap - minority interest or Yahoo mapping)"),
-                   "Fields Yahoo did not supply": ", ".join(comp.missing) or "none"})
-    st.dataframe(pd.DataFrame(dq), width="stretch", hide_index=True)
-    st.subheader("Data used")
-    for comp in ([A] + ([B] if B else [])):
-        st.write(f"Standardised annual statements for **{comp.name}** (Rs crore):")
-        st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
-    st.subheader("Metric dictionary and thresholds")
-    if SECTOR_MODE:
-        st.caption(f"Cut-offs below are **sector-relative** for {sector} ({strict} strictness): taken from this sector's own "
+if tabs[10] is not None:
+    with tabs[10]:
+        st.subheader("Data quality")
+        dq = []
+        for comp in ([A] + ([B] if B else [])):
+            fin = comp.fin
+            ok = int(all_m[comp.ticker].iloc[:, -1].notna().sum())
+            gap = np.nan
+            if {"ta", "tl", "equity"} <= set(fin.columns):
+                r = fin.iloc[-1]
+                gap = abs(r["ta"] - (r["tl"] + r["equity"])) / r["ta"] if r["ta"] else np.nan
+            dq.append({"Company": comp.name, "Latest period": comp.period_end or "n/a", "Fetched": comp.fetched_at or "n/a",
+                       "Years of data": len(fin), "Metrics computable": f"{ok} of {len(mt.M)}",
+                       "Balance check": "n/a" if pd.isna(gap) else (f"OK ({gap:.1%} gap)" if gap < 0.05 else f"Check ({gap:.1%} gap - minority interest or Yahoo mapping)"),
+                       "Fields Yahoo did not supply": ", ".join(comp.missing) or "none"})
+        st.dataframe(pd.DataFrame(dq), width="stretch", hide_index=True)
+        st.subheader("Data used")
+        for comp in ([A] + ([B] if B else [])):
+            st.write(f"Standardised annual statements for **{comp.name}** (Rs crore):")
+            st.dataframe(comp.fin.T.style.format("{:,.1f}", na_rep="n/a"), width="stretch")
+        st.subheader("Metric dictionary and thresholds")
+        if SECTOR_MODE:
+            st.caption(f"Cut-offs below are **sector-relative** for {sector} ({strict} strictness): taken from this sector's own "
                    "distribution where at least 6 companies have the metric, otherwise the textbook cut-off.")
-    elif strict != "Standard":
-        st.caption(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
-    st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
-                                "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
-                                "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1],
-                                "Cut-off source": "sector" if mt.is_sector_band(k) else ("textbook" if m["dir"] and m["green"] is not None else "-"),
-                                "Textbook healthy": m["green"], "Textbook concern": m["red"]} for k, m in mt.M.items()]),
-                 width="stretch", hide_index=True)
-    st.subheader("Assumptions & limitations")
-    st.markdown(f"""
+        elif strict != "Standard":
+            st.caption(f"Cut-offs below reflect the **{strict}** strictness chosen in View options (Standard ± 20%).")
+        st.dataframe(pd.DataFrame([{"Metric": m["label"], "Group": m["group"], "Formula": m["formula"], "Meaning": m["desc"],
+                                    "Better when": {"high": "higher", "low": "lower", None: "-"}[m["dir"]],
+                                    "Healthy at": mt.thresholds(k)[0], "Concern at": mt.thresholds(k)[1],
+                                    "Cut-off source": "sector" if mt.is_sector_band(k) else ("textbook" if m["dir"] and m["green"] is not None else "-"),
+                                    "Textbook healthy": m["green"], "Textbook concern": m["red"]} for k, m in mt.M.items()]),
+                     width="stretch", hide_index=True)
+        st.subheader("Assumptions & limitations")
+        st.markdown(f"""
 - **Yahoo Finance gives about 4 annual periods**, so averages, Piotroski, Beneish and the Ohlson change term need the prior year and start in year 2. Data is cached for 6 hours; annual statements change only when a company files new results, while market cap moves daily.
 - **DSCR is a proxy**: (CFO + interest) ÷ (interest + current portion of debt). True DSCR needs the repayment schedule.
 - **Defensive interval** uses cash opex = Revenue − EBITDA; liquid assets = cash & short-term investments + receivables.
