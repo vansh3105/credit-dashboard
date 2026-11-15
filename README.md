@@ -19,13 +19,24 @@ Data comes live from Yahoo Finance via `yfinance` (needs internet). The first lo
 | `data.py` | Yahoo pull + mapping of Yahoo row names to standard fields (INR crore). |
 | `metrics.py` | Every formula, thresholds (green/red), Benford test, red-flag rules. Source session noted per metric. |
 | `report.py` | Credit memo: internal grade and notching, memo content, PDF / Word / Markdown export with charts. |
+| `news.py` | News & ratings tab: Google News / Yahoo headlines, keyword credit screen, rating extraction and mapping to CR grades, optional Claude analysis. |
 | `early_warning.py` | Early-warning tab: quarterly and half-year signals, share-price signals vs sector, Merton distance-to-default. |
 | `insights.py` | Rule-based narrative (no LLM). |
 | `app.py` | Streamlit UI. |
 | `tests/` | Unit tests using the decks' worked examples (Apex liquidity case, accrual A/B, Ohlson 63.7%, Dhenu conversion, Benford, Beneish). |
+| `tests/test_news.py` | Keyword screen, rating extraction and attribution, news signal, memo rendering, and the AI call with a fake client. |
 | `tests/test_breakdowns.py` | Checks the score breakdowns reproduce the scores exactly, and the insight rules find the right cause on a deteriorating test firm. |
 
 ## First live run - check these
 1. Sidebar warning lists tickers that failed to load (tickers were written from memory; fix in `sectors.py`).
 2. *Data & method* tab shows which Yahoo fields were missing for the selected company.
 3. Spot-check 3 numbers against the annual report, and compare Altman/Beneish/Piotroski with TradingView.
+
+## Optional: AI reading of the news
+
+The News & ratings tab can ask Claude to read the headlines. Add an Anthropic API key:
+
+- **Streamlit Cloud:** app menu → Settings → Secrets → `ANTHROPIC_API_KEY = "sk-ant-..."`
+- **Locally:** create `.streamlit/secrets.toml` with the same line (git-ignored).
+
+Without a key everything else works; the AI never changes the grade or the early-warning signal.

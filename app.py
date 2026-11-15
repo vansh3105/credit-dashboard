@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import dataclasses
+from datetime import datetime, timezone
 import importlib
 import os
 
@@ -15,6 +16,7 @@ import early_warning as ew
 import insights as ins
 import report as rp
 import metrics as mt
+import news as nw
 import sectors
 
 
@@ -35,6 +37,7 @@ mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
 ew = _fresh(ew)
 rp = _fresh(rp)
+nw = _fresh(nw)
 SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
@@ -138,6 +141,7 @@ with st.sidebar.expander("Settings", expanded=False):
                           help="Total assets (Rs crore) are divided by this index in the Ohlson size term.")
 if st.sidebar.button("Reload data", help="Discard saved data and fetch again from Yahoo Finance"):
     dt.clear_cache()
+    nw.clear_cache()
     st.rerun()
 st.sidebar.markdown("---")
 st.sidebar.markdown("**How to read signals**  \n✓ Healthy · ! Watch · ✕ Concern  \n"
@@ -569,12 +573,21 @@ def ew_bundle(comp, rf):
     mert_ = ew.merton(comp.mcap_cr, mk["vol"] if mk else np.nan, D, rf)
     hist_ = ew.dd_history(px_all[comp.ticker], comp.mcap_cr, D, rf) if comp.ticker in px_all.columns else pd.DataFrame()
     sigs_ = ew.signals(comp.fin, q_, mk, [m for t, m in mkt_all.items() if t != comp.ticker], mert_, hist_, annual_end_of(comp))
+    news_ = nw.get_news(comp.name, comp.ticker)
+    if sigs_:
+        ns = nw.news_signal(news_["items"])
+        sigs_.append(dict(area="News", signal="News flow (keyword screen)", value=ns["value"], status=ns["status"],
+                          rule="Concern: high-severity negative headline in 90 days or agency downgrade in 180 · "
+                               "Watch: 3+ medium negatives in 90 days or a high-severity one in the year",
+                          why="Defaults, downgrades, probes and auditor exits reach the press before the next filing."
+                              + (f" Trigger: “{ns['trigger']}”" if ns["trigger"] else "")))
     n_, lvl_ = ew.summary(sigs_)
-    return dict(px_all=px_all, q=q_, mkt_all=mkt_all, mk=mk, D=D, D_src=src, mert=mert_, hist=hist_, sigs=sigs_, n=n_, level=lvl_)
+    return dict(px_all=px_all, q=q_, mkt_all=mkt_all, mk=mk, D=D, D_src=src, mert=mert_, hist=hist_, sigs=sigs_, n=n_, level=lvl_,
+                news=news_)
 
 
 tabs = st.tabs(["Overview", "Liquidity", "Solvency & debt service", "Earnings quality", "Distress & forensic",
-                "Early warning", "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
+                "Early warning", "News & ratings", "Cash flow & lifecycle", "Credit workbench · ADVANCED", "Insights", "Data & method"])
 
 # ------------------------------------------------------------------ Overview
 with tabs[0]:
@@ -1107,8 +1120,241 @@ assumes log-normal assets, so read the level loosely and the **trend** carefully
                 st.caption("Riskiest at the top. Dotted lines: PD 5% (red) and 1% (amber). Annual-report debt for every company."
                            + (f" No debt (not shown): {', '.join(nd_)}." if nd_ else ""))
 
-# ------------------------------------------------------------------ Cash flow & lifecycle
+# ------------------------------------------------------------------ News & ratings
 with tabs[6]:
+    st.markdown(f"### News & credit ratings {ADV}", unsafe_allow_html=True)
+    st.caption("Headlines from the last 12 months (Google News and Yahoo Finance) that name the company, screened for credit events, "
+               "plus the latest rating-agency actions set against this dashboard's grade. Headlines only - full articles are often paywalled.")
+    nc = A if B is None else {A.name: A, B.name: B}[st.radio("Company", [A.name, B.name], horizontal=True, key="nw-co")]
+    with st.spinner("Fetching headlines…"):
+        nres = nw.get_news(nc.name, nc.ticker)
+    items = nres["items"]
+    if nres["errors"]:
+        st.caption("Some news sources did not respond: " + ", ".join(nres["errors"]) + ". Use *Reload data* to try again.")
+    ns = nw.news_signal(items)
+    NS_TXT = {"R": ("CONCERN", RED), "A": ("WATCH", AMBER), "G": ("CLEAR", GREEN), None: ("NO HEADLINES", "#8b949e")}[ns["status"]]
+    st.markdown(f"<div class='banner' style='--c:{NS_TXT[1]}'><div class='who' style='color:{C1 if nc is A else C2}'>● {esc(nc.name)}</div>"
+                f"<div class='sig'>{NS_TXT[0]}</div><div>News flow (keyword screen) · {len(items)} headlines in 12 months · "
+                f"{ns['value']}</div></div>", unsafe_allow_html=True)
+    if ns["trigger"]:
+        st.caption(f"Driven by: “{ns['trigger']}”. This is the *News flow* signal in the Early warning tab.")
+
+    # ---- ratings
+    st.markdown("#### Credit ratings: agencies vs this model")
+
+    def model_grade(t):
+        """Grade from the quantitative score on textbook cut-offs (no early-warning or analyst notches)."""
+        mt.set_basis("Textbook")
+        s_ = mt.overall_score(mt.pillar_scores(latest_all[t], companies[t].gov), W)
+        mt.set_basis(basis_sel, SECTOR_VALS)
+        return rp.grade_index(s_), s_
+
+    def gap_words(gap):
+        if gap is None:
+            return "–"
+        return "same grade" if gap == 0 else f"model {abs(gap)} grade{'s' * (abs(gap) > 1)} {'lower' if gap > 0 else 'higher'}"
+
+    gi, gsc = model_grade(nc.ticker)
+    r1, r2 = st.columns([1, 3])
+    with r1:
+        if gi is None:
+            st.metric("Model grade", "n/a")
+        else:
+            st.metric("Model grade (score only)", rp.grade_info(gi)["label"], f"score {gsc:.0f}/100", delta_color="off",
+                      help="Quantitative score on textbook cut-offs mapped to CR1-CR9, before early-warning and analyst notches - "
+                           "the same base grade as the Credit memo.")
+        with st.popover("Enter a rating you looked up", width="stretch"):
+            st.caption("From the agency's website or the company's annual report. Kept for this session only.")
+            m_ag = st.selectbox("Agency", ["CRISIL", "ICRA", "CARE", "India Ratings", "Acuite", "Brickwork"], key=f"nw-man-ag-{nc.ticker}")
+            m_rt = st.selectbox("Long-term rating", ["–", "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB",
+                                                     "BB-", "B+", "B", "B-", "C", "D"], key=f"nw-man-rt-{nc.ticker}")
+            m_ol = st.selectbox("Outlook", ["Stable", "Positive", "Negative", "Developing", "Watch"], key=f"nw-man-ol-{nc.ticker}")
+    rats = nw.latest_ratings(items)
+    if m_rt != "–":
+        rats = [dict(agency=m_ag, rating=m_rt, outlook=m_ol, action="Entered by analyst", scale="national",
+                     date=datetime.now(timezone.utc), title="Entered manually", url="", source="")] + \
+               [r_ for r_ in rats if r_["agency"] != m_ag]
+    with r2:
+        if not rats:
+            st.info("No rating action named this company in the last 12 months of headlines. Agencies publish every rating on their "
+                    "own sites (CRISIL, ICRA, CARE, India Ratings) - check there before relying on the model grade alone.")
+        else:
+            rrows = []
+            for r_ in rats:
+                ai_ = nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None
+                gap = (gi - ai_) if (gi is not None and ai_ is not None) else None
+                rrows.append({"Agency": r_["agency"], "Scale": r_["scale"].title(), "Rating": r_["rating"] or "–",
+                              "Outlook": r_["outlook"] or "–", "Action": r_["action"] or "–", "Date": f"{r_['date']:%d %b %Y}",
+                              "≈ CR grade": rp.GRADES[ai_][1] if ai_ is not None else "–", "Gap": gap_words(gap),
+                              "Headline": r_["title"], "Link": r_["url"] or None})
+            st.dataframe(pd.DataFrame(rrows), hide_index=True, width="stretch",
+                         column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                        "Headline": st.column_config.TextColumn(width="large")})
+    nat = [r_ for r_ in rats if r_["scale"] == "national" and nw.grade_index_of(r_["rating"]) is not None]
+    if nat and gi is not None:
+        r_ = nat[0]
+        gap = gi - nw.grade_index_of(r_["rating"])
+        if abs(gap) <= 1:
+            st.success(f"The model broadly agrees with {r_['agency']} ({r_['rating']}): {gap_words(gap)}.")
+        elif gap > 0:
+            st.warning(f"The model is {gap} grades below {r_['agency']} ({r_['rating']}). Agencies also weigh what the statements do not show: "
+                       "market position, parent or state support, regulated returns and access to funding. Textbook cut-offs are also harsh "
+                       "on capital-heavy sectors. Read the agency's rationale before treating the gap as a red flag.")
+        else:
+            st.error(f"The model is {-gap} grades above {r_['agency']} ({r_['rating']}). The agency may be seeing risks the ratios miss - "
+                     "contingent liabilities, group exposure, refinancing walls or governance. Read its rationale before relying on the model.")
+    if rats:
+        st.caption("Ratings are read from headlines, so check the entity named (group companies share names) and the date. "
+                   "Moody's, Fitch and S&P use a global scale capped near India's sovereign rating (BBB- / Baa3), so they are shown but "
+                   "not compared with the national-scale CR grade.")
+    if not EW_LATEST:
+        st.caption("The model grade above uses the as-of year chosen in View options; ratings and headlines are always current.")
+
+    with st.expander(f"Model vs agencies across the {sector} sector"):
+        st.caption("Searches rating-agency headlines for every company in the sector (one search each, cached 6 hours) and lines up the "
+                   "latest national-scale rating against the model grade. A real-world check on how far the model can be trusted.")
+        skey = f"nw-sector-{sector}-{asof_y}"
+        if st.button("Run the sector check", key="nw-sector-btn"):
+            def one(t):
+                r_ = nw.get_news(companies[t].name, t, sources=("Rating agencies",))
+                return t, [x for x in nw.latest_ratings(r_["items"]) if x["scale"] == "national" and nw.grade_index_of(x["rating"]) is not None]
+            from concurrent.futures import ThreadPoolExecutor
+            with st.spinner(f"Searching rating news for {len(companies)} companies…"), ThreadPoolExecutor(8) as ex_:
+                st.session_state[skey] = dict(ex_.map(one, list(companies)))
+        found = st.session_state.get(skey)
+        if found is not None:
+            srows = []
+            for t, lst in found.items():
+                g_, s_ = model_grade(t)
+                if not lst or g_ is None:
+                    continue
+                r_ = lst[0]
+                ag_i = nw.grade_index_of(r_["rating"])
+                srows.append({"Company": companies[t].name, "Model": rp.GRADES[g_][1], "Score": round(s_),
+                              "Agency": f"{r_['agency']} {r_['rating']}", "≈ CR grade": rp.GRADES[ag_i][1], "gap": g_ - ag_i,
+                              "Gap": gap_words(g_ - ag_i), "Date": f"{r_['date']:%b %Y}", "_m": g_, "_a": ag_i})
+            if not srows:
+                st.info("No national-scale ratings found in headlines for this sector.")
+            else:
+                sdf_ = pd.DataFrame(srows).sort_values("gap", key=abs, ascending=False)
+                within = (sdf_["gap"].abs() <= 1).mean()
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Companies with a rating found", f"{len(sdf_)} of {len(companies)}")
+                k2.metric("Within one grade", f"{within:.0%}")
+                k3.metric("Average gap", f"{sdf_['gap'].mean():+.1f} grades",
+                          help="Positive = the model is harsher than the agencies on average.")
+                jit = np.linspace(-0.18, 0.18, len(sdf_))
+                fig_ = go.Figure()
+                fig_.add_trace(go.Scatter(x=[0, 8], y=[0, 8], mode="lines", line=dict(color="#8b949e", dash="dot"), hoverinfo="skip",
+                                          name="agreement"))
+                fig_.add_trace(go.Scatter(x=sdf_["_a"] + jit, y=sdf_["_m"] - jit, mode="markers", name="company",
+                                          marker=dict(size=11, color=[C1 if n_ == A.name else (C2 if B is not None and n_ == B.name else "#57606a")
+                                                                      for n_ in sdf_["Company"]]),
+                                          text=sdf_["Company"] + " · " + sdf_["Agency"] + " · model " + sdf_["Model"],
+                                          hovertemplate="%{text}<extra></extra>"))
+                ticks = dict(tickmode="array", tickvals=list(range(9)), ticktext=[f"{g[1]}<br>≈{g[2]}" for g in rp.GRADES])
+                fig_.update_layout(height=420, template="plotly_white", margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
+                                   xaxis=dict(title="Agency rating (mapped)", range=[-0.5, 8.5], **ticks),
+                                   yaxis=dict(title="Model grade", range=[8.5, -0.5], **ticks))
+                st.plotly_chart(fig_, width="stretch", key="nw-sector-fig")
+                st.caption("Dots on the dotted line agree; below it the model is harsher than the agency, above it more lenient.")
+                st.dataframe(sdf_.drop(columns=["gap", "_m", "_a"]), hide_index=True, width="stretch")
+
+    # ---- AI
+    st.markdown("#### AI read of the headlines")
+    ai_key = f"nw-ai-{nc.ticker}"
+    sent = nw.ai_input(items)
+    if not nw.api_key():
+        st.info("Optional: add an Anthropic API key to have Claude read these headlines, judge each one for lenders, pick out rating "
+                "actions and write a short digest with follow-up questions.  \n"
+                "**Streamlit Cloud:** app menu → Settings → Secrets → `ANTHROPIC_API_KEY = \"sk-ant-...\"`.  \n"
+                "**Locally:** `.streamlit/secrets.toml` with the same line (that file is git-ignored). "
+                "Everything else on this tab works without it.")
+    elif not sent:
+        st.caption("No credit-relevant headlines to analyse.")
+    else:
+        a1, a2 = st.columns([1, 3])
+        if a1.button(f"Analyse {len(sent)} headlines with AI", key=f"nw-ai-btn-{nc.ticker}", type="primary"):
+            with st.spinner(f"{nw.AI_MODEL} is reading the headlines…"):
+                try:
+                    st.session_state[ai_key] = (nw.ai_analyse(nc.name, sector, sent), [it["title"] for it in sent])
+                except RuntimeError as e:
+                    st.error(str(e))
+        a2.caption("One request per click, cached 6 hours. Share-price chatter is left out. The AI sees only headlines and short snippets, "
+                   "can misread them, and does not change the grade or the early-warning signal - treat it as a reading aid.")
+    ai_res = st.session_state.get(ai_key)
+    ai_map = {}
+    if ai_res:
+        ai, sent_titles = ai_res
+        sent_items = [next((it for it in items if it["title"] == t_), {"title": t_, "url": ""}) for t_ in sent_titles]
+        ai_map = nw.ai_by_title(sent_items, ai)
+        RISK_COL = {"Low": GREEN, "Moderate": AMBER, "High": RED}
+        st.markdown(f"<div class='banner' style='--c:{RISK_COL.get(ai['news_risk'], '#8b949e')}'><div class='who'>AI view</div>"
+                    f"<div class='sig'>{ai['news_risk'].upper()} NEWS RISK</div><div>{len(ai_map)} headlines read</div></div>",
+                    unsafe_allow_html=True)
+        st.markdown(ai["digest"])
+        if ai.get("watch_points"):
+            st.markdown("**Questions for management**  \n" + "\n".join(f"- {w}" for w in ai["watch_points"]))
+        if ai.get("ratings"):
+            st.markdown("**Rating actions the AI found**")
+            st.dataframe(pd.DataFrame([{"Agency": r_["agency"], "Rating": r_["rating"] or "–", "Outlook": r_["outlook"] or "–",
+                                        "Action": r_["action"] or "–",
+                                        "Headline": sent_items[r_["id"]]["title"] if 0 <= r_["id"] < len(sent_items) else ""}
+                                       for r_ in ai["ratings"]]), hide_index=True, width="stretch")
+        dis = sum(1 for it in items if it["title"] in ai_map and ai_map[it["title"]]["relevant"] and ai_map[it["title"]]["tone"] != it["tone"])
+        irr = sum(1 for x in ai_map.values() if not x["relevant"])
+        with st.expander("Headlines the digest cites"):
+            for i_, it in enumerate(sent_items):
+                st.markdown(f"[{i_}] [{esc(it['title'])}]({it.get('url', '')})")
+        st.caption(f"The AI disagrees with the keyword screen on the tone of {dis} headline(s) and judged {irr} not really about "
+                   f"{nc.name}. Model {ai.get('model')}, {ai['usage']['in']:,} input / {ai['usage']['out']:,} output tokens.")
+
+    # ---- headlines
+    st.markdown("#### Headlines")
+    if not items:
+        st.info("No headlines naming this company in the last 12 months.")
+    else:
+        f1, f2, f3 = st.columns([1, 2, 2])
+        hide_mkt = f1.toggle("Hide share-price chatter", True, key="nw-hide-mkt")
+        tones = f2.segmented_control("Tone", ["negative", "neutral", "positive"], selection_mode="multi",
+                                     default=["negative", "neutral", "positive"], key="nw-tone") or []
+        cats = f3.multiselect("Category", nw.CATEGORIES, key="nw-cat", placeholder="All categories")
+        view = [it for it in items if (not hide_mkt or it["category"] != "Market commentary") and it["tone"] in tones
+                and (not cats or it["category"] in cats)]
+        TONE_COL = {"negative": RED, "neutral": "#8b949e", "positive": GREEN}
+        mdf = pd.DataFrame([{"m": it["date"].strftime("%Y-%m"), "tone": it["tone"]} for it in view])
+        if not mdf.empty:
+            fig_ = go.Figure()
+            for tn in ("negative", "neutral", "positive"):
+                cnt = mdf[mdf["tone"] == tn].groupby("m").size()
+                fig_.add_trace(go.Bar(x=cnt.index, y=cnt.values, name=tn, marker_color=TONE_COL[tn]))
+            fig_.update_layout(barmode="stack", height=230, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                               legend=dict(orientation="h", y=-0.3), xaxis=dict(type="category"), yaxis_title="headlines")
+            st.plotly_chart(fig_, width="stretch", key="nw-timeline")
+        TONE_TXT = {"negative": "✕ negative", "neutral": "· neutral", "positive": "✓ positive"}
+        hrows = []
+        for it in view:
+            row = {"Date": it["date"].strftime("%d %b %Y"), "Headline": it["title"], "Source": it["source"] or it["via"],
+                   "Category": it["category"], "Tone": TONE_TXT[it["tone"]], "Severity": it["severity"]}
+            x = ai_map.get(it["title"])
+            if ai_map:
+                row["AI tone"] = ("not about company" if not x["relevant"] else TONE_TXT[x["tone"]]) if x else "–"
+                row["AI note"] = x["note"] if x else ""
+            row["Link"] = it["url"]
+            hrows.append(row)
+        hdf = pd.DataFrame(hrows)
+        tcss = lambda v: {"✕ negative": SIG_CSS["✕ Concern"], "✓ positive": SIG_CSS["✓ Healthy"]}.get(v, "")
+        st.dataframe(style_cells(hdf, tcss, [c for c in ("Tone", "AI tone") if c in hdf.columns]) if len(hdf) else hdf,
+                     hide_index=True, width="stretch", height=min(600, 38 + 35 * len(hdf)),
+                     column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                    "Headline": st.column_config.TextColumn(width="large"),
+                                    "AI note": st.column_config.TextColumn(width="large")})
+        st.caption(f"{len(view)} of {len(items)} headlines shown. Tone and severity come from a transparent keyword screen "
+                   "(see Data & method); it can misread unusual wording.")
+
+
+# ------------------------------------------------------------------ Cash flow & lifecycle
+with tabs[7]:
     st.subheader("Cash flow & lifecycle")
     st.caption("Where the cash came from and where it went, and what stage of life the business is in.")
     yrs = sorted(set(A.fin.index) | (set(B.fin.index) if B is not None else set()))
@@ -1145,7 +1391,7 @@ with tabs[6]:
                      width="stretch", hide_index=True)
 
 # ------------------------------------------------------------------ ADVANCED: credit workbench
-with tabs[7]:
+with tabs[8]:
     st.markdown(f"### Credit workbench {ADV}", unsafe_allow_html=True)
     st.caption("Decision tools built on top of the core ratios. Assumptions are simplified and listed in *Data & method*.")
     bor_name = st.radio("Borrower", [A.name] + ([B.name] if B is not None else []), horizontal=True, key="borrower") if B is not None else A.name
@@ -1400,10 +1646,24 @@ with tabs[7]:
         cmp_lbl = cmp_name if BC is A else A.name
         pcmp_ = pB if BC is A else pA
         hist_b = ew_b["hist"] if ew_b else None
+        news_ctx = None
+        if ew_b and ew_b.get("news"):
+            n_items = ew_b["news"]["items"]
+            n_rats = nw.latest_ratings(n_items)
+            m_rt_ = st.session_state.get(f"nw-man-rt-{BC.ticker}", "–")
+            if m_rt_ and m_rt_ != "–":                      # a rating the analyst entered on the News & ratings tab wins
+                m_ag_ = st.session_state.get(f"nw-man-ag-{BC.ticker}", "CRISIL")
+                n_rats = [dict(agency=m_ag_, rating=m_rt_, outlook=st.session_state.get(f"nw-man-ol-{BC.ticker}"),
+                               action="Entered by analyst", scale="national", date=datetime.now(timezone.utc))] + \
+                         [r_ for r_ in n_rats if r_["agency"] != m_ag_]
+            news_ctx = dict(signal=nw.news_signal(n_items),
+                            ratings=[dict(r_, cr=nw.grade_index_of(r_["rating"]) if r_["scale"] == "national" else None)
+                                     for r_ in n_rats][:4],
+                            top=[it for it in n_items if it["tone"] == "negative" and it["severity"] in ("high", "medium")][:5])
         ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
                    vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
                    req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
-                   cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, security_cover=cover, override=override,
+                   cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, security_cover=cover, override=override,
                    override_reason=ov_reason.strip(),
                    analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
                                 management=mgmt, outlook=outlook, notes=notes.strip()))
@@ -1433,7 +1693,7 @@ with tabs[7]:
             st.markdown(md_text)
 
 # ------------------------------------------------------------------ Insights
-with tabs[8]:
+with tabs[9]:
     st.subheader("Insights & analysis")
 
     def render(secs):
@@ -1568,7 +1828,7 @@ with tabs[8]:
         render(ins.build(ic.name, i_vals, i_flags, cmp_label if is_A else A.name, i_bench, None if (B is None) else i_bench_lbl, i_bf))
 
 # ------------------------------------------------------------------ Data & method
-with tabs[9]:
+with tabs[10]:
     st.subheader("Data quality")
     dq = []
     for comp in ([A] + ([B] if B else [])):
@@ -1620,6 +1880,7 @@ with tabs[9]:
   concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
   textbook cut-off.
 - {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate editable (default 6.5%); probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
+- {ADV} **News & ratings** runs three Google News searches per company (debt and ratings; legal and governance; rating agencies) plus Yahoo Finance's feed, keeps headlines from the last 12 months that name the company, and drops duplicates. A **keyword screen** tags each with a category, a tone for lenders and a severity; share-price chatter and broker calls (\"downgraded to Sell\") are treated as neutral. **News flow signal**: Concern if a high-severity negative headline (default, insolvency, fraud, downgrade, ban, auditor exit…) appeared in the last 90 days or an agency downgrade in the last 180; Watch if three or more medium negatives in 90 days or a high-severity one in the year. **Ratings** are read from headlines naming CRISIL, ICRA, CARE, India Ratings, Acuite, Brickwork, Moody's, Fitch or S&P, only from the clause that names the company. National-scale ratings map to CR grades (AAA→CR1, AA→CR2, A→CR3, BBB→CR4, BB→CR5, B+→CR6, B/B-→CR7, CCC→CR8, below→CR9); global-scale ratings are shown but not compared, since they sit under India's sovereign ceiling. The **AI read** (optional, needs an Anthropic API key) sends the non-chatter headlines to Claude, which returns a per-headline judgement, rating actions, a news-risk level, a digest and questions for management. It never changes the grade or the early-warning signal.
 - {ADV} **Credit memo and internal grade.** The quantitative score on *textbook* cut-offs maps to a 9-step internal scale (CR1 ≈ AAA … CR9 ≈ CC/C) with an indicative one-year PD - a rounded long-run average default rate for the equivalent agency grade, not a company-specific estimate. Whole-notch adjustments: early warning (Watch −1, Elevated −2), management (Strong +1, Weak −1), negative industry outlook (−1), capped at ±2 together; security cover of 1.5x or more lifts the facility (not the issuer) one notch. The grade never depends on the screen's scoring basis; the sector-relative score is shown beside it as relative standing, with a warning when a weak grade mainly reflects the sector (e.g. utilities). PDF and Word files are built only when a download button is clicked.
 - **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
   of total assets respectively.

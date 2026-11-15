@@ -45,8 +45,9 @@ def grade_index(score):
 
 
 def grade_info(i):
-    lo, g, eq, pd_, meaning = GRADES[max(0, min(i, len(GRADES) - 1))]
-    return dict(grade=g, equiv=eq, pd=pd_, meaning=meaning, label=f"{g} (≈ {eq})")
+    i = max(0, min(i, len(GRADES) - 1))
+    lo, g, eq, pd_, meaning = GRADES[i]
+    return dict(index=i, grade=g, equiv=eq, pd=pd_, meaning=meaning, label=f"{g} (≈ {eq})")
 
 
 def rate(score, ew_level=None, management="Adequate", outlook="Stable", security_cover=None):
@@ -264,6 +265,16 @@ def build_memo(c):
         B.append(("p", "Factor scores: " + "; ".join(f"{p} {s:.0f}" for p, s in pil.items() if not pd.isna(s)) + "."))
         if c.get("charts", {}).get("pillars"):
             B.append(("image", c["charts"]["pillars"], f"Factor scores: {c['name']} vs {c.get('cmp_name', 'comparator')}"))
+        nwc = c.get("news") or {}
+        nat = [r for r in nwc.get("ratings", []) if r.get("cr") is not None]
+        if nat:
+            r = nat[0]
+            gap = rating["base"]["index"] - r["cr"]
+            B.append(("p", f"Agency cross-check: latest headline rating **{r['agency']} {r['rating']}**"
+                           + (f" ({r['outlook']})" if r.get("outlook") else "") + f", {r['date']:%b %Y}, ≈ {GRADES[r['cr']][1]}. "
+                           + ("The model's base grade is the same." if gap == 0 else
+                              f"The model's base grade is {abs(gap)} grade{'s' * (abs(gap) > 1)} {'lower' if gap > 0 else 'higher'}.")
+                           + " Agencies also weigh parent/state support, market position and funding access, which the model does not."))
         B.append(("p", f"Grade scale: CR1 (≈ AAA) to CR9 (≈ CC/C). Indicative PDs are rounded long-run average default rates for the "
                        "equivalent agency grade, not a model estimate for this company."))
 
@@ -298,6 +309,15 @@ def build_memo(c):
             B.append(("image", c["charts"]["dd"], "Merton distance-to-default, last 12 months (red: PD > 5%, amber: PD > 1%)"))
     else:
         B.append(("p", "Not available (no quarterly or market data, or the dashboard is set to a past year)."))
+    nwc = c.get("news")
+    if nwc:
+        sig = nwc["signal"]
+        B.append(("p", f"**News flow (last 12 months, keyword screen):** {sig['value']} - "
+                       + {"R": "Concern", "A": "Watch", "G": "Clear", None: "no headlines found"}[sig["status"]] + "."))
+        if nwc.get("top"):
+            B.append(("table", ["Date", "Headline", "Source", "Severity"],
+                      [[f"{it['date']:%d %b %Y}", it["title"], it["source"] or it["via"], it["severity"]] for it in nwc["top"]]))
+        B.append(("p", "*Headlines are screened by keyword and can be misread; check the source before relying on them.*"))
 
     # 8. stress
     if scen:
