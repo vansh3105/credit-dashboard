@@ -85,7 +85,8 @@ def main():
     # ---- quarterly, prices, news
     with ThreadPoolExecutor(4) as ex:
         quarterly = dict(zip(companies, ex.map(dt.get_quarterly, companies)))
-    px = dt.get_prices(list(companies))
+    import macro as mc_
+    px = dt.get_prices(list(companies) + [t for t, *_ in mc_.market_tickers()])   # companies + sector market context
     with ThreadPoolExecutor(6) as ex:
         news = dict(zip(companies, ex.map(lambda t: nw.get_news(companies[t].name, t), companies)))
     print(f"quarterly {sum(len(q['is']) > 0 for q in quarterly.values())}, prices {px.shape[1]} tickers x {len(px)} days, "

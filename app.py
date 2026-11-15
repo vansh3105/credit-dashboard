@@ -16,6 +16,7 @@ import early_warning as ew
 import insights as ins
 import report as rp
 import scenario as scn
+import groups as grp
 import metrics as mt
 import macro as mc
 import news as nw
@@ -41,6 +42,7 @@ ins = _fresh(ins)
 ew = _fresh(ew)
 rp = _fresh(rp)
 scn = _fresh(scn)
+grp = _fresh(grp)
 mc = _fresh(mc)
 nw = _fresh(nw)
 sn = _fresh(sn)
@@ -52,7 +54,7 @@ st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", pa
 # Streamlit forgets the value of an input that is not drawn in a run. Inputs live in one section each, so while their
 # section is hidden their values are re-saved here; that keeps memo notes, weights and overrides when you switch sections.
 _PERSIST = {"Decide": ("m_", "w_", "fa_", "fd_", "fn_", "fr_", "ft_", "sdd_", "sdm_", "sdr_", "sg_", "cov_", "borrower"),
-            "Monitor": ("nw-man-", "nw-cat", "nw-tone", "nw-hide-mkt", "mon-co", "ew-rf"),
+            "Monitor": ("nw-man-", "nw-cat", "nw-tone", "nw-hide-mkt", "mon-co", "ew-rf", "grp-sel", "mk-sel"),
             "Analyse": ("ov-co", "wi-", "cs-", "pt-sel", "ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
 _shown = st.session_state.get("section") or "Analyse"
 for _k in list(st.session_state.keys()):
@@ -639,6 +641,8 @@ def credit_view(comp):
         nat_ = [r_ for r_ in agency_ratings(comp, b_["news"]["items"]) if r_["scale"] == "national" and r_.get("rating")]
         if nat_:
             parts.append(chip(nat_[0]["agency"], nat_[0]["rating"] + (f" {nat_[0]['outlook']}" if nat_[0].get("outlook") else ""), "inherit"))
+    if grp.group_of(comp.ticker):
+        parts.append(chip("Group", grp.group_of(comp.ticker).split(" (")[0], "inherit"))
     return "<div class='cvrow'>" + "".join(parts) + "</div>"
 
 
@@ -682,7 +686,7 @@ def _whatif(comp):
 SECTIONS = {
     "Analyse": [(0, "Overview"), (9, "Insights"), (12, "Peer table"), (1, "Liquidity"), (2, "Solvency & debt service"),
                 (3, "Earnings quality"), (4, "Distress & forensic"), (7, "Cash flow & lifecycle"), (11, "Common-size")],
-    "Monitor": [(5, "Early warning"), (6, "News & ratings")],
+    "Monitor": [(5, "Early warning"), (6, "News & ratings"), (13, "Group exposure"), (14, "Sector & market")],
     "Decide": [(8, None)],          # the workbench's own tabs (facility, covenants, scorecard, watchlist, memo) show directly
     "Method": [(10, None)],
 }
@@ -2172,3 +2176,129 @@ if tabs[12] is not None:
             st.plotly_chart(fig_, width="stretch", key="pt-radar")
             st.caption("Factor scores 0-100 (healthy = 100, watch = 50, concern = 0). The deep-dive tabs still compare two "
                        "companies; this table is the wider view.")
+
+# ------------------------------------------------------------------ Group exposure
+if tabs[13] is not None:
+    with tabs[13]:
+        st.markdown("### Group exposure")
+        st.caption("Indian credit risk is often group risk: cash, guarantees and reputation move between sister companies, so a "
+                   "lender looks at the whole family. Members across all sectors are scored on textbook cut-offs so they are comparable.")
+        own_g = grp.group_of(MON_CO.ticker)
+        g_names = list(grp.GROUPS)
+        g_sel = st.selectbox("Group", g_names, index=g_names.index(own_g) if own_g else 0, key=f"grp-sel-{MON_CO.ticker}",
+                             help="Defaults to the selected company's group.")
+        if not own_g:
+            st.caption(f"{MON_CO.name} is not part of a group among the dashboard's companies; showing another group to browse.")
+        ALL_NAMES = {t: (sec_, n_) for sec_, d_ in SECTORS.items() for t, n_ in d_.items()}
+        _hist = sn.history()
+        _last = _hist[_hist["date"] == _hist["date"].max()].set_index("ticker") if len(_hist) else pd.DataFrame()
+        g_rows = []
+        mt.set_basis("Textbook")
+        try:
+            for t in grp.GROUPS[g_sel]:
+                sec_, n_ = ALL_NAMES[t]
+                c_, _err = dt.get_company(t, n_)
+                if c_ is None or c_.fin.empty:
+                    g_rows.append({"Company": n_, "Sector": sec_, "Grade": "no data"})
+                    continue
+                v_ = ins.latest(mt.compute(c_.fin, c_.mcap_cr, gnp))
+                s_ = mt.overall_score(mt.pillar_scores(v_, c_.gov), mt.DEFAULT_WEIGHTS)
+                gi_ = rp.grade_index(s_)
+                debt_ = c_.fin["debt"].iloc[-1] if "debt" in c_.fin else np.nan
+                h_ = _last.loc[t] if t in _last.index else {}
+                g_rows.append({"Company": n_, "Sector": sec_, "Grade": rp.GRADES[gi_][1] if gi_ is not None else "n/a",
+                               "Score": s_, "Headline signal": ins.verdict(v_, mt.red_flags(c_.fin, mt.compute(c_.fin, c_.mcap_cr, gnp)))["signal"].title(),
+                               "Early warning": (h_.get("ew_level") or "–").title() if len(h_) else "–",
+                               "News": {"R": "Concern", "A": "Watch", "G": "Clear"}.get(h_.get("news") if len(h_) else None, "–"),
+                               "Debt (Rs cr)": debt_, "Net debt / EBITDA": v_.get("nd_ebitda"), "Interest cover": v_.get("icr"),
+                               "_t": t})
+        finally:
+            mt.set_basis(basis_sel, SECTOR_VALS)
+        gdf = pd.DataFrame(g_rows)
+        if "Debt (Rs cr)" in gdf:
+            tot = gdf["Debt (Rs cr)"].sum(skipna=True)
+            gdf["Share of group debt"] = gdf["Debt (Rs cr)"] / tot if tot else np.nan
+            weakest = gdf.dropna(subset=["Score"]).sort_values("Score").head(1)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Listed members here", len(gdf))
+            k2.metric("Total debt", f"Rs {tot:,.0f} cr")
+            k3.metric("Weakest member", weakest["Company"].iloc[0] if len(weakest) else "n/a",
+                      f"{weakest['Grade'].iloc[0]} · score {weakest['Score'].iloc[0]:.0f}" if len(weakest) else None, delta_color="off")
+            k4.metric("Members on Watch or worse", int((gdf["Headline signal"].isin(["Watch", "Elevated Concern"])).sum()))
+            show = gdf.drop(columns=["_t"]).copy()
+            show["Score"] = show["Score"].map(lambda v: "–" if pd.isna(v) else f"{v:.0f}")
+            show["Debt (Rs cr)"] = show["Debt (Rs cr)"].map(lambda v: "–" if pd.isna(v) else f"{v:,.0f}")
+            show["Share of group debt"] = show["Share of group debt"].map(lambda v: "–" if pd.isna(v) else f"{v:.0%}")
+            show["Net debt / EBITDA"] = show["Net debt / EBITDA"].map(lambda v: fmtv("nd_ebitda", v))
+            show["Interest cover"] = show["Interest cover"].map(lambda v: fmtv("icr", v))
+            st.dataframe(style_cells(show, lambda v: {"Elevated Concern": SIG_CSS["✕ Concern"], "Watch": SIG_CSS["! Watch"],
+                                                      "Concern": SIG_CSS["✕ Concern"], "Comfortable": SIG_CSS["✓ Healthy"]}.get(v, ""),
+                                     ["Headline signal", "Early warning", "News"]), hide_index=True, width="stretch")
+            gd = gdf.dropna(subset=["Debt (Rs cr)"]).sort_values("Debt (Rs cr)", ascending=False)
+            if len(gd):
+                fig_ = go.Figure(go.Bar(x=gd["Company"], y=gd["Debt (Rs cr)"], text=gd["Grade"], textposition="outside",
+                                        marker_color=[C1 if t == MON_CO.ticker else "#57606a" for t in gd["_t"]],
+                                        hovertemplate="%{x}: Rs %{y:,.0f} cr · %{text}<extra></extra>"))
+                fig_.update_layout(height=320, template="plotly_white", margin=dict(l=10, r=10, t=20, b=10), yaxis_title="Debt (Rs cr)")
+                st.plotly_chart(fig_, width="stretch", key="grp-debt")
+            if g_sel.startswith("Central PSUs"):
+                st.info("State-owned companies are not a group in the usual sense: they do not support each other, but lenders and "
+                        "agencies assume government support, which is why their ratings sit well above their standalone numbers.")
+            else:
+                st.caption("Read across: a weak or highly indebted member can draw cash, guarantees or management attention from the "
+                           "others, and a default anywhere in the group usually hits the whole family's funding. Unlisted holding "
+                           "companies and promoter debt are not visible here.")
+
+# ------------------------------------------------------------------ Sector & market context
+if tabs[14] is not None:
+    with tabs[14]:
+        st.markdown(f"### {sector}: market context")
+        st.caption("The sector's equity index, the commodity and currency prices that drive its earnings, and Indian interest rates. "
+                   "Prices from Yahoo Finance (nightly copy first); commodity futures are global benchmarks.")
+        mk_items = mc.market_tickers(sector)
+        mpx = dt.get_prices([t for t, *_ in mk_items])
+        rows_ = []
+        for t, lbl, why in mk_items:
+            s_ = mpx[t].dropna() if t in mpx.columns else pd.Series(dtype=float)
+            if s_.empty:
+                rows_.append({"Instrument": lbl, "Last": "n/a", "1 month": "", "3 months": "", "1 year": "", "Why it matters": why})
+                continue
+            ch = lambda days: (s_.iloc[-1] / s_[s_.index <= s_.index[-1] - pd.Timedelta(days=days)].iloc[-1] - 1) \
+                if (s_.index <= s_.index[-1] - pd.Timedelta(days=days)).any() else np.nan
+            rows_.append({"Instrument": lbl, "Last": f"{s_.iloc[-1]:,.2f}", "1 month": ch(30), "3 months": ch(91), "1 year": ch(365),
+                          "Why it matters": why})
+        mdf = pd.DataFrame(rows_)
+        pct = lambda v: "" if v == "" or pd.isna(v) else f"{v:+.1%}"
+        st.dataframe(mdf.style.format({c: pct for c in ("1 month", "3 months", "1 year")})
+                     .map(lambda v: "" if v == "" or pd.isna(v) else f"color: {GREEN if v > 0 else RED}", subset=["1 month", "3 months", "1 year"]),
+                     hide_index=True, width="stretch", column_config={"Why it matters": st.column_config.TextColumn(width="large")})
+        st.caption("Green / red = up / down, not good / bad: rising crude helps ONGC but hurts refiners and paint makers.")
+        sel_ = st.multiselect("Chart (rebased to 100 a year ago)", [lbl for _, lbl, _ in mk_items],
+                              default=[lbl for _, lbl, _ in mk_items][2:4] or [mk_items[0][1]], key="mk-sel")
+        cpx = dt.get_prices(list(companies))
+        fig_ = go.Figure()
+        start = pd.Timestamp.now() - pd.Timedelta(days=365)
+        for t, lbl, _ in mk_items:
+            if lbl in sel_ and t in mpx.columns:
+                s_ = mpx[t].dropna(); s_ = s_[s_.index >= start]
+                if len(s_):
+                    fig_.add_trace(go.Scatter(x=s_.index, y=s_ / s_.iloc[0] * 100, name=lbl, mode="lines"))
+        if MON_CO.ticker in cpx.columns:
+            s_ = cpx[MON_CO.ticker].dropna(); s_ = s_[s_.index >= start]
+            if len(s_):
+                fig_.add_trace(go.Scatter(x=s_.index, y=s_ / s_.iloc[0] * 100, name=f"{MON_CO.name} share price",
+                                          mode="lines", line=dict(color=C1, width=3)))
+        fig_.add_hline(y=100, line_dash="dot", line_color="#8b949e")
+        fig_.update_layout(height=360, template="plotly_white", margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_, width="stretch", key="mk-chart")
+        st.markdown("##### Indian interest rates")
+        _tb = RF_LIVE.get("tbills") or {}
+        r1_, r2_, r3_, r4_ = st.columns(4)
+        r1_.metric("91-day T-bill", f"{_tb['91']:.2f}%" if "91" in _tb else "n/a")
+        r2_.metric("364-day T-bill", f"{_tb['364']:.2f}%" if "364" in _tb else "n/a", help="Used as the Merton risk-free rate.")
+        r3_.metric("3-month rate (OECD)", f"{RF_LIVE['short_3m'][0]:.2f}%" if RF_LIVE.get("short_3m") else "n/a",
+                   RF_LIVE["short_3m"][1] if RF_LIVE.get("short_3m") else None, delta_color="off")
+        r4_.metric("10-year G-sec (OECD)", f"{RF_LIVE['gsec_10y'][0]:.2f}%" if RF_LIVE.get("gsec_10y") else "n/a",
+                   RF_LIVE["gsec_10y"][1] if RF_LIVE.get("gsec_10y") else None, delta_color="off")
+        st.caption("T-bill cut-offs from the RBI website (latest auction); monthly averages from the OECD. A steeper gap between "
+                   "10-year and short rates usually means tighter long-term funding for capital-heavy borrowers.")

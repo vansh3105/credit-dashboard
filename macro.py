@@ -177,3 +177,45 @@ def sebi_for(names: list[str], ticker: str) -> list[dict]:
             out.append({"title": it["title"], "source": f"SEBI · {it['section']}", "url": it["url"],
                         "date": datetime.fromisoformat(it["date"]), "via": "SEBI", "section": it["section"]})
     return out
+
+# ---------------------------------------------------------------- sector market context
+# (Yahoo ticker, label, why it matters for lenders to the sector). All verified on Yahoo Finance.
+MARKET_COMMON = [("^NSEI", "Nifty 50", "Overall equity market"),
+                 ("^INDIAVIX", "India VIX", "Market fear gauge - spikes when risk appetite falls and funding tightens")]
+MARKET = {
+    "IT Services": [("^CNXIT", "Nifty IT", "Sector equity index"),
+                    ("INR=X", "USD / INR", "A weaker rupee lifts rupee revenue of dollar earners")],
+    "Steel & Metals": [("^CNXMETAL", "Nifty Metal", "Sector equity index"),
+                       ("HRC=F", "Hot-rolled coil steel (US futures)", "Global steel price - drives realisations"),
+                       ("ALI=F", "Aluminium (futures)", "Hindalco, Nalco, Vedanta realisations"),
+                       ("HG=F", "Copper (futures)", "Hindustan Copper, Hindalco (Novelis) realisations")],
+    "Automobiles & Auto Parts": [("^CNXAUTO", "Nifty Auto", "Sector equity index"),
+                                 ("HRC=F", "Hot-rolled coil steel (US futures)", "Main raw-material cost"),
+                                 ("BZ=F", "Brent crude", "Fuel prices weigh on vehicle demand")],
+    "Power & Utilities": [("^CNXENERGY", "Nifty Energy", "Sector equity index"),
+                          ("NG=F", "Natural gas (US futures)", "Fuel cost for gas-based plants"),
+                          ("^CNXPSE", "Nifty PSE", "State-owned companies - most utilities")],
+    "Pharma": [("^CNXPHARMA", "Nifty Pharma", "Sector equity index"),
+               ("INR=X", "USD / INR", "Exporters to the US gain when the rupee weakens")],
+    "FMCG": [("^CNXFMCG", "Nifty FMCG", "Sector equity index"),
+             ("BZ=F", "Brent crude", "Packaging and freight costs")],
+    "Oil & Gas": [("^CNXENERGY", "Nifty Energy", "Sector equity index"),
+                  ("BZ=F", "Brent crude", "Upstream realisations; refiners' and marketers' input cost"),
+                  ("NG=F", "Natural gas (US futures)", "Gas producers and city-gas input cost"),
+                  ("INR=X", "USD / INR", "Crude is bought in dollars")],
+    "Cement": [("^CNXINFRA", "Nifty Infrastructure", "Construction demand"),
+               ("BZ=F", "Brent crude", "Fuel and freight - a large share of cement cost")],
+    "Infra & Construction": [("^CNXINFRA", "Nifty Infrastructure", "Sector equity index"),
+                             ("HRC=F", "Hot-rolled coil steel (US futures)", "Steel is a main input"),
+                             ("^CNXPSE", "Nifty PSE", "Government-owned contractors and clients")],
+}
+
+
+def market_tickers(sector: str | None = None) -> list[tuple]:
+    items = MARKET_COMMON + (MARKET.get(sector, []) if sector else [x for v in MARKET.values() for x in v])
+    seen, out = set(), []
+    for it in items:
+        if it[0] not in seen:
+            seen.add(it[0])
+            out.append(it)
+    return out
