@@ -301,7 +301,8 @@ def build_memo(c):
         flagged = [s for s in ew["sigs"] if s["status"] in ("R", "A")]
         B.append(("p", f"Verdict **{ew['level'].title()}**: {ew['n']['R']} concern, {ew['n']['A']} watch, {ew['n']['G']} clear."
                        + (f" Merton distance-to-default {ew['mert']['DD']:.1f} (1-year PD {_pct(ew['mert']['PD'], 2)})."
-                          if ew.get("mert") and not ew["mert"].get("no_debt") else "")))
+                          if ew.get("mert") and not ew["mert"].get("no_debt") else "")
+                       + (f" Risk-free rate {c['rf']['rate']:.2f}% ({c['rf']['source']})." if c.get("rf") else "")))
         if flagged:
             B.append(("table", ["Signal", "Value", "Status"],
                       [[s["signal"], s["value"], {"R": "Concern", "A": "Watch"}[s["status"]]] for s in flagged]))

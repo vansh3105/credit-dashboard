@@ -151,7 +151,8 @@ def get_news(name: str, ticker: str, sources: tuple | None = None) -> dict:
     import snapshot as sn
     saved = sn.news(ticker) if sources is None else None
     if saved is not None:
-        saved = {**saved, "items": tag(saved["items"], names_for(name, ticker), ticker)}
+        nm_ = names_for(name, ticker)
+        saved = {**saved, "items": tag(saved["items"] + (_sebi(nm_, ticker) if sources is None else []), nm_, ticker)}
     if saved is not None and not dt.PREFER_LIVE and sn.is_fresh(sn.get()):
         with _LOCK:
             _CACHE[ck] = (time.time(), saved)
@@ -169,7 +170,7 @@ def get_news(name: str, ticker: str, sources: tuple | None = None) -> dict:
                 raw += f.result()
             except Exception as e:  # network, parse or rate limit: keep the other sources
                 errors.append(f"{lab}: {type(e).__name__}")
-    items = tag(raw, names, ticker)
+    items = tag(raw + (_sebi(names, ticker) if not sources else []), names, ticker)
     res = {"items": items, "errors": errors, "fetched": datetime.now(timezone.utc), "names": names}
     if not items and errors and saved is not None:      # every source failed: use the last good copy
         res = {**saved, "errors": errors + ["showing the saved nightly copy"]}
@@ -190,10 +191,31 @@ def tag(raw: list[dict], names: list[str], ticker: str) -> list[dict]:
                 or (ticker in EXCLUDE and re.search(EXCLUDE[ticker], _norm(it["title"]))):
             continue
         seen.add(k)
-        it = {**it, **classify(it["title"])}
+        it = {**it, **(sebi_class(it) if it.get("via") == "SEBI" else classify(it["title"]))}
         it["rating"] = extract_rating(it["title"], names)
         items.append(it)
     return items
+
+
+def sebi_class(it: dict) -> dict:
+    """SEBI's own enforcement items. An exemption is routine; a settlement means the matter was paid off; adjudication,
+    final, interim and recovery orders are serious for a borrower (penalties, debarment, attachment of accounts)."""
+    t = _norm(it["title"])
+    if it.get("section") == "Press release":
+        return {**classify(it["title"]), "category": "Legal & regulatory"}
+    if re.search(r"exemption|relaxation|in-principle|no objection", t):
+        return {"category": "Legal & regulatory", "tone": "neutral", "severity": "low"}
+    if re.search(r"settlement", t):
+        return {"category": "Legal & regulatory", "tone": "negative", "severity": "medium"}
+    return {"category": "Legal & regulatory", "tone": "negative", "severity": "high"}
+
+
+def _sebi(names, ticker):
+    try:
+        import macro
+        return macro.sebi_for(names, ticker)
+    except Exception:
+        return []
 
 
 def clear_cache():

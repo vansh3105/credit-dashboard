@@ -21,7 +21,6 @@ import numpy as np
 import pandas as pd
 
 HIST_DAYS = 120
-RF = 0.065
 
 
 def main():
@@ -41,6 +40,7 @@ def main():
     import data as dt
     import early_warning as ew
     import insights as ins
+    import macro as mc
     import metrics as mt
     import news as nw
     import report as rp
@@ -81,12 +81,21 @@ def main():
     print(f"quarterly {sum(len(q['is']) > 0 for q in quarterly.values())}, prices {px.shape[1]} tickers x {len(px)} days, "
           f"news {sum(len(n['items']) > 0 for n in news.values())} ({time.time() - t0:.0f}s)")
 
+    # ---- risk-free rate and the SEBI order archive (RSS keeps only a few days, so keep everything seen)
+    prev_snap = sn.get() or {}
+    rates = mc._fetch_rates()
+    if not rates["live"] and prev_snap.get("macro"):
+        rates = {**prev_snap["macro"], "source": prev_snap["macro"]["source"] + " (carried over)"}
+    sebi = mc.merge_archive(list(prev_snap.get("sebi") or []), mc.sebi_rss())
+    rf = rates["rate"] / 100
+    print(f"risk-free {rates['rate']:.2f}% ({rates['source']}); SEBI archive {len(sebi)} items")
+
     built = datetime.now(timezone.utc)
     snap = {"version": sn.VERSION, "built": built.isoformat(),
             "companies": {t: sn.company_out(c) for t, c in companies.items()},
             "quarterly": {t: {"is": sn.df_out(q["is"]), "bs": sn.df_out(q["bs"])} for t, q in quarterly.items()},
             "prices": sn.df_out(px), "news": {t: sn.news_out(n) for t, n in news.items()},
-            "carried_over": carried}
+            "carried_over": carried, "macro": rates, "sebi": sebi}
     blob = sn.dumps(snap)
     (out / "snapshot.json.gz").write_bytes(blob)
 
@@ -103,7 +112,7 @@ def main():
                 flags = mt.red_flags(c.fin, m)
                 score = mt.overall_score(mt.pillar_scores(vals, c.gov), mt.DEFAULT_WEIGHTS)
                 gi = rp.grade_index(score)
-                b = ew.bundle(c, peers, sec_px, quarterly.get(t) or {"is": pd.DataFrame(), "bs": pd.DataFrame()}, RF,
+                b = ew.bundle(c, peers, sec_px, quarterly.get(t) or {"is": pd.DataFrame(), "bs": pd.DataFrame()}, rf,
                               news[t]["items"])
                 mert = b["mert"] or {}
                 rows.append({"date": today, "ticker": t, "sector": sec, "name": c.name,

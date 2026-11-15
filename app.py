@@ -16,6 +16,7 @@ import early_warning as ew
 import insights as ins
 import report as rp
 import metrics as mt
+import macro as mc
 import news as nw
 import snapshot as sn
 import sectors
@@ -38,12 +39,23 @@ mt = _fresh(mt)          # metrics before insights: insights depends on it
 ins = _fresh(ins)
 ew = _fresh(ew)
 rp = _fresh(rp)
+mc = _fresh(mc)
 nw = _fresh(nw)
 sn = _fresh(sn)
 SECTORS = _fresh(sectors).SECTORS
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", page_icon="📊")
+
+# Streamlit forgets the value of an input that is not drawn in a run. Inputs live in one section each, so while their
+# section is hidden their values are re-saved here; that keeps memo notes, weights and overrides when you switch sections.
+_PERSIST = {"Decide": ("m_", "w_", "fa_", "fd_", "fn_", "fr_", "ft_", "sdd_", "sdm_", "sdr_", "sg_", "cov_", "borrower"),
+            "Monitor": ("nw-man-", "nw-cat", "nw-tone", "nw-hide-mkt", "mon-co", "ew-rf"),
+            "Analyse": ("ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
+_shown = st.session_state.get("section") or "Analyse"
+for _k in list(st.session_state.keys()):
+    if any(_k.startswith(p_) for sec_, ps_ in _PERSIST.items() if sec_ != _shown for p_ in ps_):
+        st.session_state[_k] = st.session_state[_k]
 
 C1, C2, CB = "#1f6feb", "#e8710a", "#8b949e"          # company 1, company 2, benchmark
 GREEN, AMBER, RED = "#2da44e", "#d29922", "#cf222e"
@@ -147,6 +159,7 @@ with st.sidebar.expander("Settings", expanded=False):
 if st.sidebar.button("Reload data", help="Skip the nightly snapshot and fetch everything again from Yahoo Finance and Google News"):
     dt.clear_cache()
     nw.clear_cache()
+    mc.clear_cache()
     st.rerun()
 _src = dt.source()
 if _src["mode"] == "snapshot":
@@ -559,6 +572,9 @@ with hc[1]:
             kpis_rel(vB)
 
 # ------------------------------------------------------------------ early-warning helpers (used by the tab and the credit memo)
+RF_LIVE = mc.risk_free()                                    # live risk-free rate (RBI 364-day T-bill), nightly copy first
+if "ew-rf" not in st.session_state:
+    st.session_state["ew-rf"] = round(float(RF_LIVE["rate"]), 2)
 EW_LATEST = asof_y is None or asof_y == year_opts[-1]
 fpd = lambda p_: "n/a" if p_ is None or pd.isna(p_) else ("< 0.01%" if p_ < 1e-4 else f"{p_:.2%}")
 
@@ -614,7 +630,7 @@ def credit_view(comp):
                                   f"<b style='color:{col}'>{esc(val)}</b></span>")
     parts = [chip("Grade", rp.grade_info(gi_)["label"] if gi_ is not None else "n/a", "inherit")]
     if EW_LATEST:
-        b_ = ew_bundle(comp, st.session_state.get("ew-rf", 6.5) / 100)
+        b_ = ew_bundle(comp, st.session_state.get("ew-rf", RF_LIVE["rate"]) / 100)
         if b_["sigs"]:
             parts.append(chip("Early warning", *LVL_TXT[b_["level"]]))
         parts.append(chip("News", *NEWS_TXT[nw.news_signal(b_["news"]["items"])["status"]]))
@@ -1074,12 +1090,20 @@ if tabs[5] is not None:
             st.info("Early-warning signals always use the latest quarterly and market data. Switch *As-of fiscal year* back to the "
                 "latest year in View options to see them.")
         else:
-            e1, e2 = st.columns([3, 1])
+            ec = MON_CO
+            e1, e2 = st.columns([1, 3], vertical_alignment="bottom")
             with e1:
-                ec = MON_CO
+                rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, step=0.25, key="ew-rf",
+                                     help="Used by the Merton model (1-year horizon). Starts at the live rate shown alongside; "
+                                          "change it to test sensitivity.") / 100
             with e2:
-                rf = st.number_input("Risk-free rate (%)", 0.0, 20.0, 6.5, 0.25, key="ew-rf",
-                                     help="Used by the Merton model; roughly the 1-year Indian T-bill yield.") / 100
+                _tb = RF_LIVE.get("tbills") or {}
+                _lt = RF_LIVE.get("gsec_10y")
+                st.caption(f"Live: **{RF_LIVE['rate']:.2f}%** - {RF_LIVE['source']}."
+                           + (f" T-bill cut-offs: 91-day {_tb['91']:.2f}%, 182-day {_tb['182']:.2f}%, 364-day {_tb['364']:.2f}%."
+                              if all(k in _tb for k in ("91", "182", "364")) else "")
+                           + (f" 10-year G-sec {_lt[0]:.2f}% ({_lt[1]}, OECD)." if _lt else "")
+                           + ("" if abs(rf * 100 - RF_LIVE["rate"]) < 0.005 else " *You have overridden it.*"))
             with st.spinner("Loading quarterly results and share prices…"):
                 ewb = ew_bundle(ec, rf)
             px_all, q_ec, mkt_all, mk_ec = ewb["px_all"], ewb["q"], ewb["mkt_all"], ewb["mk"]
@@ -1231,6 +1255,23 @@ if tabs[6] is not None:
                 f"{ns['value']}</div></div>", unsafe_allow_html=True)
         if ns["trigger"]:
             st.caption(f"Driven by: “{ns['trigger']}”. This is the *News flow* signal in the Early warning tab.")
+
+        # ---- SEBI
+        _sebi_all = mc.sebi_orders()
+        _sebi_co = [it for it in items if it.get("via") == "SEBI"]
+        with st.expander(f"SEBI enforcement naming {nc.name}: {len(_sebi_co)} item(s)", expanded=bool(_sebi_co)):
+            if _sebi_co:
+                st.dataframe(pd.DataFrame([{"Date": it["date"].strftime("%d %b %Y"), "Type": it.get("section", ""), "Title": it["title"],
+                                            "Severity": it["severity"], "Link": it["url"] or None} for it in _sebi_co]),
+                             hide_index=True, width="stretch",
+                             column_config={"Link": st.column_config.LinkColumn(display_text="open"),
+                                            "Title": st.column_config.TextColumn(width="large")})
+            _since = min((datetime.fromisoformat(x["date"]) for x in _sebi_all), default=None)
+            st.caption(f"Matched by name against {len(_sebi_all)} SEBI orders, recovery proceedings and press releases"
+                       + (f" collected since {_since:%d %b %Y}" if _since else "") + ". SEBI's feed shows only the last few days, so the "
+                       "nightly job keeps every item it sees - the archive grows from the day it started. Orders against promoters or "
+                       "directors by personal name are not matched. Adjudication, final, interim and recovery orders count as "
+                       "high-severity (→ Watch); settlements as medium; exemptions as routine.")
 
         # ---- ratings
         st.markdown("#### Credit ratings: agencies vs this model")
@@ -1689,7 +1730,7 @@ if tabs[8] is not None:
             # whatever basis the screen shows; the sector-relative score is reported alongside as relative standing.
             mt.set_basis("Textbook")
             tb_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
-            ew_b = ew_bundle(BC, st.session_state.get("ew-rf", 6.5) / 100) if EW_LATEST else None
+            ew_b = ew_bundle(BC, st.session_state.get("ew-rf", RF_LIVE["rate"]) / 100) if EW_LATEST else None
             ew_ctx = dict(level=ew_b["level"], n=ew_b["n"], sigs=ew_b["sigs"], mert=ew_b["mert"]) if ew_b and ew_b["sigs"] else None
             mt.set_basis("Sector-relative", SECTOR_VALS)
             sr_score = mt.overall_score(mt.pillar_scores(bvals, BC.gov), W)
@@ -1743,7 +1784,7 @@ if tabs[8] is not None:
             ctx = dict(name=BC.name, sector=sector, as_of=f"data to {BC.period_end or 'n/a'}, fetched {BC.fetched_at or 'n/a'}",
                        vals=bvals, flags=bflags, pillars=pb_, score=sc_b, rating=rating, snap=dict(cols=[f"FY{y}" for y in ycols], rows=srows),
                        req=fac.get("req"), scen=fac.get("scen"), cov_rows=fac.get("cov_rows"), benford=bfA if BC is A else bfB,
-                       cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, security_cover=cover, override=override,
+                       cmp_name=cmp_lbl, basis=basis_sel, ew=ew_ctx, news=news_ctx, rf=dict(rate=st.session_state.get('ew-rf', RF_LIVE['rate']), source=RF_LIVE['source']), security_cover=cover, override=override,
                        override_reason=ov_reason.strip(),
                        analyst=dict(name=an_name.strip(), purpose=purpose.strip(), collateral_type=ctype, collateral_value=cval,
                                     management=mgmt, outlook=outlook, notes=notes.strip()))
@@ -1961,8 +2002,8 @@ if tabs[10] is not None:
   shifts these percentiles). Hard floors stay: DSCR or interest cover below 1x and Ohlson probability above 50% are always a
   concern; Beneish and negative free cash flow keep their fixed rules. A metric with fewer than 6 sector values keeps the
   textbook cut-off.
-- {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate editable (default 6.5%); probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
-- {ADV} **News & ratings** runs three Google News searches per company (debt and ratings; legal and governance; rating agencies) plus Yahoo Finance's feed, keeps headlines from the last 12 months that name the company, and drops duplicates. A **keyword screen** tags each with a category, a tone for lenders and a severity; share-price chatter and broker calls (\"downgraded to Sell\") are treated as neutral. **News flow signal**: Concern only for a rating-agency downgrade in the last 180 days; Watch if a high-severity negative headline (default, insolvency, fraud, asset seizure, ban, auditor exit…) appeared in the last 180 days or three or more medium negatives in 90. A keyword match alone never makes a Concern, because namesakes (\"Cesc\" vs CESC) and stories where the company is the victim of a fraud slip through; short capitalised names must match in capitals. Testing on all 203 companies, only about 1 in 6 high-severity keyword hits was a genuine credit event. **Ratings** are read from headlines naming CRISIL, ICRA, CARE, India Ratings, Acuite, Brickwork, Moody's, Fitch or S&P, only from the clause that names the company. National-scale ratings map to CR grades (AAA→CR1, AA→CR2, A→CR3, BBB→CR4, BB→CR5, B+→CR6, B/B-→CR7, CCC→CR8, below→CR9); global-scale ratings are shown but not compared, since they sit under India's sovereign ceiling. The **AI read** (optional, needs an Anthropic API key) sends the non-chatter headlines to Claude, which returns a per-headline judgement, rating actions, a news-risk level, a digest and questions for management. It never changes the grade or the early-warning signal.
+- {ADV} **Early warning** uses Yahoo's quarterly income statements (about 5-7 quarters; Indian companies publish no quarterly cash-flow statement), the half-yearly interim balance sheet and two years of daily prices. Year-on-year compares the same quarter a year apart. **Merton model**: equity = call option on assets; market cap and one-year share-price volatility solve for asset value and volatility; default point = short-term debt + half of long-term debt (KMV); risk-free rate = cut-off yield of the latest 364-day Treasury-bill auction from the RBI website (matching the 1-year horizon), else OECD's monthly Indian 3-month rate, else 6.5%; editable; probability of default = N(−DD), risk-neutral and only indicative. The DD history holds debt at today's level. Early-warning signals always use the latest data, whatever the as-of year.
+- {ADV} **News & ratings** runs three Google News searches per company (debt and ratings; legal and governance; rating agencies) plus Yahoo Finance's feed, keeps headlines from the last 12 months that name the company, and drops duplicates. A **keyword screen** tags each with a category, a tone for lenders and a severity; share-price chatter and broker calls (\"downgraded to Sell\") are treated as neutral. **News flow signal**: Concern only for a rating-agency downgrade in the last 180 days; Watch if a high-severity negative headline (default, insolvency, fraud, asset seizure, ban, auditor exit…) appeared in the last 180 days or three or more medium negatives in 90. A keyword match alone never makes a Concern, because namesakes (\"Cesc\" vs CESC) and stories where the company is the victim of a fraud slip through; short capitalised names must match in capitals. Testing on all 203 companies, only about 1 in 6 high-severity keyword hits was a genuine credit event. **SEBI orders** come from SEBI's RSS feed (last few days only), kept nightly in an archive and matched by company name; adjudication, final, interim and recovery orders are high-severity, settlements medium, exemptions routine. **Ratings** are read from headlines naming CRISIL, ICRA, CARE, India Ratings, Acuite, Brickwork, Moody's, Fitch or S&P, only from the clause that names the company. National-scale ratings map to CR grades (AAA→CR1, AA→CR2, A→CR3, BBB→CR4, BB→CR5, B+→CR6, B/B-→CR7, CCC→CR8, below→CR9); global-scale ratings are shown but not compared, since they sit under India's sovereign ceiling. The **AI read** (optional, needs an Anthropic API key) sends the non-chatter headlines to Claude, which returns a per-headline judgement, rating actions, a news-risk level, a digest and questions for management. It never changes the grade or the early-warning signal.
 - {ADV} **Credit memo and internal grade.** The quantitative score on *textbook* cut-offs maps to a 9-step internal scale (CR1 ≈ AAA … CR9 ≈ CC/C) with an indicative one-year PD - a rounded long-run average default rate for the equivalent agency grade, not a company-specific estimate. Whole-notch adjustments: early warning (Watch −1, Elevated −2), management (Strong +1, Weak −1), negative industry outlook (−1), capped at ±2 together; security cover of 1.5x or more lifts the facility (not the issuer) one notch. The grade never depends on the screen's scoring basis; the sector-relative score is shown beside it as relative standing, with a warning when a weak grade mainly reflects the sector (e.g. utilities). PDF and Word files are built only when a download button is clicked.
 - **Red-flag materiality.** Receivable, inventory and debt growth flags only fire when that balance is at least 2%, 2% and 5%
   of total assets respectively.
