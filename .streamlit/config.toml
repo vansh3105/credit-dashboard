@@ -1,5 +1,6 @@
-[theme]
-primaryColor = "#1f6feb"
+# No [theme] section on purpose: setting any theme colour replaces Streamlit's automatic light/dark switching
+# with a light-based custom theme. Without it the app follows each viewer's system setting (dark on a dark Mac),
+# and anyone can pick Light / Dark under ⋮ → Settings.
 
 [client]
 toolbarMode = "viewer"

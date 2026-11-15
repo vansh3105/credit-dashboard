@@ -10,7 +10,7 @@ pip install -r requirements.txt
 pytest -q                     # reproduces the worked examples from the course decks
 streamlit run app.py
 ```
-Data comes live from Yahoo Finance via `yfinance` (needs internet). The first load of each sector takes about a minute, then it is cached for 6 hours.
+Data comes from Yahoo Finance via `yfinance`, served from a nightly snapshot (opens in about 2 s); *Reload data* fetches live. Live results are cached for 6 hours.
 
 ## Files
 | File | Purpose |
@@ -54,6 +54,7 @@ Without a key everything else works; the AI never changes the grade or the early
 - **Fallback.** If Yahoo or Google News fail, the app shows the last good nightly copy and says so in the sidebar.
 - **What changed.** The Overview tab compares the last two nights: grade, headline signal, early-warning level,
   news flow and score moves of 5+ points.
-- **Tested before it goes live.** `.github/workflows/tests.yml` runs the tests on Python 3.11 and 3.13 on every push
-  to `main`, then moves the `live` branch to that commit only if they pass. Point Streamlit Cloud at `live`.
+- **Tested before it goes live.** Changes are pushed to the `dev` branch. `.github/workflows/tests.yml` runs the tests
+  on Python 3.11 and 3.13 and moves `main` - the branch Streamlit Cloud deploys - to that commit only if they pass.
+  If a run fails, the live app simply stays on the last good version (see the Actions tab on GitHub).
 - **Pinned versions.** `requirements.txt` pins exact library versions so an upstream release cannot break the app.

@@ -1,10 +1,10 @@
 name: Tests
 
-# Every push to main runs the tests on two Python versions. Only if they pass is the `live` branch moved to the
-# same commit - point Streamlit Cloud at `live` so a broken push never reaches the public app.
+# Work is pushed to `dev`. Every push runs the tests on two Python versions; only if they pass is `main` moved to
+# the same commit. Streamlit Cloud deploys `main`, so a broken push never reaches the public app.
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
   workflow_dispatch:
 
@@ -36,7 +36,7 @@ jobs:
 
   promote:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -44,5 +44,5 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Move live branch to this commit
-        run: git push --force origin HEAD:refs/heads/live
+      - name: Move main (the deployed branch) to this commit
+        run: git push origin HEAD:refs/heads/main      # fast-forward only: refuses if main has commits dev lacks
