@@ -53,7 +53,7 @@ st.set_page_config(page_title="Credit Risk Analyst Dashboard", layout="wide", pa
 # section is hidden their values are re-saved here; that keeps memo notes, weights and overrides when you switch sections.
 _PERSIST = {"Decide": ("m_", "w_", "fa_", "fd_", "fn_", "fr_", "ft_", "sdd_", "sdm_", "sdr_", "sg_", "cov_", "borrower"),
             "Monitor": ("nw-man-", "nw-cat", "nw-tone", "nw-hide-mkt", "mon-co", "ew-rf"),
-            "Analyse": ("ov-co", "wi-", "ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
+            "Analyse": ("ov-co", "wi-", "cs-", "pt-sel", "ins-co", "ins-filter", "fx-co", "fx-yr", "sz-measure", "dist-metric")}
 _shown = st.session_state.get("section") or "Analyse"
 for _k in list(st.session_state.keys()):
     if any(_k.startswith(p_) for sec_, ps_ in _PERSIST.items() if sec_ != _shown for p_ in ps_):
@@ -680,8 +680,8 @@ def _whatif(comp):
 # tabs[k] keeps the original numbering: 0 Overview, 1 Liquidity, 2 Solvency, 3 Earnings quality, 4 Distress & forensic,
 # 5 Early warning, 6 News & ratings, 7 Cash flow & lifecycle, 8 Credit workbench, 9 Insights, 10 Data & method.
 SECTIONS = {
-    "Analyse": [(0, "Overview"), (9, "Insights"), (1, "Liquidity"), (2, "Solvency & debt service"), (3, "Earnings quality"),
-                (4, "Distress & forensic"), (7, "Cash flow & lifecycle")],
+    "Analyse": [(0, "Overview"), (9, "Insights"), (12, "Peer table"), (1, "Liquidity"), (2, "Solvency & debt service"),
+                (3, "Earnings quality"), (4, "Distress & forensic"), (7, "Cash flow & lifecycle"), (11, "Common-size")],
     "Monitor": [(5, "Early warning"), (6, "News & ratings")],
     "Decide": [(8, None)],          # the workbench's own tabs (facility, covenants, scorecard, watchlist, memo) show directly
     "Method": [(10, None)],
@@ -692,7 +692,7 @@ sc1, sc2 = st.columns([2, 3], vertical_alignment="center")
 with sc1:
     SECTION = st.segmented_control("Section", list(SECTIONS), default="Analyse", key="section", label_visibility="collapsed") or "Analyse"
 sc2.caption(f"**{SECTION}** - {SECTION_HELP[SECTION]}.")
-tabs = [None] * 11
+tabs = [None] * 16          # 11 Common-size, 12 Peer table, 13 Group exposure, 14 Sector & market, 15 Guide
 _spec = SECTIONS[SECTION]
 if _spec[0][1] is None:
     tabs[_spec[0][0]] = st.container()
@@ -2077,3 +2077,98 @@ if tabs[10] is not None:
   year (Dec-2025 → FY2026), since it overlaps that fiscal year for 9 of 12 months.
 - **Growth & margins** (revenue growth, EBITDA, net and free-cash-flow margins) are compared with peers but not rated green/red, because normal margins differ widely between sectors.
 - Insights and the memo are rule-based text, not a credit rating or a lending decision.""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------------ Common-size statements
+if tabs[11] is not None:
+    with tabs[11]:
+        st.markdown("### Common-size statements")
+        st.caption("Every line as a share of revenue (income and cash flow) or of total assets (balance sheet), so companies of "
+                   "very different size can be compared line by line. The last column is the sector median for the latest year.")
+        CS_IS = [("rev", "Revenue"), ("cogs", "Cost of revenue"), ("sga", "Selling, general & admin"), ("ebitda", "EBITDA"),
+                 ("da", "Depreciation"), ("ebit", "EBIT"), ("interest", "Interest"), ("pbt", "Profit before tax"),
+                 ("tax", "Tax"), ("ni", "Net profit")]
+        CS_BS = [("cash", "Cash & short-term investments"), ("recv", "Receivables"), ("inv", "Inventory"), ("ca", "Current assets"),
+                 ("ppe", "Net PP&E"), ("ta", "Total assets"), ("pay", "Payables"), ("cl", "Current liabilities"),
+                 ("cur_debt", "Short-term debt"), ("ltd", "Long-term debt"), ("debt", "Total debt"), ("tl", "Total liabilities"),
+                 ("equity", "Equity"), ("retained", "Retained earnings")]
+        CS_CF = [("cfo", "Operating cash flow"), ("capex", "Capex"), ("cfi", "Investing cash flow"), ("cff", "Financing cash flow"),
+                 ("divs", "Dividends paid")]
+        cs_cos = [A] + ([B] if B is not None else [])
+        cs1, cs2 = st.columns([2, 1])
+        cs_co = {c.name: c for c in cs_cos}[cs1.radio("Company", [c.name for c in cs_cos], horizontal=True, key="cs-co")] \
+            if len(cs_cos) > 1 else A
+        cs_show = cs2.segmented_control("Statement", ["Income", "Balance sheet", "Cash flow"], default="Income", key="cs-st") or "Income"
+        lines, base = {"Income": (CS_IS, "rev"), "Balance sheet": (CS_BS, "ta"), "Cash flow": (CS_CF, "rev")}[cs_show]
+
+        def common_size(fin, lines_, base_):
+            if base_ not in fin:
+                return pd.DataFrame()
+            b_ = fin[base_].replace(0, np.nan)
+            return pd.DataFrame({lbl: (fin[k] / b_ if k in fin else pd.Series(np.nan, index=fin.index)) for k, lbl in lines_}).T
+
+        cs_tab = common_size(cs_co.fin, lines, base)
+        if cs_tab.empty:
+            st.info("No data for this statement.")
+        else:
+            cs_tab.columns = [f"FY{y}" for y in cs_tab.columns]
+            peers_cs = [common_size(c.fin, lines, base).iloc[:, -1] for c in companies.values() if base in c.fin and len(c.fin)]
+            cs_tab[f"{sector} median"] = pd.concat(peers_cs, axis=1).median(axis=1) if peers_cs else np.nan
+            last = cs_tab.columns[-2]
+            gap = (cs_tab[last] - cs_tab[f"{sector} median"])
+            cs_view = (cs_tab * 100).round(1)
+            cs_view["vs sector (pp)"] = (gap * 100).round(1)
+            st.dataframe(cs_view.style.format(lambda v: "–" if pd.isna(v) else f"{v:,.1f}")
+                         .background_gradient(cmap="RdBu", subset=["vs sector (pp)"], vmin=-25, vmax=25),
+                         width="stretch")
+            st.caption(f"Percent of {'revenue' if base == 'rev' else 'total assets'}. *vs sector* = latest year minus the sector "
+                       "median, in percentage points (blue above, red below - not good or bad by itself: higher debt is "
+                       "riskier, higher cash is safer).")
+
+# ------------------------------------------------------------------ Peer table (up to 5 companies)
+if tabs[12] is not None:
+    with tabs[12]:
+        st.markdown("### Peer table")
+        st.caption("Up to five companies from the sector side by side on the main credit metrics, with the sector median. "
+                   "Cells are coloured by the cut-offs in force (textbook or sector-relative).")
+        _default = [t1] + ([t2] if t2 else [])
+        _by_rev = sorted(companies, key=lambda t: -np.nan_to_num(companies[t].fin["rev"].iloc[-1] if "rev" in companies[t].fin else np.nan, nan=-1))
+        _default += [t for t in _by_rev if t not in _default][: max(0, 3 - len(_default))]
+        pt_sel = st.multiselect("Companies (up to 5)", list(companies), default=_default, max_selections=5,
+                                format_func=lambda t: names[t], key="pt-sel")
+        PT_KEYS = [k for k in ("current_ratio", "quick_ratio", "de", "nd_ebitda", "icr", "dscr", "cce", "roe", "roce",
+                               "ebitda_margin", "rev_growth", "altman_z", "piotroski", "beneish", "ohlson_p") if k in mt.M]
+        if pt_sel:
+            pt = {}
+            for t in pt_sel:
+                v_ = latest_all[t]
+                gi_, s_ = textbook_grade(t)
+                col = {mt.M[k]["label"]: fmtv(k, v_.get(k)) for k in PT_KEYS}
+                col["Score (in force)"] = f"{mt.overall_score(mt.pillar_scores(v_, companies[t].gov), W):.0f}"
+                col["Grade (textbook)"] = rp.GRADES[gi_][1] if gi_ is not None else "n/a"
+                col["Headline signal"] = ins.verdict(v_, mt.red_flags(companies[t].fin, all_m[t]))["signal"].title()
+                pt[names[t]] = col
+            med = {mt.M[k]["label"]: fmtv(k, np.nanmedian([lv.get(k) for lv in latest_all.values()])
+                                          if any(not pd.isna(lv.get(k)) for lv in latest_all.values()) else np.nan) for k in PT_KEYS}
+            pt[f"{sector} median"] = med
+            ptdf = pd.DataFrame(pt)
+            rag_of = {mt.M[k]["label"]: k for k in PT_KEYS}
+
+            def _pt_css(df):
+                css = pd.DataFrame("", index=df.index, columns=df.columns)
+                for lbl, k in rag_of.items():
+                    for c in df.columns[:-1]:
+                        r_ = mt.rag(k, latest_all[[t for t in pt_sel if names[t] == c][0]].get(k))
+                        css.loc[lbl, c] = {"G": SIG_CSS["✓ Healthy"], "A": SIG_CSS["! Watch"], "R": SIG_CSS["✕ Concern"]}.get(r_, "")
+                return css
+            st.dataframe(ptdf.style.apply(_pt_css, axis=None), width="stretch", height=min(700, 38 + 35 * len(ptdf)))
+            pil = {names[t]: mt.pillar_scores(latest_all[t], companies[t].gov) for t in pt_sel}
+            cats = [p for p in mt.DEFAULT_WEIGHTS if p != "Governance"]
+            fig_ = go.Figure()
+            for i_, (nm_, ps_) in enumerate(pil.items()):
+                vals_ = [0 if pd.isna(ps_.get(c)) else ps_.get(c) for c in cats]
+                fig_.add_trace(go.Scatterpolar(r=vals_ + vals_[:1], theta=cats + cats[:1], name=nm_, fill="toself", opacity=0.55))
+            fig_.update_layout(height=420, template="plotly_white", margin=dict(l=40, r=40, t=30, b=30),
+                               polar=dict(radialaxis=dict(range=[0, 100])), legend=dict(orientation="h", y=-0.1))
+            st.plotly_chart(fig_, width="stretch", key="pt-radar")
+            st.caption("Factor scores 0-100 (healthy = 100, watch = 50, concern = 0). The deep-dive tabs still compare two "
+                       "companies; this table is the wider view.")
